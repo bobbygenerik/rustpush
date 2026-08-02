@@ -5,7 +5,7 @@ use base64::engine::general_purpose;
 use facetimep::{ConversationInvitationPreference, ConversationLink, ConversationLinkLifetimeScope, ConversationMember, ConversationMessage, ConversationMessageType, ConversationParticipant, ConversationParticipantDidJoinContext, ConversationReport, EncryptedConversationMessage, Handle, HandleType};
 use hkdf::Hkdf;
 use log::{debug, info, warn};
-use openssl::{derive::Deriver, pkey::Private, sha::sha1, symm::{decrypt, Cipher}};
+use openssl::{bn::BigNumContext, derive::Deriver, ec::PointConversionForm, pkey::Private, sha::sha1, symm::{decrypt, Cipher}};
 use plist::{Data, Dictionary, Value};
 use base64::Engine;
 use prost::Message;
@@ -340,6 +340,8 @@ pub struct LetMeInRequest {
 pub struct FTState {
     pub links: HashMap<String, FTLink>,
     pub sessions: HashMap<String, FTSession>,
+    #[serde(default)]
+    pub rtmpk: Option<[u8; 32]>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -372,11 +374,22 @@ pub struct FTClient {
     pub state: DebugRwLock<FTState>,
     update_state: Box<dyn Fn(&FTState) + Send + Sync>,
     pub delegated_requests: DebugMutex<HashMap<String, LetMeInRequest>>,
+    rtmpk: CompactECKey<Private>,
 }
 
 impl FTClient {
-    pub async fn new(state: FTState, update_state: Box<dyn Fn(&FTState) + Send + Sync>, conn: APSConnection, identity: IdentityManager, config: Arc<dyn OSConfig>) -> Self {
+    pub async fn new(mut state: FTState, update_state: Box<dyn Fn(&FTState) + Send + Sync>, conn: APSConnection, identity: IdentityManager, config: Arc<dyn OSConfig>) -> Self {
         let token = conn.request_topics(&["com.apple.private.alloy.facetime.multi", "com.apple.private.alloy.facetime.video", "com.apple.private.alloy.quickrelay"]).await;
+
+        let rtmpk = match state.rtmpk {
+            Some(bytes) => CompactECKey::decompress_private_small(bytes),
+            None => {
+                let key = CompactECKey::new().expect("Failed to generate rtmpk key");
+                state.rtmpk = Some(key.compress_private_small());
+                update_state(&state);
+                key
+            }
+        };
 
         Self {
             _interest_token: token,
@@ -385,8 +398,15 @@ impl FTClient {
             os_config: config,
             state: DebugRwLock::new(state),
             update_state,
-            delegated_requests: DebugMutex::new(HashMap::new())
+            delegated_requests: DebugMutex::new(HashMap::new()),
+            rtmpk,
         }
+    }
+
+    fn rtmpk_point(&self) -> Data {
+        let mut ctx = BigNumContext::new().expect("Failed to create BigNumContext");
+        let point = self.rtmpk.public_key().to_bytes(&self.rtmpk.group(), PointConversionForm::UNCOMPRESSED, &mut ctx).expect("Failed to serialize public key");
+        Data::from(point)
     }
 
     pub async fn ensure_allocations(&self, session: &mut FTSession, new_members: &[FTMember]) -> Result<(), PushError> {
@@ -650,10 +670,11 @@ impl FTClient {
 
         let is_initiator = true; // todo, what does this mean
         let is_u_plus_one = join_type == 3; // new user flag (one on one downgrade??)
+        let rtmpk_point = self.rtmpk_point();
         let wire_message = FTWireMessage {
             session: session.group_id.clone(),
-            prekey: None,
-            prekey_wrap_mode: None,
+            prekey: Some(rtmpk_point),
+            prekey_wrap_mode: Some(1),
             fanout_groupid: session.group_id.clone(),
             client_context_data_key: Some(update_context.encode_to_vec().into()),
             participant_data_key: None, // should be AV mode, hopefully this doens't give us trouble?
@@ -748,6 +769,7 @@ impl FTClient {
         let my_participant = builder_session.participants.values().find(|p| &p.token == &base64_encoded).ok_or(PushError::NoParticipantTokenIndex)?.clone();
 
         let targets = self.identity.cache.lock().await.get_participants_targets(&topic, &handle, &relevant_people);
+        let rtmpk_point = self.rtmpk_point();
         self.identity.send_message(topic, IDSSendMessage {
             sender: handle.clone(),
             raw: Raw::Builder(Box::new(move |target| {
@@ -790,8 +812,8 @@ impl FTClient {
 
                 let wire_message = FTWireMessage {
                     session: builder_session.group_id.clone(),
-                    prekey: None,
-                    prekey_wrap_mode: None,
+                    prekey: Some(rtmpk_point.clone()),
+                    prekey_wrap_mode: Some(1),
                     fanout_groupid: builder_session.group_id.clone(),
                     client_context_data_key: Some(update_context.encode_to_vec().into()),
                     participant_data_key: Some(include_bytes!("sampleavcdata.bplist").to_vec().into()), // should be AV mode, hopefully this doens't give us trouble?
@@ -853,10 +875,11 @@ impl FTClient {
         let my_participant = session.get_participant(self.conn.get_token().await).ok_or(PushError::NoParticipantTokenIndex)?;
         let is_initiator = true; // todo, what does this mean
         let is_u_plus_one = true; // new user flag (one on one downgrade??)
+        let rtmpk_point = self.rtmpk_point();
         let wire_message = FTWireMessage {
             session: session.group_id.clone(),
-            prekey: None,
-            prekey_wrap_mode: None,
+            prekey: Some(rtmpk_point),
+            prekey_wrap_mode: Some(1),
             fanout_groupid: session.group_id.clone(),
             client_context_data_key: Some(vec![16, 0].into()),
             participant_data_key: None, // should be AV mode, hopefully this doens't give us trouble?
