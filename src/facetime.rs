@@ -454,6 +454,18 @@ impl FTClient {
             for_id: Data,
             #[serde(rename = "qal")]
             allocations: Vec<QuickRelayAllocation>,
+            #[serde(rename = "qrip", default)]
+            relay_ip: Option<Data>,
+            #[serde(rename = "qrp", default)]
+            relay_port: Option<i64>,
+            #[serde(rename = "qrsi", default)]
+            relay_session_id: Option<Data>,
+            #[serde(rename = "qrsk", default)]
+            relay_session_key: Option<Data>,
+            #[serde(rename = "qrst", default)]
+            relay_session_token: Option<Data>,
+            #[serde(rename = "qrep", default)]
+            relay_credential: Option<Data>,
         }
 
         let response = self.conn.wait_for_timeout(receiver, get_message(|payload| {
@@ -471,15 +483,76 @@ impl FTClient {
             if parsed.for_id.as_ref() == uuid.as_bytes() { Some(parsed) } else { None }
         }, &["com.apple.private.alloy.quickrelay"])).await?;
 
-        for allocation in response.allocations {
+        let mut tokens = Vec::new();
+        for allocation in &response.allocations {
             let id = allocation.id as u64;
             let participant = session.participants.entry(id.to_string()).or_default();
-            participant.handle = allocation.participant;
+            participant.handle = allocation.participant.clone();
             participant.participant_id = id;
             participant.token = Some(base64_encode(allocation.token.as_ref()));
+            tokens.push(allocation.token.as_ref().to_vec());
         }
-        
+
+        // QRPROBE: empirically probe the allocated QuickRelay relay (qrip:qrp) with the held
+        // session material. Logs every response we get so we can reverse the wire protocol.
+        if let (Some(ip), Some(port)) = (response.relay_ip.as_ref(), response.relay_port) {
+            let ipv4 = ip.as_ref().to_vec();
+            let port = port as u16;
+            let mut candidates = Vec::new();
+            for t in &tokens {
+                candidates.push(t.clone());
+            }
+            if let Some(q) = &response.relay_session_token {
+                candidates.push(q.as_ref().to_vec());
+            }
+            if let Some(q) = &response.relay_session_key {
+                candidates.push(q.as_ref().to_vec());
+            }
+            if let Some(q) = &response.relay_credential {
+                candidates.push(q.as_ref().to_vec());
+            }
+            for t in &tokens {
+                let mut v = vec![0x00, 0x01, 0x00, t.len() as u8];
+                v.extend_from_slice(t);
+                candidates.push(v);
+            }
+            candidates.push(vec![0u8; 16]);
+            info!("QRPROBE session {} candidates {} relay {}:{}", session.group_id, candidates.len(), ipv4.iter().map(|b| b.to_string()).collect::<Vec<_>>().join("."), port);
+            let _ = tokio::spawn(async move {
+                Self::probe_quickrelay(&ipv4, port, candidates).await;
+            });
+        }
+
         Ok(())
+    }
+
+    // QRPROBE: fire candidate Allocbind-style packets at the QuickRelay relay and log any
+    // response bytes. Per-session port (qrp) is dedicated to this session, so anything the
+    // server answers with is protocol signal.
+    async fn probe_quickrelay(ip: &[u8], port: u16, candidates: Vec<Vec<u8>>) {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use tokio::net::UdpSocket;
+        if ip.len() != 4 {
+            return;
+        }
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3])), port);
+        let Ok(sock) = UdpSocket::bind("0.0.0.0:0").await else { return };
+        for (i, cand) in candidates.iter().enumerate() {
+            info!("QRPROBE send #{i} {}B -> {addr}", cand.len());
+            if sock.send_to(cand, addr).await.is_err() {
+                continue;
+            }
+            let mut buf = vec![0u8; 2048];
+            match tokio::time::timeout(Duration::from_millis(600), sock.recv_from(&mut buf)).await {
+                Ok(Ok((n, from))) => info!("QRPROBE rcv #{i} {}B <- {from}: {}", n, encode_hex(&buf[..n])),
+                Ok(Err(e)) => info!("QRPROBE err #{i}: {e}"),
+                Err(_) => {}
+            }
+        }
+        let mut buf = vec![0u8; 2048];
+        if let Ok(Ok((n, from))) = tokio::time::timeout(Duration::from_secs(3), sock.recv_from(&mut buf)).await {
+            info!("QRPROBE late {}B <- {from}: {}", n, encode_hex(&buf[..n]));
+        }
     }
 
     // warning: Doesn't save the link
