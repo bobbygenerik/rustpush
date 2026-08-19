@@ -1008,20 +1008,20 @@ pub struct QuickRelayAllocation {
 pub struct QuickRelayAllocationsResponse {
     #[serde(rename = "U")]
     pub for_id: Data,
-    #[serde(rename = "qal")]
+    #[serde(rename = "qal", default)]
     pub allocations: Vec<QuickRelayAllocation>,
     #[serde(rename = "qrip")]
-    relay_ip: Data,
+    pub relay_ip: Data,
     #[serde(rename = "qrp")]
-    relay_port: u16,
+    pub relay_port: u16,
     #[serde(rename = "qrst")]
-    session_token: Data,
+    pub session_token: Data,
     #[serde(rename = "qrsk")]
-    session_key: Data,
+    pub session_key: Data,
     #[serde(rename = "qids")]
     pub session_id: Data,
     #[serde(rename = "qrsi")]
-    relay_id: Data,
+    pub relay_id: Data,
     #[serde(rename = "qri")]
     pub id: i64,
 }

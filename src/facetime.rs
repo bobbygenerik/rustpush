@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use uuid::Uuid;
 use aes_gcm::KeyInit;
-use crate::{avconference::{AVConfig, AVSession, IncomingFrameHandler, QuickRelayMkmMaterial, QuickRelayPreKey, QuickRelaySkmMaterial}, ids::link::{GlobalLinkChange, GlobalLinkOutgoingPacket, QuickRelayAllocationsResponse, qrp::{self, IdsqrProtoMaterial}}, util::{bin_deserialize, bin_serialize, decode_hex}};
+use crate::{avconference::{AVConfig, AVSession, ChannelFrame, ChannelMessage, FTMediaFrameEnvelope, IncomingFrameHandler, QuickRelayMkmMaterial, QuickRelayPreKey, QuickRelaySkmMaterial, publish_media_frame}, ids::link::{GlobalLinkChange, GlobalLinkOutgoingPacket, QuickRelayAllocationsResponse, qrp::{self, IdsqrProtoMaterial}}, util::{bin_deserialize, bin_serialize, decode_hex}};
 use crate::{APSConnection, APSMessage, IdentityManager, MessageTarget, OSConfig, PushError, aps::{APSInterestToken, get_message}, ids::{IDSRecvMessage, identity_manager::{IDSQuickRelaySettings, IDSSendMessage, IdentityResource, Raw}, link::{GlobalLink, GlobalPacket, LinkType}, user::{IDSService, QueryOptions}}, util::{CompactECKey, DebugMutex, DebugRwLock, base64_decode, base64_encode, deflate, duration_since_epoch, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, inflate, plist_to_bin, proto_deserialize_opt, proto_serialize_opt}};
 
 // static HAS_JOINED: AtomicBool = AtomicBool::new(false);
@@ -522,6 +522,7 @@ impl FTClient {
         let (incoming_handler, ctrl_channel) = IncomingFrameHandler::new();
 
         let incoming_copy = incoming_handler.clone();
+        let media_handler = incoming_handler.clone();
         let relay_session = GlobalLink::new(self.identity.clone(), handle, &people_in_chatroom, &session.group_id, 
             Arc::new(move |packet| incoming_copy.handle_packet(packet)), true, true).await?;
 
@@ -553,6 +554,24 @@ impl FTClient {
             info!("Importing cached avc data");
             session.connection.as_ref().unwrap().import_avc(active.identifier, participant.handle.clone(), &active.avc_data).await?;
         }
+
+        let media_guid = session.group_id.clone();
+        media_handler.configure_handler(Box::new(move |msg: ChannelMessage| {
+            let frame = match &msg.frame {
+                ChannelFrame::Sample(data) => data.clone(),
+                ChannelFrame::Configuration(config) => config.annex_b(),
+            };
+            publish_media_frame(FTMediaFrameEnvelope {
+                guid: media_guid.clone(),
+                participant: msg.participant,
+                participant_handle: msg.participant_handle,
+                stream_id: msg.stream_id,
+                codec: format!("{:?}", msg.r#type).to_lowercase(),
+                is_configuration: matches!(msg.frame, ChannelFrame::Configuration(_)),
+                timestamp: msg.timestamp,
+                frame,
+            });
+        }));
 
         if relay_session.state.lock().await.active_participants.is_empty() {
             session.is_initiator = true;
@@ -1370,10 +1389,33 @@ impl FTClient {
             item.import_allocations(&allocate_response);
 
             if let Some(session) = &item.connection {
-                session.link.update_config(allocate_response).await;
+                session.link.update_config(allocate_response.clone()).await;
             } else {
                 warn!("Dropping QR message for call {uuid}!");
             }
+
+            let guid = uuid.to_string().to_uppercase();
+            let _ = native_signaling::publish_native_signal(
+                guid,
+                None,
+                FTNativeSignal::QuickRelayAllocation {
+                    relay_ip: allocate_response.relay_ip.as_ref().to_vec(),
+                    relay_port: allocate_response.relay_port,
+                    relay_session_id: allocate_response.relay_id.as_ref().to_vec(),
+                    relay_session_key: allocate_response.session_key.as_ref().to_vec(),
+                    relay_session_token: allocate_response.session_token.as_ref().to_vec(),
+                    relay_credential: None,
+                    allocations: allocate_response
+                        .allocations
+                        .iter()
+                        .map(|allocation| FTQuickRelayAllocationToken {
+                            participant_id: allocation.id as u64,
+                            participant_handle: allocation.participant.clone(),
+                            token: allocation.token.as_ref().to_vec(),
+                        })
+                        .collect(),
+                },
+            );
             
             return Ok(None)
         }
@@ -1410,13 +1452,19 @@ impl FTClient {
                 },
                 ConversationMessageType::Decline => {
                     let mut state = self.state.write().await;
+                    let guid = decoded.conversation_group_uuid_string.clone();
+                    let _ = native_signaling::publish_native_signal(
+                        guid.clone(),
+                        Some(ns_since_epoch),
+                        FTNativeSignal::CallTerminated { reason: "declined".to_string() },
+                    );
                     if let Some(session) = state.sessions.get_mut(&decoded.conversation_group_uuid_string) {
                         session.is_ringing_inaccurate = false;
                         session.mode = Some(FTMode::MissedOutgoing); // mark as incoming
                         self.leave(session).await?;
                         (self.update_state)(&state);
                     }
-                    Some(FTMessage::Decline { guid: decoded.conversation_group_uuid_string.clone() })
+                    Some(FTMessage::Decline { guid })
                 }
                 ConversationMessageType::LetMeInDelegationResponse => {
                     let requests = self.delegated_requests.lock().await;
@@ -1514,7 +1562,7 @@ impl FTClient {
                         participant_id: participant.into(),
                         last_join_date: Some(ns_since_epoch / 1000000),
                         handle: sender.clone(),
-                        active: Some(participant_from_meta(participant, &sender, avc_data.into(), message, &decoded_context)),
+                        active: Some(participant_from_meta(participant, &sender, avc_data.clone().into(), message, &decoded_context)),
                     });
 
                     if message.r#type() == ConversationMessageType::Invitation {
@@ -1528,6 +1576,16 @@ impl FTClient {
                     let guid = session.group_id.clone();
                     (self.update_state)(&state);
                     
+
+                    let _ = native_signaling::publish_native_signal(
+                        received.session.clone(),
+                        Some(ns_since_epoch),
+                        FTNativeSignal::ParticipantBundle {
+                            participant_id: participant.into(),
+                            sender: sender.clone(),
+                            participant_data: avc_data.clone().into(),
+                        },
+                    );
 
                     info!("Context {:#?} {:#?}", decoded_context, received);
                     Some(FTMessage::JoinEvent {
@@ -1647,6 +1705,16 @@ impl FTClient {
                     }
                     (self.update_state)(&state);
                     info!("Context {:#?} {:?} {:#?}", a, b, received);
+
+                    let _ = native_signaling::publish_native_signal(
+                        received.session.clone(),
+                        Some(ns_since_epoch),
+                        FTNativeSignal::ParticipantChanged {
+                            participant_id: id.into(),
+                            handle: handle_left.clone(),
+                            joined: false,
+                        },
+                    );
                     Some(FTMessage::LeaveEvent { guid, participant: id.into(), handle: handle_left })
                 },
                 (_c, a, b, _) => {

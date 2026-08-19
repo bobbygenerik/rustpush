@@ -9,7 +9,7 @@ use rtc_rtcp::transport_feedbacks::transport_layer_nack::{NackPair, TransportLay
 use rtc_rtp::{Header, Packet, codec::{h264::H264Packet, h265::{H265Packet, HevcPayloader}}, header::Extension, packetizer::{Depacketizer, Payloader}};
 use rtc_srtp::{cipher::new_cipher, context::Context, protection_profile::ProtectionProfile};
 use rustls::pki_types::{CertificateDer, Ipv4Addr, ServerName, UnixTime};
-use tokio::{select, sync::{Mutex, Notify, mpsc}, time::{Instant, sleep_until}};
+use tokio::{select, sync::{Mutex, Notify, broadcast, mpsc}, time::{Instant, sleep_until}};
 use rtc_shared::{marshal::{Marshal, Unmarshal}, time::SystemInstant};
 use crate::{facetime::{FTWireMessage, my_conv_participant}, ids::link::{GlobalLinkChange, GlobalLinkOutgoingPacket, QuickRelayAllocationsResponse, qrp::{self, IdsqrProtoMaterial}}, util::{bin_deserialize, bin_serialize, decode_hex}};
 use std::str::FromStr;
@@ -21,7 +21,7 @@ use aes_gcm::KeyInit;
 use hkdf::Hkdf;
 use uuid::Uuid;
 use plist::{Data, Dictionary, Value};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use prost::{Message, bytes::{Buf, BytesMut}};
 use aes_gcm::{Aes256Gcm, Nonce, aead::{Aead, Payload}};
 use crate::facetime::facetimep::{ConversationInvitationPreference, ConversationLink, ConversationLinkLifetimeScope, ConversationMember, ConversationMessage, ConversationMessageType, ConversationParticipant, ConversationParticipantDidJoinContext, ConversationReport, EncryptedConversationMessage, Handle, HandleType};
@@ -2905,6 +2905,10 @@ pub struct AVSession {
 
     ssrc_packet_buffer: std::sync::Mutex<HashMap<u32, Arc<std::sync::Mutex<AVChannelHistory>>>>,
     u1: AtomicBool,
+
+    /// Lazily-created outgoing video sender, cached for the lifetime of the
+    /// session so RTP sequence numbers stay monotonic across frames.
+    pub video_sender: tokio::sync::Mutex<Option<VideoSender>>,
 }
 
 impl AVSession {
@@ -2959,6 +2963,8 @@ impl AVSession {
 
             // will automatically upgrade to u1 if we end up being the only person in a 3-way call
             u1: AtomicBool::new(participants.len() <= 2),
+
+            video_sender: tokio::sync::Mutex::new(None),
         });
 
         let avc_mat_id: [u8; 20] = rand::random();
@@ -4235,6 +4241,41 @@ pub struct ChannelMessage {
     pub metadata: HashMap::<&'static str, Vec<u8>>,
     pub camera_meta: Option<FTVideoCameraStatus>,
     pub timestamp: u32,
+}
+
+const MEDIA_FRAME_CAPACITY: usize = 4096;
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FTMediaFrameEnvelope {
+    pub guid: String,
+    pub participant: u64,
+    pub participant_handle: String,
+    pub stream_id: u32,
+    pub codec: String,
+    pub is_configuration: bool,
+    pub timestamp: u32,
+    #[serde(serialize_with = "serialize_frame_b64")]
+    pub frame: Vec<u8>,
+}
+
+fn serialize_frame_b64<S: Serializer>(data: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&base64_encode(data))
+}
+
+static MEDIA_FRAMES: LazyLock<broadcast::Sender<FTMediaFrameEnvelope>> = LazyLock::new(|| {
+    let (sender, _) = broadcast::channel(MEDIA_FRAME_CAPACITY);
+    sender
+});
+
+pub fn subscribe_media_frames() -> broadcast::Receiver<FTMediaFrameEnvelope> {
+    MEDIA_FRAMES.subscribe()
+}
+
+pub fn publish_media_frame(envelope: FTMediaFrameEnvelope) {
+    // Absent consumers are treated as a drop; media is lossy and must never
+    // block the media decode threads.
+    let _ = MEDIA_FRAMES.send(envelope);
 }
 
 
