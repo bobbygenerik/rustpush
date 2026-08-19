@@ -14,11 +14,19 @@ use sha2::Sha256;
 use uuid::Uuid;
 use aes_gcm::KeyInit;
 
-use crate::{APSConnection, APSMessage, IdentityManager, MessageTarget, OSConfig, PushError, aps::{APSInterestToken, get_message}, ids::{IDSRecvMessage, identity_manager::{IDSQuickRelaySettings, IDSSendMessage, IdentityResource, Raw}, user::{IDSService, QueryOptions}}, util::{CompactECKey, DebugMutex, DebugRwLock, base64_decode, base64_encode, duration_since_epoch, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, plist_to_bin, proto_deserialize_opt, proto_serialize_opt}};
+use crate::{APSConnection, APSMessage, IdentityManager, MessageTarget, OSConfig, PushError, aps::{APSInterestToken, get_message}, ids::{IDSRecvMessage, identity_manager::{IDSQuickRelaySettings, IDSSendMessage, IdentityResource, Raw}, user::{IDSService, QueryOptions}}, util::{CompactECKey, DebugMutex, DebugRwLock, base64_decode, base64_encode, duration_since_epoch, ec_deserialize_priv_compact, ec_serialize_priv, plist_to_bin, proto_deserialize_opt, proto_serialize_opt}};
 
 pub mod facetimep {
     include!(concat!(env!("OUT_DIR"), "/facetimep.rs"));
 }
+
+pub mod native_signaling;
+pub mod ids_quic;
+pub use native_signaling::{
+    FTNativeSignal, FTNativeSignalChannel, FTNativeSignalDirection, FTNativeSignalEnvelope,
+    FTNativeSignalError, FTQuickRelayAllocationToken, FTQuickRelayMaterialType,
+    FTSipSkeMessageType,
+};
 
 pub const FACETIME_SERVICE: IDSService = IDSService {
     name: "com.apple.private.alloy.facetime.multi",
@@ -112,6 +120,10 @@ pub struct FTParticipant {
     pub token: Option<String>,
     pub handle: String,
     pub participant_id: u64,
+    #[serde(default)]
+    pub participant_id_alias: Option<u64>,
+    #[serde(default)]
+    pub raw_participant_data: Option<Data>,
     pub last_join_date: Option<u64>, // ms since epoch
     #[serde(default, serialize_with = "proto_serialize_opt", deserialize_with = "proto_deserialize_opt")]
     pub active: Option<ConversationParticipant>,
@@ -403,6 +415,43 @@ impl FTClient {
         }
     }
 
+    /// Read-only ingress for the IDS datagram-channel owner. This validates
+    /// SIP/SKE framing and publishes raw body bytes; SKE remains in Dart.
+    pub fn receive_ske_datagram(
+        &self,
+        guid: String,
+        ns_since_epoch: Option<u64>,
+        participant_id: Option<u64>,
+        direction: FTNativeSignalDirection,
+        datagram: &[u8],
+    ) -> Result<FTNativeSignalEnvelope, FTNativeSignalError> {
+        let signal =
+            native_signaling::parse_ske_sip_message(datagram, participant_id, direction)?;
+        native_signaling::publish_native_signal(guid, ns_since_epoch, signal)
+    }
+
+    /// Read-only ingress for a decoded IDSQRProtoMaterial item. Wire framing
+    /// and qrep unwrap stay with the future accepted-channel transport.
+    pub fn receive_quickrelay_material(
+        &self,
+        guid: String,
+        ns_since_epoch: Option<u64>,
+        relay_group_id: String,
+        owner_participant_id: Option<u64>,
+        receiver_participant_id: Option<u64>,
+        material_type: u32,
+        material: Vec<u8>,
+    ) -> Result<FTNativeSignalEnvelope, FTNativeSignalError> {
+        let signal = native_signaling::quickrelay_material_signal(
+            relay_group_id,
+            owner_participant_id,
+            receiver_participant_id,
+            material_type,
+            material,
+        )?;
+        native_signaling::publish_native_signal(guid, ns_since_epoch, signal)
+    }
+
     fn rtmpk_point(&self) -> Data {
         let mut ctx = BigNumContext::new().expect("Failed to create BigNumContext");
         let point = self.rtmpk.public_key().to_bytes(&self.rtmpk.group(), PointConversionForm::UNCOMPRESSED, &mut ctx).expect("Failed to serialize public key");
@@ -469,7 +518,7 @@ impl FTClient {
         }
 
         let response = self.conn.wait_for_timeout(receiver, get_message(|payload| {
-            info!("Got relay {:?}", payload);
+            debug!("Received QuickRelay allocation response");
             let parsed = match plist::from_value::<QuickRelayAllocationsResponse>(&payload) {
                 Ok(parsed) => parsed,
                 Err(e) => {
@@ -483,76 +532,51 @@ impl FTClient {
             if parsed.for_id.as_ref() == uuid.as_bytes() { Some(parsed) } else { None }
         }, &["com.apple.private.alloy.quickrelay"])).await?;
 
-        let mut tokens = Vec::new();
+        let mut native_allocations = Vec::new();
         for allocation in &response.allocations {
             let id = allocation.id as u64;
             let participant = session.participants.entry(id.to_string()).or_default();
             participant.handle = allocation.participant.clone();
             participant.participant_id = id;
             participant.token = Some(base64_encode(allocation.token.as_ref()));
-            tokens.push(allocation.token.as_ref().to_vec());
-        }
-
-        // QRPROBE: empirically probe the allocated QuickRelay relay (qrip:qrp) with the held
-        // session material. Logs every response we get so we can reverse the wire protocol.
-        if let (Some(ip), Some(port)) = (response.relay_ip.as_ref(), response.relay_port) {
-            let ipv4 = ip.as_ref().to_vec();
-            let port = port as u16;
-            let mut candidates = Vec::new();
-            for t in &tokens {
-                candidates.push(t.clone());
-            }
-            if let Some(q) = &response.relay_session_token {
-                candidates.push(q.as_ref().to_vec());
-            }
-            if let Some(q) = &response.relay_session_key {
-                candidates.push(q.as_ref().to_vec());
-            }
-            if let Some(q) = &response.relay_credential {
-                candidates.push(q.as_ref().to_vec());
-            }
-            for t in &tokens {
-                let mut v = vec![0x00, 0x01, 0x00, t.len() as u8];
-                v.extend_from_slice(t);
-                candidates.push(v);
-            }
-            candidates.push(vec![0u8; 16]);
-            info!("QRPROBE session {} candidates {} relay {}:{}", session.group_id, candidates.len(), ipv4.iter().map(|b| b.to_string()).collect::<Vec<_>>().join("."), port);
-            let _ = tokio::spawn(async move {
-                Self::probe_quickrelay(&ipv4, port, candidates).await;
+            native_allocations.push(FTQuickRelayAllocationToken {
+                participant_id: id,
+                participant_handle: allocation.participant.clone(),
+                token: allocation.token.as_ref().to_vec(),
             });
         }
 
-        Ok(())
-    }
+        if let (
+            Some(relay_ip),
+            Some(relay_port),
+            Some(relay_session_id),
+            Some(relay_session_key),
+            Some(relay_session_token),
+        ) = (
+            response.relay_ip.as_ref(),
+            response.relay_port,
+            response.relay_session_id.as_ref(),
+            response.relay_session_key.as_ref(),
+            response.relay_session_token.as_ref(),
+        ) {
+            if let Ok(relay_port) = u16::try_from(relay_port) {
+                let _ = native_signaling::publish_native_signal(
+                    session.group_id.clone(),
+                    None,
+                    FTNativeSignal::QuickRelayAllocation {
+                        relay_ip: relay_ip.as_ref().to_vec(),
+                        relay_port,
+                        relay_session_id: relay_session_id.as_ref().to_vec(),
+                        relay_session_key: relay_session_key.as_ref().to_vec(),
+                        relay_session_token: relay_session_token.as_ref().to_vec(),
+                        relay_credential: response.relay_credential.as_ref().map(|value| value.as_ref().to_vec()),
+                        allocations: native_allocations,
+                    },
+                );
+            }
+        }
 
-    // QRPROBE: fire candidate Allocbind-style packets at the QuickRelay relay and log any
-    // response bytes. Per-session port (qrp) is dedicated to this session, so anything the
-    // server answers with is protocol signal.
-    async fn probe_quickrelay(ip: &[u8], port: u16, candidates: Vec<Vec<u8>>) {
-        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-        use tokio::net::UdpSocket;
-        if ip.len() != 4 {
-            return;
-        }
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3])), port);
-        let Ok(sock) = UdpSocket::bind("0.0.0.0:0").await else { return };
-        for (i, cand) in candidates.iter().enumerate() {
-            info!("QRPROBE send #{i} {}B -> {addr}", cand.len());
-            if sock.send_to(cand, addr).await.is_err() {
-                continue;
-            }
-            let mut buf = vec![0u8; 2048];
-            match tokio::time::timeout(Duration::from_millis(600), sock.recv_from(&mut buf)).await {
-                Ok(Ok((n, from))) => info!("QRPROBE rcv #{i} {}B <- {from}: {}", n, encode_hex(&buf[..n])),
-                Ok(Err(e)) => info!("QRPROBE err #{i}: {e}"),
-                Err(_) => {}
-            }
-        }
-        let mut buf = vec![0u8; 2048];
-        if let Ok(Ok((n, from))) = tokio::time::timeout(Duration::from_secs(3), sock.recv_from(&mut buf)).await {
-            info!("QRPROBE late {}B <- {from}: {}", n, encode_hex(&buf[..n]));
-        }
+        Ok(())
     }
 
     // warning: Doesn't save the link
@@ -1113,7 +1137,7 @@ impl FTClient {
         let cipher = Aes256Gcm::new(&key.into());
         let decrypted = cipher.decrypt(Nonce::from_slice(nonce), body).map_err(|_| PushError::AESGCMError)?;
 
-        info!("Decrypted {}", encode_hex(&decrypted));
+        debug!("Decrypted FaceTime let-me-in request");
         let decoded = ConversationMessage::decode(&mut Cursor::new(&decrypted))?;
 
         let mut request = LetMeInRequest {
@@ -1279,9 +1303,8 @@ impl FTClient {
                 self.identity.receive_message(msg, &["com.apple.private.alloy.facetime.multi", "com.apple.private.alloy.facetime.video"]).await? else { return Ok(None) };
         Ok(if command == 242 { // NiceData
             let bytes = message.bytes()?;
-            debug!("Facetime IDS message came in as {}", encode_hex(&bytes));
             let decoded = ConversationMessage::decode(&mut Cursor::new(&bytes))?;
-            debug!("Decoded {:#?}", decoded);
+            debug!("Decoded FaceTime conversation message type {:?}", decoded.r#type());
 
             match decoded.r#type() {
                 ConversationMessageType::LinkChanged | ConversationMessageType::LinkCreated => {
@@ -1305,14 +1328,22 @@ impl FTClient {
                     }
                 },
                 ConversationMessageType::Decline => {
+                    let guid = decoded.conversation_group_uuid_string.clone();
                     let mut state = self.state.write().await;
-                    if let Some(session) = state.sessions.get_mut(&decoded.conversation_group_uuid_string) {
+                    if let Some(session) = state.sessions.get_mut(&guid) {
                         session.is_ringing_inaccurate = false;
                         session.mode = Some(FTMode::MissedOutgoing); // mark as incoming
                         self.unprop_conv(session).await?;
                         (self.update_state)(&state);
                     }
-                    Some(FTMessage::Decline { guid: decoded.conversation_group_uuid_string.clone() })
+                    let _ = native_signaling::publish_native_signal(
+                        guid.clone(),
+                        Some(ns_since_epoch),
+                        FTNativeSignal::CallTerminated {
+                            reason: "declined".into(),
+                        },
+                    );
+                    Some(FTMessage::Decline { guid })
                 }
                 ConversationMessageType::LetMeInDelegationResponse => {
                     let requests = self.delegated_requests.lock().await;
@@ -1335,12 +1366,20 @@ impl FTClient {
                     Some(FTMessage::Ring { guid: decoded.conversation_group_uuid_string.clone() })
                 },
                 ConversationMessageType::RespondedElsewhere => {
+                    let guid = decoded.conversation_group_uuid_string.clone();
                     let mut state = self.state.write().await;
-                    if let Some(session) = state.sessions.get_mut(&decoded.conversation_group_uuid_string) {
+                    if let Some(session) = state.sessions.get_mut(&guid) {
                         session.is_ringing_inaccurate = false;
                         (self.update_state)(&state);
                     }
-                    Some(FTMessage::RespondedElsewhere { guid: decoded.conversation_group_uuid_string.clone() })
+                    let _ = native_signaling::publish_native_signal(
+                        guid.clone(),
+                        Some(ns_since_epoch),
+                        FTNativeSignal::CallTerminated {
+                            reason: "respondedElsewhere".into(),
+                        },
+                    );
+                    Some(FTMessage::RespondedElsewhere { guid })
                 }
                 _type => {
                     warn!("Couldn't handle message type {_type:?}");
@@ -1349,7 +1388,7 @@ impl FTClient {
             }
         } else {
             let received: Value = message.plist()?;
-            info!("recieved {:?}", received);
+            debug!("Received FaceTime command {command}");
             let mut received: FTWireMessage = plist::from_value(&received)?;
             let mut state = self.state.write().await;
             let session = state.sessions.entry(received.session.clone()).or_default();
@@ -1362,7 +1401,23 @@ impl FTClient {
             match (command, context, participant_meta, &received) {
                 (207, Some(context), Some(avc_data), FTWireMessage { participant_id_key: Some(participant), .. }) => {
                     info!("Someone joined!");
-                    let participant = *participant;
+                    let participant: u64 = (*participant).into();
+                    let native_participant_data = avc_data.as_ref().to_vec();
+                    let participant_id_alias = match ids_quic::FaceTimeParticipantMediaBundle::decode(
+                        &native_participant_data,
+                    ) {
+                        Ok(bundle) => Some(bundle.participant_id_alias),
+                        Err(error) => {
+                            // The hosted lifecycle remains additive, but the native
+                            // transport cannot be assembled without a valid alias.
+                            warn!(
+                                "Native FaceTime transport unavailable for participant {}: {}",
+                                participant,
+                                error
+                            );
+                            None
+                        }
+                    };
                     let decoded_context = ConversationParticipantDidJoinContext::decode(&mut Cursor::new(context))?;
                     let message = decoded_context.message.as_ref().ok_or(PushError::BadMsg)?;
 
@@ -1383,6 +1438,8 @@ impl FTClient {
                     session.participants.insert(participant.to_string(), FTParticipant {
                         token: Some(base64_encode(&token)),
                         participant_id: participant.into(),
+                        participant_id_alias,
+                        raw_participant_data: Some(avc_data.clone()),
                         last_join_date: Some(ns_since_epoch / 1000000),
                         handle: sender.clone(),
                         active: Some(ConversationParticipant {
@@ -1422,9 +1479,22 @@ impl FTClient {
 
                     let guid = session.group_id.clone();
                     (self.update_state)(&state);
-                    
 
-                    info!("Context {:#?} {:#?}", decoded_context, received);
+                    let _ = native_signaling::publish_native_signal(
+                        guid.clone(),
+                        Some(ns_since_epoch),
+                        FTNativeSignal::ParticipantBundle {
+                            participant_id: participant.into(),
+                            sender: sender.clone(),
+                            participant_data: native_participant_data,
+                        },
+                    );
+
+                    debug!(
+                        "Decoded FaceTime join context for session {} participant {}",
+                        guid,
+                        participant
+                    );
                     Some(FTMessage::JoinEvent {
                         guid,
                         participant: participant.into(),
@@ -1469,9 +1539,14 @@ impl FTClient {
                         },
                         _ => None
                     };
+                    let guid = session.group_id.clone();
                     (self.update_state)(&state);
                     
-                    info!("Context {:#?} {:?} {:#?}", decoded_context, meta.map(|a| encode_hex(a.as_ref())), received);
+                    debug!(
+                        "Decoded FaceTime group update for session {} (participant data present: {})",
+                        guid,
+                        meta.is_some()
+                    );
                     result
                 },
                 (210, _, _, _) => {
@@ -1481,7 +1556,7 @@ impl FTClient {
                     None
                 }
                 (208, a, b, FTWireMessage { participant_id_key: Some(participant), .. }) => {
-                    let id = *participant;
+                    let id: u64 = (*participant).into();
                     info!("Group member left!");
                     let participant = session.participants.get_mut(&id.to_string()).ok_or(PushError::BadMsg)?;
                     if let Some(last_join_date) = participant.last_join_date {
@@ -1511,16 +1586,33 @@ impl FTClient {
                         session.is_ringing_inaccurate = false;
                     }
                     (self.update_state)(&state);
-                    info!("Context {:#?} {:?} {:#?}", a, b, received);
+                    debug!(
+                        "Decoded FaceTime leave for session {} participant {} (context: {}, participant data: {})",
+                        guid,
+                        id,
+                        a.is_some(),
+                        b.is_some()
+                    );
+                    let _ = native_signaling::publish_native_signal(
+                        guid.clone(),
+                        Some(ns_since_epoch),
+                        FTNativeSignal::ParticipantChanged {
+                            participant_id: id.into(),
+                            handle: handle_left.clone(),
+                            joined: false,
+                        },
+                    );
                     Some(FTMessage::LeaveEvent { guid, participant: id.into(), handle: handle_left })
                 },
                 (_c, a, b, _) => {
-                    info!("Received unknown command {_c} {} \n {} {received:#?}", 
-                            encode_hex(a.unwrap_or(Data::new(vec![])).as_ref()), encode_hex(b.unwrap_or(Data::new(vec![])).as_ref()));
+                    warn!(
+                        "Received unsupported FaceTime command {_c} (context: {}, participant data: {})",
+                        a.is_some(),
+                        b.is_some()
+                    );
                     None
                 },
             }
         })
     }
 }
-
