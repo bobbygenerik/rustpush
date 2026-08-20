@@ -180,6 +180,8 @@ pub enum PushError {
     ShareKeyNotFound(String),
     #[error("BatchError {0}")]
     BatchError(Arc<PushError>),
+    #[error("Link error: {0}")]
+    LinkError(String),
     #[error("Invalid 2fa code!")]
     Bad2FaCode,
     #[error("PCS record key id not found!")]

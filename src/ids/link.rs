@@ -2005,6 +2005,7 @@ impl MultiplexEndpoint {
                                 let packet = &datagram_size[..size];
                                 if addr == relay_server { // from relay
                                     let id: u16 = self.channel_id.load(Ordering::Relaxed);
+                                    info!("FT: recv from relay {addr} len={size} first=0x{:02x} id={id}", packet[0]);
                                     if packet.len() > 1 && (packet[0] & 0x60) == 0 {
                                         // this is a STUN/non-channeldata TURN packet
                                         let _ = internal_send.try_send(GlobalLinkInternalChange::TurnIndication(packet.to_vec()));
@@ -2138,6 +2139,7 @@ impl AsyncUdpSocket for MultiplexEndpoint {
     }
 
     fn try_send(&self, transmit: &quinn::udp::Transmit) -> std::io::Result<()> {
+        info!("FT: quinn try_send {}B to {}", transmit.contents.len(), transmit.destination);
         if let Some(segment_size) = transmit.segment_size {
             for segment in transmit.contents.chunks(segment_size) {
                 match self.inner.send_to(segment, transmit.destination) {
@@ -3020,6 +3022,9 @@ impl GlobalLink {
 
     pub async fn new(identity_manager: IdentityManager, handle: &str, participants: &[String], group_id: &str, data_callback: Arc<dyn Fn(GlobalPacket) + Send + Sync>, relay_mode: bool, is_initiator: bool) -> Result<Arc<Self>, PushError> {
         let response = identity_manager.request_relay_allocations(handle, participants, group_id).await?;
+        info!("FT: link::new allocation ok: relay_ip={:?} relay_port={} session_token_len={} session_key_len={} session_id_len={} relay_id_len={}",
+            response.relay_ip.as_ref(), response.relay_port, response.session_token.as_ref().len(),
+            response.session_key.as_ref().len(), response.session_id.as_ref().len(), response.relay_id.as_ref().len());
 
         let mut client_crypto: ClientConfig = rustls_psk::ClientConfig::builder()
             .dangerous()
@@ -3120,14 +3125,44 @@ impl GlobalLink {
         client_config.transport_config(Arc::new(transport_config));
         endpoint.set_default_client_config(client_config);
 
-        let conn = endpoint
-            .connect(qr_addr, 
-                &std::net::Ipv4Addr::from_octets(target_ip).to_string()).unwrap()
-            .await.unwrap();
+        info!("FT: link::new socket ready, qr_addr={qr_addr}, connecting...");
+        let conn = {
+            let server_name_str = std::net::Ipv4Addr::from_octets(target_ip).to_string();
+            let connecting = match endpoint.connect(qr_addr, &server_name_str) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("FT: link::new endpoint.connect() error: {e:?}");
+                    return Err(PushError::LinkError(format!("endpoint.connect: {e:?}")));
+                }
+            };
+            match tokio::time::timeout(Duration::from_secs(10), connecting).await {
+                Ok(Ok(conn)) => conn,
+                Ok(Err(e)) => {
+                    warn!("FT: link::new QUIC handshake error: {e:?}");
+                    return Err(PushError::LinkError(format!("QUIC handshake: {e:?}")));
+                }
+                Err(_) => {
+                    warn!("FT: link::new QUIC handshake TIMED OUT after 10s (relay {qr_addr} not responding)");
+                    return Err(PushError::LinkError(format!("QUIC handshake timeout to {qr_addr}")));
+                }
+            }
+        };
+        info!("FT: link::new QUIC connected to {qr_addr}");
 
         let h3_conn = Connection::new(conn.clone());
 
-        let (mut driver, send_request) = client::new(h3_conn).await.unwrap();
+        let (mut driver, send_request) = match tokio::time::timeout(Duration::from_secs(10), client::new(h3_conn)).await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                warn!("FT: link::new H3 open error: {e:?}");
+                return Err(PushError::LinkError(format!("H3 open: {e:?}")));
+            }
+            Err(_) => {
+                warn!("FT: link::new H3 open TIMED OUT");
+                return Err(PushError::LinkError("H3 open timeout".into()));
+            }
+        };
+        info!("FT: link::new H3 opened");
         tokio::spawn(async move {
             let e = driver.wait_idle().await;
             eprintln!("LINK CLEANUP: H3 connection error: {e}");
