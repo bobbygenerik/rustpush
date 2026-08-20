@@ -1374,6 +1374,17 @@ impl FTClient {
     pub async fn handle(&self, msg: APSMessage) -> Result<Option<FTMessage>, PushError> {
         let APSMessage::Notification { id: _, topic, token: _, payload, channel: _ } = &msg else { return Ok(None) };
         if topic == &sha1("com.apple.private.alloy.quickrelay".as_bytes()) {
+            // The first QuickRelay dict per call is a request-ack (c:255) that
+            // legitimately has no relay fields (qrip/qrp/qrst/qrsk) yet; the
+            // full allocation (c:200) arrives right after. Tolerate the ack
+            // instead of failing the whole parse.
+            if let Some(code) = payload.as_dictionary().and_then(|d| d.get("c")).and_then(plist::Value::as_unsigned_integer) {
+                if code == 255 {
+                    debug!("Ignoring QuickRelay request-ack (c:255) for incoming call");
+                    return Ok(None);
+                }
+            }
+
             let allocate_response = match plist::from_value::<QuickRelayAllocationsResponse>(payload) {
                 Ok(e) => e,
                 Err(e) => {
