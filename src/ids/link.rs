@@ -3026,6 +3026,8 @@ impl GlobalLink {
             response.relay_ip.as_ref(), response.relay_port, response.session_token.as_ref().len(),
             response.session_key.as_ref().len(), response.session_id.as_ref().len(), response.relay_id.as_ref().len());
 
+        let _ = rustls_psk::crypto::CryptoProvider::install_default(rustls_psk::crypto::ring::default_provider());
+
         let mut client_crypto: ClientConfig = rustls_psk::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))

@@ -533,8 +533,11 @@ impl FTClient {
         }
 
         let interfaces = self.interfaces.read().await;
-        let ifs = interfaces.as_ref().unwrap();
-        relay_session.update_local_interfaces(ifs).await;
+        if let Some(ifs) = interfaces.as_ref() {
+            relay_session.update_local_interfaces(ifs).await;
+        } else {
+            warn!("No local interfaces set; skipping ICE candidate update for relay session");
+        }
 
         session.connection = Some(AVSession::new(
             relay_session.clone(), 
