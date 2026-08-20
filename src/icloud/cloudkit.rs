@@ -6,7 +6,7 @@ use aes_siv::siv::CmacSiv;
 use cloudkit_derive::CloudKitRecord;
 use cloudkit_proto::{AssetGetResponse, AssetsToDownload, CloudKitRecord, CreateSubscriptionRequest, Identifier, Invitation, Participant, ProtectionInfo, Record, RecordIdentifier, RecordZoneIdentifier, ResolveTokenRequest, ResolveTokenResponse, ResponseOperation, ShareAcceptRequest, ShareDeclineRequest, ShareIdentifier, ShareInfo, Subscription, SubscriptionNotification, TokenRegistration, TokenRegistrationRequest, User, UserAlias, UserAliasType, UserQueryRequest, Zone, identifier, participant::ContactInformation, record::{self, StableUrl}, request_operation::header::{Database, IsolationLevel}, retrieve_changes_response::RecordChange, retrieve_zone_changes_response::ChangedZone};
 use hkdf::Hkdf;
-use log::info;
+use log::{info, warn};
 use omnisette::{AnisetteProvider, ArcAnisetteClient};
 use openssl::{bn::{BigNum, BigNumContext}, conf, ec::{EcGroup, EcKey, EcPoint}, hash::MessageDigest, nid::Nid, pkcs5::pbkdf2_hmac, pkey::{HasPublic, PKey, Private, Public}, sha::{sha1, sha256}, sign::{Signer, Verifier}};
 use plist::Value;
@@ -2052,8 +2052,17 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
 
         let mut responses = vec![];
         for request_uuid in request_uuids {
-            let op = response.iter().find(|r| r.response.as_ref().unwrap().operation_uuid() == &request_uuid).expect("Operation UUID has no response?");
-            let result = op.result.as_ref().expect("No Result?");
+            let Some(op) = response.iter().find(|r| match r.response.as_ref() {
+                Some(resp) => resp.operation_uuid() == &request_uuid,
+                None => false,
+            }) else {
+                warn!("CloudKit operation response missing for UUID {request_uuid}; skipping");
+                continue;
+            };
+            let Some(result) = op.result.as_ref() else {
+                warn!("CloudKit operation result missing for UUID {request_uuid}; skipping");
+                continue;
+            };
             
             responses.push(if result.code() != cloudkit_proto::response_operation::result::Code::Success {
                 Err(PushError::CloudKitError(result.clone()))

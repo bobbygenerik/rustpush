@@ -2277,17 +2277,32 @@ impl GlobalLink {
             .header("accept", "*/*")
             .header("txn_id", txn_id.to_string())
             .header("content-length", body.len().to_string())
-            .body(()).unwrap();
+            .body(())
+            .map_err(|e| PushError::LinkError(format!("QR request build: {e:?}")))?;
 
-        let mut stream = self.h3.lock().await.send_request(req).await.unwrap();
+        let mut stream = self.h3.lock().await.send_request(req).await
+            .map_err(|e| {
+                warn!("QR send_request failed (H3 link likely gone): {e:?}");
+                PushError::LinkError(format!("QR send_request: {e:?}"))
+            })?;
 
-        stream.send_data(body.into()).await.unwrap();
-        stream.finish().await.unwrap();
+        if let Err(e) = stream.send_data(body.into()).await {
+            warn!("QR send_data failed: {e:?}");
+        }
+        if let Err(e) = stream.finish().await {
+            warn!("QR finish failed: {e:?}");
+        }
 
-        
         let mut total = vec![];
-        let resp = stream.recv_response().await.unwrap();
-        while let Some(mut chunk) = stream.recv_data().await.unwrap() {
+        match stream.recv_response().await {
+            Ok(resp) => {
+                if !resp.status().is_success() {
+                    warn!("QR request failed with status {} {}", resp.status().as_u16(), encode_hex(&total));
+                }
+            }
+            Err(e) => warn!("QR recv_response failed: {e:?}"),
+        }
+        while let Ok(Some(mut chunk)) = stream.recv_data().await {
             while chunk.has_remaining() {
                 let cnt = chunk.chunk().len();
                 total.extend_from_slice(chunk.chunk());
@@ -2295,11 +2310,7 @@ impl GlobalLink {
             }
         }
 
-        if !resp.status().is_success() {
-            warn!("QR request failed with status {} {}", resp.status().as_u16(), encode_hex(&total));
-        }
-
-        Ok(IdsqrProtoH3Message::decode(Cursor::new(total)).unwrap())
+        IdsqrProtoH3Message::decode(Cursor::new(total)).map_err(|e| PushError::LinkError(format!("QR decode: {e:?}")))
     }
 
     async fn handle_ids(&self, packet: GlobalPacket, ids: LinkMessage) -> Result<(), PushError> {
