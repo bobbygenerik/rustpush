@@ -2374,7 +2374,9 @@ impl GlobalLink {
     async fn handle_indication(&self, mut indication: IdsqrProtoH3Message) -> Result<(), PushError> {
         if let Some(mat) = indication.putmaterial_indication.take() {
             for mat in mat.materials {
-                let _ = self.state_send.try_send(GlobalLinkChange::NewMaterial(mat));
+                if let Err(e) = self.state_send.try_send(GlobalLinkChange::NewMaterial(mat)) {
+                    warn!("Failed to send NewMaterial to session: {e}");
+                }
             }
         }
         if let Some(mat) = indication.sessioninfo_indication.take() {
@@ -2392,6 +2394,14 @@ impl GlobalLink {
 
     pub async fn token_to_participant(&self, token: &[u8]) -> Option<u64> {
         self.state.lock().await.configuration.allocations.iter().find(|a| a.token.as_ref() == token).map(|p| p.id as u64)
+    }
+
+    pub async fn token_to_handle(&self, token: &[u8]) -> Option<String> {
+        self.state.lock().await.configuration.allocations.iter().find(|a| a.token.as_ref() == token).map(|p| p.participant.clone())
+    }
+
+    pub async fn participant_to_handle(&self, participant_id: u64) -> Option<String> {
+        self.state.lock().await.configuration.allocations.iter().find(|a| a.id == participant_id as i64).map(|p| p.participant.clone())
     }
 
     pub async fn participant_to_token(&self, token: u64) -> Option<Vec<u8>> {
@@ -2956,7 +2966,9 @@ impl GlobalLink {
 
         let new_materials = self.state.lock().await.materials.import(&r2.materials);
         for mat in new_materials {
-            let _ = self.state_send.try_send(GlobalLinkChange::NewMaterial(mat));
+            if let Err(e) = self.state_send.try_send(GlobalLinkChange::NewMaterial(mat)) {
+                warn!("Failed to send NewMaterial from alloc: {e}");
+            }
         }
 
         if !r2.peer_published_streams.is_empty() {

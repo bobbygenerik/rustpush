@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use uuid::Uuid;
 use aes_gcm::KeyInit;
-use crate::{avconference::{AVConfig, AVSession, ChannelFrame, ChannelMessage, FTMediaFrameEnvelope, IncomingFrameHandler, QuickRelayMkmMaterial, QuickRelayPreKey, QuickRelaySkmMaterial, publish_media_frame}, ids::link::{GlobalLinkChange, GlobalLinkOutgoingPacket, QuickRelayAllocationsResponse, qrp::{self, IdsqrProtoMaterial}}, util::{bin_deserialize, bin_serialize, decode_hex}};
+use crate::{avconference::{AVConfig, AVSession, ChannelFrame, ChannelMessage, FTMediaFrameEnvelope, IncomingFrameHandler, QuickRelayMkmMaterial, QuickRelayPreKey, QuickRelaySkmMaterial, VCControlData, VCGenerateKeyFrame, publish_media_frame}, ids::link::{GlobalLinkChange, GlobalLinkOutgoingPacket, QuickRelayAllocationsResponse, qrp::{self, IdsqrProtoMaterial}}, util::{bin_deserialize, bin_serialize, decode_hex}};
 use crate::{APSConnection, APSMessage, IdentityManager, MessageTarget, OSConfig, PushError, aps::{APSInterestToken, get_message}, ids::{IDSRecvMessage, identity_manager::{IDSQuickRelaySettings, IDSSendMessage, IdentityResource, Raw}, link::{GlobalLink, GlobalPacket, LinkType}, user::{IDSService, QueryOptions}}, util::{CompactECKey, DebugMutex, DebugRwLock, base64_decode, base64_encode, deflate, duration_since_epoch, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, inflate, plist_to_bin, proto_deserialize_opt, proto_serialize_opt}};
 
 // static HAS_JOINED: AtomicBool = AtomicBool::new(false);
@@ -206,6 +206,8 @@ pub struct FTSession {
     // than a false negative, which we avoid at this time.
     #[serde(skip)]
     pub is_initiator: bool,
+    #[serde(skip)]
+    pub pending_keys: Vec<(Vec<u8>, QuickRelaySkmMaterial, QuickRelayMkmMaterial)>,
 }
 
 // time to track recently added members
@@ -508,6 +510,42 @@ impl FTClient {
         }
     }
 
+    fn detect_local_interfaces() -> Vec<IpAddr> {
+        use std::net::UdpSocket;
+        let mut addrs = Vec::new();
+        // Try to detect via UDP socket binding to common public DNS
+        for target in &["8.8.8.8:80", "1.1.1.1:80", "208.67.222.222:80"] {
+            if let Ok(socket) = UdpSocket::bind("0.0.0.0:0") {
+                if socket.connect(target).is_ok() {
+                    if let Ok(local) = socket.local_addr() {
+                        if let std::net::SocketAddr::V4(v4) = local {
+                            let ip = IpAddr::V4(*v4.ip());
+                            if !addrs.contains(&ip) {
+                                addrs.push(ip);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Also try binding to IPv6
+        for target in &["[2001:4860:4860::8888]:80", "[2606:4700:4700::1111]:80"] {
+            if let Ok(socket) = UdpSocket::bind("[::]:0") {
+                if socket.connect(target).is_ok() {
+                    if let Ok(local) = socket.local_addr() {
+                        if let std::net::SocketAddr::V6(v6) = local {
+                            let ip = IpAddr::V6(*v6.ip());
+                            if !addrs.contains(&ip) && !ip.is_loopback() {
+                                addrs.push(ip);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        addrs
+    }
+
     pub async fn connect_to_relay(&self, session: &mut FTSession, new_members: &[FTMember]) -> Result<(), PushError> {
         if session.connection.is_some() {
             return Ok(())
@@ -532,11 +570,20 @@ impl FTClient {
             session.av_config = Some(AVConfig::new());
         }
 
-        let interfaces = self.interfaces.read().await;
-        if let Some(ifs) = interfaces.as_ref() {
+        let interfaces_guard = self.interfaces.read().await;
+        let auto_detected;
+        if let Some(ifs) = interfaces_guard.as_ref() {
             relay_session.update_local_interfaces(ifs).await;
         } else {
-            warn!("No local interfaces set; skipping ICE candidate update for relay session");
+            auto_detected = Self::detect_local_interfaces();
+            if !auto_detected.is_empty() {
+                info!("Auto-detected local interfaces: {:?}", auto_detected);
+                relay_session.update_local_interfaces(&auto_detected).await;
+                drop(interfaces_guard);
+                *self.interfaces.write().await = Some(auto_detected);
+            } else {
+                warn!("No local interfaces set and auto-detection failed; skipping ICE candidate update");
+            }
         }
 
         session.connection = Some(AVSession::new(
@@ -549,6 +596,27 @@ impl FTClient {
             session.is_video,
         ).await?);
 
+        // Flush any keys that arrived before the session was connected
+        let pending = std::mem::take(&mut session.pending_keys);
+        if !pending.is_empty() {
+            info!("Flushing {} pending key sets", pending.len());
+        }
+        for (token, skm, mkm) in pending {
+            let conn = session.connection.as_ref().unwrap();
+            if let Some(participant) = conn.link.token_to_participant(&token).await {
+                let handle = conn.link.token_to_handle(&token).await.unwrap_or_default();
+                info!("Flushing pending SKM/MKM for participant");
+                if let Err(e) = conn.handle_skm(participant, skm, handle.clone()).await {
+                    warn!("Failed to flush pending SKM: {e}");
+                }
+                if let Err(e) = conn.handle_mkm(participant, mkm, handle).await {
+                    warn!("Failed to flush pending MKM: {e}");
+                }
+            } else {
+                warn!("No participant mapping for pending keys token");
+            }
+        }
+
         for participant in session.participants.values() {
             let Some(active) = &participant.active else { continue };
             if active.avc_data.is_empty() {
@@ -559,6 +627,8 @@ impl FTClient {
         }
 
         let media_guid = session.group_id.clone();
+        let conn_for_fir: Arc<AVSession> = session.connection.as_ref().unwrap().clone();
+        let fir_fired = AtomicBool::new(false);
         media_handler.configure_handler(Box::new(move |msg: ChannelMessage| {
             let frame = match &msg.frame {
                 ChannelFrame::Sample(data) => data.clone(),
@@ -574,6 +644,26 @@ impl FTClient {
                 timestamp: msg.timestamp,
                 frame,
             });
+
+            // Request a keyframe on the first video frame arriving from any
+            // participant.  We join mid-GOP so the encoder keeps sending only
+            // delta frames; without this the hardware decoder outputs nothing.
+            // We use msg.participant directly — participants aren't known when
+            // configure_handler is set up, but msg.participant is the sender.
+            if !fir_fired.swap(true, Ordering::Relaxed) && matches!(msg.frame, ChannelFrame::Sample(_)) {
+                let conn = conn_for_fir.clone();
+                let target = msg.participant;
+                tokio::task::spawn(async move {
+                    match conn.send_control_message(target, VCControlData::GenerateKeyFrame(VCGenerateKeyFrame {
+                        stream_id: 0,
+                        stream_group_id: 0,
+                        fir_type: 4,
+                    })).await {
+                        Ok(_) => info!("Requested keyframe (FIR) from participant {target}"),
+                        Err(e) => warn!("Keyframe request to participant {target} failed: {e}"),
+                    }
+                });
+            }
         }));
 
         if relay_session.state.lock().await.active_participants.is_empty() {
@@ -767,6 +857,7 @@ impl FTClient {
             connection: None,
             av_config: Some(AVConfig::new()),
             is_initiator: true,
+            pending_keys: Vec::new(),
 
             is_video,
         };
@@ -1675,14 +1766,23 @@ impl FTClient {
                     info!("Got keys message {wire:?}");
                     if let Some(session) = &session.connection {
                         if let Some(participant) = session.link.token_to_participant(&token).await {
+                            let handle = session.link.token_to_handle(&token).await.unwrap_or_default();
                             if let Some(skm) = &wire.session_key_material {
-                                session.handle_skm(participant, skm.clone()).await?;
+                                session.handle_skm(participant, skm.clone(), handle.clone()).await?;
                             }
                             if let Some(mkm) = &wire.media_key_material {
-                                session.handle_mkm(participant, mkm.clone()).await?;
+                                session.handle_mkm(participant, mkm.clone(), handle).await?;
                             }
                         } else {
-                            warn!("Ignoring keys for unknwon participant!");
+                            warn!("Ignoring keys for unknown participant!");
+                        }
+                    } else {
+                        // Session not connected yet — buffer for later
+                        if let (Some(skm), Some(mkm)) = (&wire.session_key_material, &wire.media_key_material) {
+                            info!("Buffering keys (session not connected yet)");
+                            session.pending_keys.push((token.to_vec(), skm.clone(), mkm.clone()));
+                        } else {
+                            warn!("Keys message missing SKM or MKM, not buffering");
                         }
                     }
                     None

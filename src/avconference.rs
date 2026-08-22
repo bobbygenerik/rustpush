@@ -3419,7 +3419,7 @@ impl AVSession {
         Ok(())
     }
 
-    pub async fn handle_skm(&self, owner_id: u64, mut item: QuickRelaySkmMaterial) -> Result<(), PushError> {
+    pub async fn handle_skm(&self, owner_id: u64, mut item: QuickRelaySkmMaterial, handle: String) -> Result<(), PushError> {
         let mut state = self.state.lock().await;
         item.skm = state.decode_key_material(item.skm.as_ref())?;
         let participant = state.encryption_states.entry(owner_id).or_default();
@@ -3431,12 +3431,12 @@ impl AVSession {
         let avc = participant.try_decrypt(&self.session_id)?;
         drop(state);
         if let Some(avc) = avc {
-            self.import_avc(owner_id, "".to_string(), &avc).await?;
+            self.import_avc(owner_id, handle, &avc).await?;
         }
         Ok(())
     }
 
-    pub async fn handle_mkm(&self, owner_id: u64, mut item: QuickRelayMkmMaterial) -> Result<(), PushError> {
+    pub async fn handle_mkm(&self, owner_id: u64, mut item: QuickRelayMkmMaterial, handle: String) -> Result<(), PushError> {
         let mut state = self.state.lock().await;
         item.mkm = state.decode_key_material(item.mkm.as_ref())?;
         let s = state.encryption_states.entry(owner_id).or_default();
@@ -3454,9 +3454,8 @@ impl AVSession {
             s.mkm.push(mat);
         }
         // get_media_config will return an empty array IF no AVC blob has been configured
-        // TODO get the right handle
-        self.frame_handler.handle_keys(state.get_media_config(owner_id, "".to_string(), &self.av_config), true);
-        self.frame_handler.handle_keys(state.get_media_config(owner_id, "".to_string(), &self.av_config), false);
+        self.frame_handler.handle_keys(state.get_media_config(owner_id, handle.clone(), &self.av_config), true);
+        self.frame_handler.handle_keys(state.get_media_config(owner_id, handle, &self.av_config), false);
 
         Ok(())
     }
@@ -3489,13 +3488,15 @@ impl AVSession {
                     let parsed = self.link.unwrap_signed_data(owner_id as i64, item.material_content()).await?;
 
                     let item: QuickRelayMkmMaterial = plist::from_bytes(&parsed)?;
-                    self.handle_mkm(owner_id, item).await?;
+                    let handle = self.link.participant_to_handle(owner_id).await.unwrap_or_default();
+                    self.handle_mkm(owner_id, item, handle).await?;
                 }
                 14 => {
                     let parsed = self.link.unwrap_signed_data(owner_id as i64, item.material_content()).await?;
 
                     let item: QuickRelaySkmMaterial = plist::from_bytes(&parsed)?;
-                    self.handle_skm(owner_id, item).await?;
+                    let handle = self.link.participant_to_handle(owner_id).await.unwrap_or_default();
+                    self.handle_skm(owner_id, item, handle).await?;
                 },
                 _ => {}
             }
