@@ -628,6 +628,7 @@ impl FTClient {
 
         let media_guid = session.group_id.clone();
         let conn_for_fir: Arc<AVSession> = session.connection.as_ref().unwrap().clone();
+        let rt_handle = tokio::runtime::Handle::current();
         let fir_fired = AtomicBool::new(false);
         media_handler.configure_handler(Box::new(move |msg: ChannelMessage| {
             let frame = match &msg.frame {
@@ -645,21 +646,37 @@ impl FTClient {
                 frame,
             });
 
-            // Request a keyframe on the first video frame arriving from any
-            // participant.  We join mid-GOP so the encoder keeps sending only
-            // delta frames; without this the hardware decoder outputs nothing.
-            // We use msg.participant directly — participants aren't known when
-            // configure_handler is set up, but msg.participant is the sender.
             if !fir_fired.swap(true, Ordering::Relaxed) && matches!(msg.frame, ChannelFrame::Sample(_)) {
                 let conn = conn_for_fir.clone();
                 let target = msg.participant;
-                tokio::task::spawn(async move {
+                let fallback_stream_id = msg.stream_id;
+                rt_handle.spawn(async move {
+                    // Look up the remote participant's video stream IDs from
+                    // their negotiated config so the FIR targets the correct
+                    // stream.  msg.stream_id is 0 when the SSRC isn't
+                    // recognized as a group stream (common on first frames).
+                    let (stream_id, stream_group_id) = {
+                        let state = conn.state.lock().await;
+                        if let Some(enc) = state.encryption_states.get(&target) {
+                            if let Some(video_group) = enc.stream_groups.get(&1) {
+                                let sg_id = video_group.config.settings_u1.as_ref()
+                                    .map(|u| u.rtp_ssrc()).unwrap_or(0);
+                                let s_id = crate::avconference::get_stream_id(video_group.current());
+                                (s_id, sg_id)
+                            } else {
+                                (fallback_stream_id, 0)
+                            }
+                        } else {
+                            (fallback_stream_id, 0)
+                        }
+                    };
+                    info!("Sending FIR to {target}: stream_id={stream_id} stream_group_id={stream_group_id}");
                     match conn.send_control_message(target, VCControlData::GenerateKeyFrame(VCGenerateKeyFrame {
-                        stream_id: 0,
-                        stream_group_id: 0,
+                        stream_id,
+                        stream_group_id,
                         fir_type: 4,
                     })).await {
-                        Ok(_) => info!("Requested keyframe (FIR) from participant {target}"),
+                        Ok(_) => info!("Requested keyframe (FIR) from participant {target} stream_id={stream_id}"),
                         Err(e) => warn!("Keyframe request to participant {target} failed: {e}"),
                     }
                 });

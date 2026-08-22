@@ -470,7 +470,7 @@ impl ImageDescription {
 }
 
 
-fn get_stream_id(stream: &VcMediaNegotiationBlobV2StreamGroupStream) -> u32 {
+pub fn get_stream_id(stream: &VcMediaNegotiationBlobV2StreamGroupStream) -> u32 {
     stream.stream_id.unwrap_or(stream.rtp_ssrc() & 0xffff)
 }
 
@@ -844,13 +844,13 @@ fn compare(cur: &VcMediaNegotiationBlobV2StreamGroupStream, nex: &VcMediaNegotia
     (cost / cur.abs_diff(nex) as f32, nex as i32 - cur as i32)
 }
 
-struct StreamGroup {
-    config: VcMediaNegotiationBlobV2StreamGroup,
+pub struct StreamGroup {
+    pub config: VcMediaNegotiationBlobV2StreamGroup,
     current: usize,
 }
 
 impl StreamGroup {
-    fn current(&self) -> &VcMediaNegotiationBlobV2StreamGroupStream {
+    pub fn current(&self) -> &VcMediaNegotiationBlobV2StreamGroupStream {
         &self.config.streams[self.current]
     }
 
@@ -887,7 +887,7 @@ pub struct ParticipantEncryptionState {
     avc_encrypted: Option<(EncryptedAvcBlobHeader, Vec<u8>)>,
     has_sent_keys: bool,
     ctrl_enc_counter: u8,
-    stream_groups: HashMap<u32, StreamGroup>,
+    pub stream_groups: HashMap<u32, StreamGroup>,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -3069,6 +3069,7 @@ impl AVSession {
         new_session.update_u1(new_session.u1.load(Ordering::Relaxed)).await?;
 
         let session_handle = Arc::downgrade(&new_session);
+        let session_weak = session_handle.clone();
         tokio::spawn(async move {
             while let Some(ctrl) = ctrl_raw_recv.recv().await {
                 let Some(session_handle) = session_handle.upgrade() else { break };
@@ -3077,6 +3078,33 @@ impl AVSession {
                 }
             }
             info!("CLEANUP: Internal control torn down!");
+        });
+
+        let control_recv_opt = new_session.control.lock().await.take();
+        tokio::spawn(async move {
+            if let Some(mut recv) = control_recv_opt {
+                while let Some(cmd) = recv.recv().await {
+                    if let Some(session) = session_weak.upgrade() {
+                        let mut state = session.state.lock().await;
+                        match cmd {
+                            AVControlCommand::AVControl { participant, data } => {
+                                if let VCControlData::GenerateKeyFrame(fir) = &data {
+                                    info!("Got FIR from participant {participant}: stream_id={} stream_group_id={}", fir.stream_id, fir.stream_group_id);
+                                    // Respond to FIR with our stream group state
+                                    drop(state);
+                                    let _ = session.send_control_message(participant as u64, VCControlData::StreamGroupState(HashMap::from_iter([
+                                        (1u32, 1u8), // video group
+                                        (2u32, 1u8), // audio group
+                                    ]))).await;
+                                }
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
         });
 
         info!("Finished allocating");
@@ -3183,7 +3211,7 @@ impl AVSession {
             is_first: true,
 
             ssrc,
-            to_participant: if group_stream.is_none() { Some(*state.active_participants.iter().next().unwrap() as i64) } else { None },
+            to_participant: if group_stream.is_none() { Some(*state.active_participants.iter().next().or_else(|| state.encryption_states.keys().next()).unwrap() as i64) } else { None },
             secondary_streams: extra_ssrcs,
             
             frame_handler: self.frame_handler.clone(),
@@ -3242,7 +3270,7 @@ impl AVSession {
             enabled_features: self.av_config.enabled_features.clone(),
             ssrc,
             secondary_streams: extra_ssrcs,
-            to_participant: if group_stream.is_none() { Some(*state.active_participants.iter().next().unwrap() as i64) } else { None },
+            to_participant: if group_stream.is_none() { Some(*state.active_participants.iter().next().or_else(|| state.encryption_states.keys().next()).unwrap() as i64) } else { None },
 
             link: self.link.clone(),
             last_probe: None,
