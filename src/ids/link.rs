@@ -2716,35 +2716,37 @@ impl GlobalLink {
     }
 
     pub fn send(&self, outgoing: &GlobalLinkOutgoingPacket) -> Result<(), PushError> {
-        if !self.link_is_up.load(Ordering::Relaxed) {
-            warn!("Link down; dropping control packet!");
-            return Ok(())
-        }
+        let relay_mode = self.relay_mode.load(Ordering::Relaxed);
+        let qr_down = !self.link_is_up.load(Ordering::Relaxed);
 
         if self.try_send_direct(&outgoing.packet) { return Ok(()) }
-        
+
+        // No direct path: relay via the AVC pod instead of dropping. The pod
+        // stays connected across QR/H3 control-channel outages (all inbound
+        // traffic arrives through it), and U1 calls sit here whenever P2P has
+        // not been nominated yet or failed silently.
+        let (primary_link_id, relay_routed) = if !relay_mode {
+            let link_id = outgoing.participant
+                .and_then(|part| self.participant_states.read().unwrap().get(&part).copied())
+                .and_then(|(_, link_id)| link_id);
+            match link_id {
+                Some(link_id) => (Some(link_id), false),
+                None => {
+                    warn!("No direct path for media{}; relaying via AVC pod",
+                        if qr_down { " (QR link down)" } else { "" });
+                    (None, true)
+                }
+            }
+        } else {
+            (None, true)
+        };
+
         let header = QRMessage {
-            primary_relaylinkid: if self.relay_mode.load(Ordering::Relaxed) {
-                None
-            } else {
-                let Some(part) = outgoing.participant else {
-                    warn!("Refusing to send for part U1!");
-                    return Ok(())
-                };
-                let Some((_, Some(link_id))) = self.participant_states.read().unwrap().get(&part).copied() else {
-                    warn!("No send state i!");
-                    return Ok(())
-                };
-                Some(link_id)
-            },
+            primary_relaylinkid: primary_link_id,
             // TODO find out if these are dependent on probe ID
-            opt_out_priority_filter: self.relay_mode.load(Ordering::Relaxed),
-            channel_priority: if self.relay_mode.load(Ordering::Relaxed) {
-                Some(1)
-            } else { None },
-            channel_data: if self.relay_mode.load(Ordering::Relaxed) {
-                outgoing.stream_id
-            } else { None },
+            opt_out_priority_filter: relay_routed,
+            channel_priority: if relay_routed { Some(1) } else { None },
+            channel_data: if relay_routed { outgoing.stream_id } else { None },
             secondary_streams: outgoing.secondary_stream_ids.clone(),
             count_packet: true,
             probe_groupid: outgoing.probe_id,

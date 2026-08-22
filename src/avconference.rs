@@ -2579,6 +2579,15 @@ pub struct VideoSender {
     last_probe: Option<Instant>,
     pub ssrc: u32,
     pub secondary_streams: Vec<u16>,
+
+    /// Latest raw parameter sets (Annex-B) seen in a Configuration frame.
+    config_raw: Option<Vec<u8>>,
+    /// Latest IRAP (IDR/CRA/BLA) sample, kept so inbound FIRs can be answered
+    /// with an actual keyframe - the camera encoder cannot be commanded from
+    /// Rust, and a peer that missed the initial IDR stays black forever.
+    last_key_frame: Option<Vec<u8>>,
+    last_timestamp: u32,
+    last_key_replay: Option<Instant>,
     
     // all of these cannot be mended with u1 switching.
     enabled_features: EnabledAVFeatures,
@@ -2590,13 +2599,36 @@ pub struct VideoSender {
 }
 
 impl VideoSender {
-    pub fn send_video_frame(&mut self, frame: ChannelFrame, timestamp: u32) -> Result<(), PushError> {
+    pub fn send_video_frame(&mut self, frame: ChannelFrame, _timestamp: u32) -> Result<(), PushError> {
+        // The native HAL/codec stamps frames at synthetic uniform intervals
+        // that do NOT track real capture pace (observed: constant 3000-tick
+        // spacing while actual delivery varied 10-30fps). Receivers pace
+        // playback by RTP timestamp, so a mismatch renders as slow motion
+        // drifting behind live. Derive timestamps from the wall clock so the
+        // timestamp pace always equals reality. u32 wraparound is normal RTP.
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| (d.as_millis() as u32).wrapping_mul(90))
+            .unwrap_or(0);
         let mut nal = match frame {
             ChannelFrame::Configuration(desc) => {
+                if let DecoderConfiguration::Raw(raw, _) = &desc {
+                    self.config_raw = Some(raw.clone());
+                }
                 self.pending_desc = Some(desc);
                 return Ok(())
             }
             ChannelFrame::Sample(mut nal) => {
+                // Samples carry Annex-B start codes; parse the first NAL
+                // properly to detect IRAP (key) frames.
+                if let Some(first_nal) = AnnexB::new(&nal).next() {
+                    if first_nal.len() >= 2 {
+                        let nal_type = (first_nal[0] >> 1) & 0x3f;
+                        if (16..=21).contains(&nal_type) {
+                            self.last_key_frame = Some(nal.clone());
+                        }
+                    }
+                }
                 if self.to_participant.is_some() {
                     self.enabled_features.add_footer(&mut nal, HashMap::from_iter([
                         // ("RVRA1", build_rvra1(1920, 1080).to_vec()),
@@ -2617,6 +2649,7 @@ impl VideoSender {
             }
         };
         let desc = self.pending_desc.take();
+        self.last_timestamp = timestamp;
 
         if let Some(DecoderConfiguration::Raw(raw, _)) = &desc {
             nal.splice(0..0, raw.clone());
@@ -2630,6 +2663,15 @@ impl VideoSender {
                 &desc.encode()
             ].concat();
             payloads.insert(0, format.into());
+        }
+
+        if payloads.is_empty() {
+            // The payloader emitted nothing for this frame (e.g. it contained
+            // only VPS/SPS/PPS that were cached for aggregation with a later
+            // VCL NAL). Nothing to send; this also keeps probe generation
+            // below from indexing payloads[0] on an empty vec.
+            info!("Payloader emitted no payloads; skipping frame");
+            return Ok(())
         }
 
         let time_since_last_probe = self.last_probe.map(|i| i.elapsed()).unwrap_or(Duration::from_hours(1));
@@ -2718,12 +2760,39 @@ impl VideoSender {
             } else {
                 self.link.send(&p)?;
             }
-            
+
         }
 
         self.frame_number = self.frame_number.wrapping_add(1);
 
         Ok(())
+    }
+
+    /// Re-send the most recent keyframe (with parameter sets prepended) so a
+    /// peer that answered our stream late - or lost the initial IDR - can
+    /// start decoding. Called when an inbound FIR asks for a keyframe.
+    pub fn resend_key_frame(&mut self) -> Result<(), PushError> {
+        if let Some(last) = self.last_key_replay {
+            if last.elapsed() < Duration::from_secs(1) {
+                return Ok(())
+            }
+        }
+        let Some(mut nal) = self.last_key_frame.clone() else {
+            warn!("FIR received but no keyframe cached yet");
+            return Ok(())
+        };
+        // Consume any pending config (and fall back to the stashed one) so
+        // VPS/SPS/PPS ride along with the replayed IRAP.
+        let pending = self.pending_desc.take();
+        if let Some(DecoderConfiguration::Raw(raw, _)) = &pending {
+            nal.splice(0..0, raw.clone());
+        } else if let Some(raw) = &self.config_raw {
+            nal.splice(0..0, raw.clone());
+        }
+        self.last_key_replay = Some(Instant::now());
+        info!("Resending cached keyframe in response to FIR ({}B)", nal.len());
+        let ts = self.last_timestamp.wrapping_add(3000);
+        self.send_video_frame(ChannelFrame::Sample(nal), ts)
     }
 }
 
@@ -3092,6 +3161,17 @@ impl AVSession {
                                     info!("Got FIR from participant {participant}: stream_id={} stream_group_id={}", fir.stream_id, fir.stream_group_id);
                                     // Respond to FIR with our stream group state
                                     drop(state);
+                                    // The camera encoder cannot be commanded from
+                                    // Rust; replay our latest keyframe so a peer
+                                    // that missed the initial IDR can start decoding.
+                                    {
+                                        let mut sender = session.video_sender.lock().await;
+                                        if let Some(sender) = sender.as_mut() {
+                                            if let Err(e) = sender.resend_key_frame() {
+                                                warn!("Keyframe replay failed: {e}");
+                                            }
+                                        }
+                                    }
                                     let _ = session.send_control_message(participant as u64, VCControlData::StreamGroupState(HashMap::from_iter([
                                         (1u32, 1u8), // video group
                                         (2u32, 1u8), // audio group
@@ -3185,19 +3265,34 @@ impl AVSession {
         Ok(())
     }
 
-    pub async fn create_audio_sender(&self, stream: Option<u32>, extra_streams: &[u32]) -> AudioSender {
+    pub async fn create_audio_sender(&self, stream: Option<u32>, extra_streams: &[u32]) -> Result<AudioSender, PushError> {
         let state = self.state.lock().await;
-        
+
         let group_stream = stream.map(|i| self.av_config.audio_streams.get(&i).unwrap());
         let ssrc = group_stream.map(|i| i.rtp_ssrc()).unwrap_or(self.av_config.audio_ssrc);
-        
+
         let extra_ssrcs = extra_streams.iter().filter_map(|&i| self.av_config.audio_streams.get(&i))
             .map(|i| i.rtp_ssrc() as u16).collect::<Vec<_>>();
 
         let audio_key = state.my_mkm.get_key(ssrc);
 
+        // U1 (1:1) senders target a specific remote participant. Hosted 1:1
+        // calls never populate active_participants, and encryption_states only
+        // fills in once the peer's key material arrives; error out so the
+        // caller retries on a later frame instead of panicking on the lookup.
+        let to_participant = if group_stream.is_none() {
+            let Some(participant) = state.active_participants.iter().next()
+                .or_else(|| state.encryption_states.keys().next()) else {
+                warn!("Cannot create audio sender: no remote participant known yet");
+                return Err(PushError::FTKeyMissing)
+            };
+            Some(*participant as i64)
+        } else {
+            None
+        };
+
         let mut buffer = self.ssrc_packet_buffer.lock().unwrap();
-        AudioSender {
+        Ok(AudioSender {
             context: Context::new(
                 &audio_key[..16], 
                 &audio_key[16..], 
@@ -3211,7 +3306,7 @@ impl AVSession {
             is_first: true,
 
             ssrc,
-            to_participant: if group_stream.is_none() { Some(*state.active_participants.iter().next().or_else(|| state.encryption_states.keys().next()).unwrap() as i64) } else { None },
+            to_participant,
             secondary_streams: extra_ssrcs,
             
             frame_handler: self.frame_handler.clone(),
@@ -3220,12 +3315,12 @@ impl AVSession {
 
             is_u1: group_stream.is_none(),
             last_worst: (0, 0),
-        }
+        })
     }
 
-    pub async fn create_video_sender(&self, stream: Option<u32>, extra_streams: &[u32]) -> VideoSender {
+    pub async fn create_video_sender(&self, stream: Option<u32>, extra_streams: &[u32]) -> Result<VideoSender, PushError> {
         let state = self.state.lock().await;
-        
+
         let group_stream = stream.map(|i| self.av_config.video_streams.get(&i).unwrap());
         let ssrc = group_stream.map(|i| i.rtp_ssrc()).unwrap_or(self.av_config.video_ssrc);
 
@@ -3244,6 +3339,21 @@ impl AVSession {
 
         let video_key = state.my_mkm.get_key(ssrc);
 
+        // U1 (1:1) senders target a specific remote participant. Hosted 1:1
+        // calls never populate active_participants, and encryption_states only
+        // fills in once the peer's key material arrives; error out so the
+        // caller retries on a later frame instead of panicking on the lookup.
+        let to_participant = if group_stream.is_none() {
+            let Some(participant) = state.active_participants.iter().next()
+                .or_else(|| state.encryption_states.keys().next()) else {
+                warn!("Cannot create video sender: no remote participant known yet");
+                return Err(PushError::FTKeyMissing)
+            };
+            Some(*participant as i64)
+        } else {
+            None
+        };
+
         info!("Video send main ssrc {} extra {:?}", ssrc, extra_ssrcs);
 
         let (sequence_number, frame_number, probe_number) = self.ssrc_packet_buffer.lock().unwrap().get(&ssrc)
@@ -3252,8 +3362,8 @@ impl AVSession {
                     lock.history.back().map(|i| (i.0.wrapping_add(1), lock.last_frame.wrapping_add(1), lock.last_probe))
                 })
                 .unwrap_or((1532, 990, 0 /* is this supposed to be 1? or zero? */));
-        
-        VideoSender {
+
+        Ok(VideoSender {
             hevc: Default::default(), 
             context: Context::new(
                 &video_key[..16], 
@@ -3270,13 +3380,17 @@ impl AVSession {
             enabled_features: self.av_config.enabled_features.clone(),
             ssrc,
             secondary_streams: extra_ssrcs,
-            to_participant: if group_stream.is_none() { Some(*state.active_participants.iter().next().or_else(|| state.encryption_states.keys().next()).unwrap() as i64) } else { None },
+            to_participant,
 
             link: self.link.clone(),
             last_probe: None,
             camera_source: Default::default(),
             packet_buffer: self.ssrc_packet_buffer.lock().unwrap().entry(ssrc).or_default().clone(),
-        }
+            config_raw: None,
+            last_key_frame: None,
+            last_timestamp: 0,
+            last_key_replay: None,
+        })
     }
 
     pub async fn import_avc(&self, p: u64, handle: String, avc_data: &[u8]) -> Result<(), PushError> {

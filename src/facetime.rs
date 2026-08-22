@@ -208,6 +208,13 @@ pub struct FTSession {
     pub is_initiator: bool,
     #[serde(skip)]
     pub pending_keys: Vec<(Vec<u8>, QuickRelaySkmMaterial, QuickRelayMkmMaterial)>,
+    // Latest outbound VPS/SPS/PPS (Annex-B) + timestamp. The camera emits the
+    // parameter sets once at encoder start, which is usually BEFORE a
+    // VideoSender can be created (no remote participant known yet) and before
+    // any mid-call AVSession recreation; stash them here so every new
+    // VideoSender can be seeded with parameter sets on creation.
+    #[serde(skip)]
+    pub pending_video_config: Option<(Vec<u8>, u32)>,
 }
 
 // time to track recently added members
@@ -629,7 +636,8 @@ impl FTClient {
         let media_guid = session.group_id.clone();
         let conn_for_fir: Arc<AVSession> = session.connection.as_ref().unwrap().clone();
         let rt_handle = tokio::runtime::Handle::current();
-        let fir_fired = AtomicBool::new(false);
+        let fir_last_sent_ms = AtomicU64::new(0);
+        let fir_sent_count = AtomicU64::new(0);
         media_handler.configure_handler(Box::new(move |msg: ChannelMessage| {
             let frame = match &msg.frame {
                 ChannelFrame::Sample(data) => data.clone(),
@@ -646,7 +654,24 @@ impl FTClient {
                 frame,
             });
 
-            if !fir_fired.swap(true, Ordering::Relaxed) && matches!(msg.frame, ChannelFrame::Sample(_)) {
+            // Re-request a keyframe periodically while we are receiving
+            // samples: a single FIR is easily missed, and without an IDR the
+            // peer's video can never be decoded. Capped + spaced out so we do
+            // not look abusive to Apple's relays.
+            if matches!(msg.frame, ChannelFrame::Sample(_)) {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let last = fir_last_sent_ms.load(Ordering::Relaxed);
+                let count = fir_sent_count.load(Ordering::Relaxed);
+                if count < 10
+                    && now_ms - last > 5000
+                    && fir_last_sent_ms
+                        .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok()
+                {
+                    fir_sent_count.fetch_add(1, Ordering::Relaxed);
                 let conn = conn_for_fir.clone();
                 let target = msg.participant;
                 let fallback_stream_id = msg.stream_id;
@@ -681,6 +706,7 @@ impl FTClient {
                     }
                 });
             }
+        }
         }));
 
         if relay_session.state.lock().await.active_participants.is_empty() {
@@ -875,6 +901,7 @@ impl FTClient {
             av_config: Some(AVConfig::new()),
             is_initiator: true,
             pending_keys: Vec::new(),
+            pending_video_config: None,
 
             is_video,
         };
