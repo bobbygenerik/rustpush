@@ -643,6 +643,10 @@ impl FTClient {
                 ChannelFrame::Sample(data) => data.clone(),
                 ChannelFrame::Configuration(config) => config.annex_b(),
             };
+            let (width, height) = if let ChannelFrame::Configuration(ref config) = msg.frame {
+                let (w, h) = config.get_dimens();
+                if w > 0 && h > 0 { (Some(w), Some(h)) } else { (None, None) }
+            } else { (None, None) };
             publish_media_frame(FTMediaFrameEnvelope {
                 guid: media_guid.clone(),
                 participant: msg.participant,
@@ -651,6 +655,8 @@ impl FTClient {
                 codec: format!("{:?}", msg.r#type).to_lowercase(),
                 is_configuration: matches!(msg.frame, ChannelFrame::Configuration(_)),
                 timestamp: msg.timestamp,
+                width,
+                height,
                 frame,
             });
 

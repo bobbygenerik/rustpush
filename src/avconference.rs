@@ -6,6 +6,8 @@ use deku::{ctx::Endian, prelude::*};
 use http::Request;
 use rtc_media::{Sample, io::sample_builder::SampleBuilder};
 use rtc_rtcp::transport_feedbacks::transport_layer_nack::{NackPair, TransportLayerNack};
+use rtc_rtcp::receiver_report::ReceiverReport;
+use rtc_rtcp::reception_report::ReceptionReport;
 use rtc_rtp::{Header, Packet, codec::{h264::H264Packet, h265::{H265Packet, HevcPayloader}}, header::Extension, packetizer::{Depacketizer, Payloader}};
 use rtc_srtp::{cipher::new_cipher, context::Context, protection_profile::ProtectionProfile};
 use rustls::pki_types::{CertificateDer, Ipv4Addr, ServerName, UnixTime};
@@ -1105,6 +1107,17 @@ impl Debug for ProbeState {
     }
 }
 
+#[derive(Default)]
+struct SSRCRRState {
+    highest_seq: u32,
+    total_received: u32,
+    total_expected: u32,
+    last_sr_ntp_mid: u32,
+    last_sr_recv: Option<Instant>,
+    last_jitter: f64,
+    last_transit: Option<i64>,
+}
+
 pub struct RecvStatTracker {
     stats: Arc<IncomingFrameStats>,
     probe_states: HashMap<u32, BTreeMap<u16, ProbeState>>,
@@ -1117,6 +1130,13 @@ pub struct RecvStatTracker {
     initial_send_time: HashMap<u64, f64>,
     initial_recv_time: HashMap<u64, Instant>,
     audio_history: Vec<FTAudioControlData>,
+
+    /// Per-SSRC RR tracking: (highest_seq, total_received, last_sr_timestamp, last_sr_recv_time)
+    ssrc_rr_state: HashMap<u32, SSRCRRState>,
+    /// Our random SSRC for outgoing RTCP RR packets.
+    our_ssrc: u32,
+    /// Last time we sent a Receiver Report.
+    last_rr_send: Option<Instant>,
 }
 
 impl RecvStatTracker {
@@ -1132,7 +1152,10 @@ impl RecvStatTracker {
 
             initial_recv_time: HashMap::new(),
             initial_send_time: HashMap::new(),
-            audio_history: Vec::with_capacity(30), // we have 500ms reporting intervals and 20ms AFRC feedback
+            audio_history: Vec::with_capacity(30),
+            ssrc_rr_state: HashMap::new(),
+            our_ssrc: rand::random(),
+            last_rr_send: None,
         }
     }
 
@@ -1153,8 +1176,82 @@ impl RecvStatTracker {
         time_slice.loss_count += loss;
     }
 
+
+    /// Returns an optional Receiver Report packet to send, if enough time has elapsed.
+    fn maybe_build_rr(&mut self) -> Option<BytesMut> {
+        let now = Instant::now();
+        let elapsed = self.last_rr_send.map(|t| t.elapsed()).unwrap_or(Duration::from_secs(10));
+        if elapsed < Duration::from_secs(5) {
+            return None;
+        }
+        self.last_rr_send = Some(now);
+
+        let mut reports = Vec::new();
+        for (ssrc, state) in &self.ssrc_rr_state {
+            let total_expected = state.highest_seq.wrapping_add(1);
+            let total_lost = total_expected.saturating_sub(state.total_received);
+            let fraction_lost: u8 = if total_expected > 0 {
+                ((total_lost as f64 / total_expected as f64) * 256.0) as u8
+            } else { 0 };
+
+            let dlsr = if let Some(recv_time) = state.last_sr_recv {
+                let elapsed_ticks = recv_time.elapsed().as_millis() as u32 * 65536 / 1000;
+                elapsed_ticks
+            } else { 0 };
+
+            reports.push(ReceptionReport {
+                ssrc: *ssrc,
+                fraction_lost,
+                total_lost: total_lost.min((1 << 24) - 1),
+                last_sequence_number: state.highest_seq,
+                jitter: state.last_jitter as u32,
+                last_sender_report: state.last_sr_ntp_mid,
+                delay: dlsr,
+            });
+        }
+
+        if reports.is_empty() { return None; }
+
+        let rr = ReceiverReport {
+            ssrc: self.our_ssrc,
+            reports,
+            profile_extensions: prost::bytes::Bytes::new(),
+        };
+
+        let buf = rr.marshal().ok()?;
+        Some(buf)
+    }
+
     fn track(&mut self, recv: &GlobalPacket, header: &Header, elapsed_packets: u16, callback: &tokio::sync::mpsc::Sender<AVInternalMessage>, ssrc: &AVSessionSSRC) -> Option<FTVideoControlData> {
         self.stats.total_recv_bytes.fetch_add(recv.packet_size as u64, Ordering::Relaxed);
+
+        // Update per-SSRC RR state
+        {
+            let state = self.ssrc_rr_state.entry(header.ssrc).or_default();
+            let seq = header.sequence_number as u32;
+            if state.total_received == 0 {
+                state.highest_seq = seq;
+            } else if seq > (state.highest_seq & 0xFFFF) || seq < 100 && (state.highest_seq & 0xFFFF) > 60000 {
+                // Handle wrap-around
+                let cycles = state.highest_seq >> 16;
+                let new_ext = if seq < 100 && (state.highest_seq & 0xFFFF) > 60000 {
+                    (cycles + 1) << 16 | seq
+                } else {
+                    cycles << 16 | seq
+                };
+                state.highest_seq = new_ext;
+            }
+            state.total_received += 1;
+
+            // Jitter calculation per RFC 3550 A.8
+            let arrival_ms = recv.time_parsed.elapsed().as_millis() as i64 * 48;
+            let transit = header.timestamp as i64 - arrival_ms;
+            if let Some(last_transit) = state.last_transit {
+                let d = (transit - last_transit).abs() as f64;
+                state.last_jitter += (d - state.last_jitter) / 16.0;
+            }
+            state.last_transit = Some(transit);
+        }
 
         if let Some(probe) = recv.probe_id {
             let item = self.probe_states.entry(header.ssrc).or_default();
@@ -1557,6 +1654,13 @@ impl IncomingFrameHandler {
 
                 
                 let video_meta = stat_tracker.track(&recv, &header, tracked_packets, &control, &ssrc);
+
+                // Send periodic RTCP Receiver Reports
+                if let Some(rr_buf) = stat_tracker.maybe_build_rr() {
+                    if let Err(e) = control.try_send(AVInternalMessage::RtcpOutgoing(participant, rr_buf)) {
+                        warn!("Failed to queue RTCP RR: {e}");
+                    }
+                }
                 
                 let context = ssrc.srtp_contexts.entry(header.ssrc).or_default().get_context_for_mki(mki, || {
                     let mkm = ssrc.mkms.iter().find(|i| &i.mki[..mki.len()] == mki).unwrap();
@@ -2906,7 +3010,7 @@ impl AudioSender {
                 padding: false,
                 extension: self.is_u1,
                 marker: self.is_first,
-                payload_type: 108,
+                payload_type: 104,
                 sequence_number: self.sequence_number,
                 timestamp,
                 ssrc: self.ssrc,
@@ -2978,6 +3082,9 @@ pub struct AVSession {
     /// Lazily-created outgoing video sender, cached for the lifetime of the
     /// session so RTP sequence numbers stay monotonic across frames.
     pub video_sender: tokio::sync::Mutex<Option<VideoSender>>,
+
+    /// Lazily-created outgoing audio sender.
+    pub audio_sender: tokio::sync::Mutex<Option<AudioSender>>,
 }
 
 impl AVSession {
@@ -3034,6 +3141,7 @@ impl AVSession {
             u1: AtomicBool::new(participants.len() <= 2),
 
             video_sender: tokio::sync::Mutex::new(None),
+            audio_sender: tokio::sync::Mutex::new(None),
         });
 
         let avc_mat_id: [u8; 20] = rand::random();
@@ -4398,6 +4506,8 @@ pub struct FTMediaFrameEnvelope {
     pub codec: String,
     pub is_configuration: bool,
     pub timestamp: u32,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
     #[serde(serialize_with = "serialize_frame_b64")]
     pub frame: Vec<u8>,
 }
