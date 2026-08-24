@@ -670,23 +670,28 @@ impl FTClient {
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0);
                 let last = fir_last_sent_ms.load(Ordering::Relaxed);
-                let count = fir_sent_count.load(Ordering::Relaxed);
-                if count < 10
-                    && now_ms - last > 5000
+                let count = fir_sent_count.fetch_add(1, Ordering::Relaxed);
+                // No cap: Apple keeps asking us every 5s indefinitely, so we
+                // mirror that cadence until an IDR finally arrives and the
+                // decoder starts producing output.
+                if now_ms - last > 2000
                     && fir_last_sent_ms
                         .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
                         .is_ok()
                 {
-                    fir_sent_count.fetch_add(1, Ordering::Relaxed);
                 let conn = conn_for_fir.clone();
                 let target = msg.participant;
                 let fallback_stream_id = msg.stream_id;
                 rt_handle.spawn(async move {
-                    // Look up the remote participant's video stream IDs from
-                    // their negotiated config so the FIR targets the correct
-                    // stream.  msg.stream_id is 0 when the SSRC isn't
-                    // recognized as a group stream (common on first frames).
-                    let (stream_id, stream_group_id) = {
+                    // Prefer the exact stream_id/stream_group_id the peer used
+                    // when THEY asked us for keyframes: those describe their
+                    // receive layout, which is what our request must target.
+                    // Fall back to locally computed IDs only if unseen yet.
+                    let cached = crate::avconference::PEER_FIR_PARAMS.lock().ok()
+                        .and_then(|m| m.get(&target).copied());
+                    let (stream_id, stream_group_id) = if let Some(params) = cached {
+                        params
+                    } else {
                         let state = conn.state.lock().await;
                         if let Some(enc) = state.encryption_states.get(&target) {
                             if let Some(video_group) = enc.stream_groups.get(&1) {
@@ -701,11 +706,11 @@ impl FTClient {
                             (fallback_stream_id, 0)
                         }
                     };
-                    info!("Sending FIR to {target}: stream_id={stream_id} stream_group_id={stream_group_id}");
+                    info!("Sending FIR to {target}: stream_id={stream_id} stream_group_id={stream_group_id} (cached={})", cached.is_some());
                     match conn.send_control_message(target, VCControlData::GenerateKeyFrame(VCGenerateKeyFrame {
                         stream_id,
                         stream_group_id,
-                        fir_type: 4,
+                        fir_type: 2,
                     })).await {
                         Ok(_) => info!("Requested keyframe (FIR) from participant {target} stream_id={stream_id}"),
                         Err(e) => warn!("Keyframe request to participant {target} failed: {e}"),

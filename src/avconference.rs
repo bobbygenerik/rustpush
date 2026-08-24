@@ -409,6 +409,12 @@ impl ImageDescription {
         sps: &[u8],
         pps: &[u8],
     ) -> Result<Self, PushError> {
+        // The description MUST advertise the ACTUAL coded size. Hardcoding
+        // 1920x1080 while the encoder emits 1280x720 makes Apple clients map
+        // the picture into the wrong geometry (inverted / edge distortion).
+        let (real_w, real_h) = h265_sps_dimens(sps).unwrap_or((1280, 720));
+        let real_w = if real_w > 0 { real_w as u16 } else { 1280 };
+        let real_h = if real_h > 0 { real_h as u16 } else { 720 };
         let mut compressor_name = [0; 32];
         compressor_name[..5].copy_from_slice(b"\x04HEVC");
 
@@ -440,8 +446,8 @@ impl ImageDescription {
                 vendor: [0; 4],
                 temporal_quality: 512,
                 spatial_quality: 512,
-                width: 1920,
-                height: 1080,
+                width: real_w,
+                height: real_h,
                 horizontal_resolution: 0x0048_0000,
                 vertical_resolution: 0x0048_0000,
                 data_size: 0,
@@ -2178,6 +2184,14 @@ pub struct VCDeviceState {
     pub slice_status: Option<u32>,
 }
 
+/// Last FIR parameters each peer used when asking US for a keyframe.
+/// Their stream_id/stream_group_id describe THEIR receive layout, so these
+/// are the correct values to echo back when we request a keyframe from them
+/// (our locally computed IDs do not match Apple's client expectations).
+pub static PEER_FIR_PARAMS: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<u64, (u32, u32)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 pub struct VCGenerateKeyFrame {
     #[serde(rename = "VCSessionMessageStreamID")]
@@ -2680,6 +2694,7 @@ pub struct VideoSender {
     sequence_number: u16,
     probe_number: u16,
     pending_desc: Option<DecoderConfiguration>,
+    cached_image_desc: Option<ImageDescription>,
     last_probe: Option<Instant>,
     pub ssrc: u32,
     pub secondary_streams: Vec<u16>,
@@ -2692,6 +2707,13 @@ pub struct VideoSender {
     last_key_frame: Option<Vec<u8>>,
     last_timestamp: u32,
     last_key_replay: Option<Instant>,
+    /// RTCP Sender Report accounting: without periodic SRs the peer cannot
+    /// map our RTP timestamps to its playout clock and discards every frame
+    /// as "too old" (observed as a constant ~19s playout delta on Apple
+    /// clients, showing as frozen video / "Connection Unstable").
+    sent_packets: u64,
+    sent_octets: u64,
+    last_sr_send: Option<Instant>,
     
     // all of these cannot be mended with u1 switching.
     enabled_features: EnabledAVFeatures,
@@ -2719,6 +2741,9 @@ impl VideoSender {
                 if let DecoderConfiguration::Raw(raw, _) = &desc {
                     self.config_raw = Some(raw.clone());
                 }
+                if let DecoderConfiguration::ImageDescription(ref img) = desc {
+                    self.cached_image_desc = Some(img.clone());
+                }
                 self.pending_desc = Some(desc);
                 return Ok(())
             }
@@ -2735,7 +2760,6 @@ impl VideoSender {
                 }
                 if self.to_participant.is_some() {
                     self.enabled_features.add_footer(&mut nal, HashMap::from_iter([
-                        // ("RVRA1", build_rvra1(1920, 1080).to_vec()),
                         ("CH1", vec![0x00, 0x00]),
                         ("CR", vec![0x65, 0x43, 0x00, 0x00]),
                         ("FA", vec![0x3e, 0x3e, 0xc0, 0xc0]),
@@ -2743,7 +2767,7 @@ impl VideoSender {
                 } else {
                     GROUP_H265_FEATURES.add_footer(&mut nal, HashMap::from_iter([
                         // FIX GROUP RESOLUTION
-                        ("RVRA1", build_rvra1(1920, 1080).to_vec()),
+                        ("RVRA1", build_rvra1(1280, 720).to_vec()),
                         ("CH1", vec![0x00, 0x00]),
                         ("CR", vec![0x00, 0x00, 0x00, 0x00]),
                         ("FA", vec![0x3e, 0x3e, 0xc0, 0xc0]),
@@ -2810,7 +2834,7 @@ impl VideoSender {
             version: if self.to_participant.is_some() { 2 } else { 1 },
             camera_status: self.camera_source,
             ltr_bits: if desc.is_some() { 1 } else { 0 },
-            total_packets_per_frame: Some(payloads.len() as u16),
+            total_packets_per_frame: Some((payloads.len() - if matches!(&desc, Some(DecoderConfiguration::ImageDescription(_))) { 1 } else { 0 }) as u16),
             frame_sequence_number: Some(self.frame_number),
             ..Default::default()
         };
@@ -2845,6 +2869,8 @@ impl VideoSender {
             let result = packet.marshal().unwrap();
 
             let encrypted = self.context.encrypt_rtp(&result).unwrap();
+            self.sent_octets = self.sent_octets.wrapping_add(encrypted.len() as u64);
+            self.sent_packets = self.sent_packets.wrapping_add(1);
             self.sequence_number = self.sequence_number.wrapping_add(1);
 
             // info!("SEnding video payload Encrypted {}", encode_hex(&encrypted));
@@ -2868,6 +2894,32 @@ impl VideoSender {
         }
 
         self.frame_number = self.frame_number.wrapping_add(1);
+
+        let sr_due = self.last_sr_send.map(|t| t.elapsed() >= Duration::from_secs(3)).unwrap_or(true);
+        if sr_due && self.to_participant.is_some() {
+            self.last_sr_send = Some(Instant::now());
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let ntp = ((now.as_secs() + 2208988800) << 32)
+                | (((now.subsec_nanos() as u64) << 32) / 1_000_000_000);
+            let sr = rtc_rtcp::sender_report::SenderReport {
+                ssrc: self.ssrc,
+                ntp_time: ntp,
+                rtp_time: timestamp,
+                packet_count: self.sent_packets as u32,
+                octet_count: self.sent_octets as u32,
+                reports: vec![],
+                profile_extensions: prost::bytes::Bytes::new(),
+            };
+            if let Ok(buf) = sr.marshal() {
+                if let Err(e) = self.link.send_rtcp(self.to_participant.unwrap(), &buf) {
+                    warn!("Failed to send video SR: {e}");
+                } else {
+                    info!("Sent video SenderReport ssrc={} rtp_ts={} pkts={}", self.ssrc, timestamp, self.sent_packets);
+                }
+            }
+        }
 
         Ok(())
     }
@@ -2896,6 +2948,11 @@ impl VideoSender {
         self.last_key_replay = Some(Instant::now());
         info!("Resending cached keyframe in response to FIR ({}B)", nal.len());
         let ts = self.last_timestamp.wrapping_add(3000);
+        // Re-include the ImageDescription so the receiver can
+        // (re-)configure its decoder. Apple clients need it on every IDR.
+        if let Some(img_desc) = &self.cached_image_desc {
+            self.pending_desc = Some(DecoderConfiguration::ImageDescription(img_desc.clone()));
+        }
         self.send_video_frame(ChannelFrame::Sample(nal), ts)
     }
 }
@@ -3267,6 +3324,10 @@ impl AVSession {
                             AVControlCommand::AVControl { participant, data } => {
                                 if let VCControlData::GenerateKeyFrame(fir) = &data {
                                     info!("Got FIR from participant {participant}: stream_id={} stream_group_id={}", fir.stream_id, fir.stream_group_id);
+                                    {
+                                        let mut cache = PEER_FIR_PARAMS.lock().unwrap();
+                                        cache.insert(participant as u64, (fir.stream_id, fir.stream_group_id));
+                                    }
                                     // Respond to FIR with our stream group state
                                     drop(state);
                                     // The camera encoder cannot be commanded from
@@ -3484,6 +3545,7 @@ impl AVSession {
             sequence_number,
             probe_number,
             pending_desc: None,
+            cached_image_desc: None,
 
             enabled_features: self.av_config.enabled_features.clone(),
             ssrc,
@@ -3493,6 +3555,9 @@ impl AVSession {
             link: self.link.clone(),
             last_probe: None,
             camera_source: Default::default(),
+            sent_packets: 0,
+            sent_octets: 0,
+            last_sr_send: None,
             packet_buffer: self.ssrc_packet_buffer.lock().unwrap().entry(ssrc).or_default().clone(),
             config_raw: None,
             last_key_frame: None,
@@ -4689,7 +4754,7 @@ impl AVConfig {
                 cap_wifi: Some(6500),
             }),
             codec_support: Some(VcMediaNegotiationBlobV2CodecFeatures {
-                audio_features: None,
+                audio_features: Some(0x2),  // AAC-LC only (Samsung ELD broken for Apple)
                 video_features: Some(video_features.clone()),
             }),
             microphone_u1: Some(VcMediaNegotiationBlobV2MicrophoneSettingsU1 {
