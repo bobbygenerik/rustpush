@@ -2,7 +2,7 @@ use std::{collections::{BTreeMap, HashMap, HashSet, VecDeque}, fmt::Debug, net::
 
 use aes_gcm::{AeadInPlace, Aes256Gcm, Nonce, Tag, aead::Payload};
 use deku::{bitvec::BitStore, prelude::*};
-use h3::{client::{self, SendRequest}, quic::StreamId};
+use h3::{client::{self, SendRequest}, error::ConnectionError, quic::StreamId};
 use h3_quinn::Connection;
 use hkdf::{Hkdf, hmac::Hmac};
 use hkdf::hmac::Mac;
@@ -12,7 +12,7 @@ use log::{info, warn};
 use mio::{Events, Interest, Registry, Token};
 use openssl::{bn::BigNumContext, derive::Deriver, ec::{EcGroup, EcKey, EcPoint, PointConversionForm}, hash::MessageDigest, nid::Nid, pkey::{PKey, Private, Public}, sign::Signer, symm::{Cipher, Crypter, Mode, decrypt, encrypt}};
 use plist::Data;
-use quinn::{AsyncUdpSocket, EndpointConfig, Pod, TransportConfig, crypto::rustls::QuicClientConfig, default_runtime, udp::RecvMeta};
+use quinn::{AsyncUdpSocket, EndpointConfig, IdleTimeout, Pod, TransportConfig, crypto::rustls::QuicClientConfig, default_runtime, udp::RecvMeta};
 use rtc_media::io::sample_builder::SampleBuilder;
 use rtc_rtp::codec::h265::H265Packet;
 use rtc_shared::{TransportContext, TransportProtocol, marshal::Unmarshal};
@@ -21,15 +21,16 @@ use rustls::pki_types::{CertificateDer, IpAddr, Ipv4Addr, ServerName, UnixTime};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use rtc_stun::{attributes::{ATTR_ERROR_CODE, AttrType, RawAttribute}, integrity::MessageIntegrity, message::{BINDING_REQUEST, BINDING_SUCCESS, CLASS_INDICATION, Getter, METHOD_APPLE_ERROR, METHOD_DATA, MessageType, Method, Setter, TransactionId}, xoraddr::XorMappedAddress};
-use tokio::{select, sync::{Mutex, RwLock}, time::{Instant, sleep_until}};
+use tokio::{select, sync::{Mutex, RwLock}, time::{Instant, MissedTickBehavior, sleep_until}};
 use uuid::Uuid;
-use prost::{Message, bytes::BytesMut};
+use prost::{Message, bytes::{Bytes, BytesMut}};
 use prost::bytes::Buf;
 use std::io::{Cursor, Read};
 use aes_gcm::KeyInit;
 use aes_gcm::aead::Aead;
 use sansio::Protocol;
-use crate::{APSMessage, ids::link::qrp::{IdsqrProtoAllocBindStaleLink, IdsqrProtoMaterial, IdsqrProtoMaterialInfo, IdsqrProtoPeerPublishedStream, IdsqrProtoPutMaterialRequest, IdsqrProtoSessionInfoResponse, IdsqrProtoSubscribedStream, IdsqrProtoUnAllocBindRequest, PsidsLinkHbhEncryptedPayload}, util::{BinaryReadExt, bin_deserialize, bin_serialize, decode_hex, duration_since_epoch, inflate}};
+use backon::{ConstantBuilder, Retryable};
+use crate::{APSMessage, ids::link::qrp::{IdsqrProtoAllocBindStaleLink, IdsqrProtoMaterial, IdsqrProtoMaterialInfo, IdsqrProtoPeerPublishedStream, IdsqrProtoPutMaterialRequest, IdsqrProtoSessionInfoResponse, IdsqrProtoStatsRequest, IdsqrProtoSubscribedStream, IdsqrProtoUnAllocBindRequest, PsidsLinkHbhEncryptedPayload}, util::{BinaryReadExt, bin_deserialize, bin_serialize, decode_hex, duration_since_epoch, inflate}};
 
 use crate::{CompactECKey, DebugMutex, IdentityManager, MessageTarget, PushError, aps::get_message, ids::{identity_manager::{IDSQuickRelaySettings, IDSSendMessage}, link::qrp::IdsqrProtoH3Message, user::QueryOptions}, util::encode_hex};
 
@@ -38,6 +39,72 @@ pub mod qrp {
 }
 
 const TOPIC: &'static str = "com.apple.private.alloy.facetime.multi";
+
+struct LinkState {
+    hbh_key: [u8; 64],
+    ids_id_map: HashMap<u64, i64>,
+    session_key_material: [u8; 48],
+}
+
+struct ConnectedLink {
+    relay_addr: SocketAddr,
+    quic: quinn::Connection,
+    h3: SendRequest<h3_quinn::OpenStreams, rasn::prelude::OctetString>,
+}
+
+impl ConnectedLink {
+    pub async fn unalloc_bind(&mut self) -> Result<(), PushError> {
+        self.contact_qr("PUT", "UnAllocBind", &IdsqrProtoH3Message {
+            unallocbind_request: Some(IdsqrProtoUnAllocBindRequest {
+                reason: Some(1),
+                client_context_blob: None,
+            }),
+            ..Default::default()
+        }).await?;
+
+        // should connection close Application
+        // App error code 256
+        // reason "QR Disconnects"
+        Ok(())
+    }
+
+    pub async fn contact_qr(&mut self, method: &str, path: &str, message: &IdsqrProtoH3Message) -> Result<IdsqrProtoH3Message, PushError> {
+        let body = message.encode_to_vec();
+        
+        let txn_id: u32 = rand::random();
+        let req = Request::builder()
+            .method(method)
+            .uri(format!("https://{}/QR/{}", self.relay_addr, path))
+            .header("version", "1.1")
+            .header("user-agent", "GFT/2.0")
+            .header("accept", "*/*")
+            .header("txn_id", txn_id.to_string())
+            .header("content-length", body.len().to_string())
+            .body(()).unwrap();
+
+        let mut stream = self.h3.send_request(req).await?;
+
+        stream.send_data(body.into()).await?;
+        stream.finish().await?;
+
+        
+        let mut total = vec![];
+        let resp = stream.recv_response().await?;
+        while let Some(mut chunk) = stream.recv_data().await? {
+            while chunk.has_remaining() {
+                let cnt = chunk.chunk().len();
+                total.extend_from_slice(chunk.chunk());
+                chunk.advance(cnt);
+            }
+        }
+
+        if !resp.status().is_success() {
+            warn!("QR request failed with status {} {}", resp.status().as_u16(), encode_hex(&total));
+        }
+
+        Ok(IdsqrProtoH3Message::decode(Cursor::new(total)).unwrap())
+    }
+}
 
 #[derive(Debug)]
 struct NoCertificateVerification;
@@ -252,7 +319,7 @@ impl QRMessage {
         my_state.has_priority = self.channel_priority.is_some();
     }
 
-    fn parse_loose_body<'t>(&mut self, total: &'t [u8], body: &mut &'t [u8]) -> &'t [u8] {
+    fn parse_loose_body<'t>(&mut self, total: &'t [u8], body: &mut &'t [u8]) -> Option<&'t [u8]> {
         let mut idx = 0;
 
         let mut state = QR_PARSER_STATE.lock().unwrap();
@@ -271,9 +338,10 @@ impl QRMessage {
         }
 
         if self.maybe_base_layer_stream_id.is_some() && !self.count_packet && self.opt_out_priority_filter {
+            let extra_state = state.entry(self.maybe_base_layer_stream_id.unwrap()).or_default();
             // don't parse priority.
             // I made up this rule, seems to work sometiimes
-            info!("QR failed to parse prioirty {} {} {}", encode_hex(total), encode_hex(body), idx);
+            info!("QR failed to parse prioirty {} {} {} {}", encode_hex(total), encode_hex(body), idx, extra_state.has_priority);
         } else if my_state.as_ref().map(|i| i.has_priority).unwrap_or(false) {
             self.channel_priority = Some(1);
             idx += 1;
@@ -289,16 +357,18 @@ impl QRMessage {
         }
 
         if idx > body.len() {
-            panic!("QR failed to parse 2 {} {} {}", encode_hex(total), encode_hex(body), idx);
+            warn!("QR failed to parse 2 {} {} {}", encode_hex(total), encode_hex(body), idx);
+            return None;
         }
 
-        if body[idx] >> 6 == 0 {
+        Some(if body[idx] >> 6 == 0 {
             // not SFrame (0x40) or RTP (0x90/0x80), must be length
             let payload_len = u16::from_be_bytes(body[idx..idx + 2].try_into().unwrap()) as usize;
             let end = idx + 2 + payload_len;
 
             if end > body.len() {
-                panic!("QR failed to parse 3 {} {} {}", encode_hex(total), encode_hex(body), idx);
+                warn!("QR failed to parse 3 {} {} {}", encode_hex(total), encode_hex(body), idx);
+                return None;
             }
 
             let res = &body[end..];
@@ -307,7 +377,7 @@ impl QRMessage {
         } else {
             *body = &body[idx..];
             &[]
-        }
+        })
     }
 
     fn read_stats_payload(data: &mut Cursor<&[u8]>) -> Option<[u8; 12]> {
@@ -466,6 +536,15 @@ impl QRMessage {
 #[test]
 fn test_parse_qr_base_layer_stream_id() {
     let parser = decode_hex("00cdd6e082b9d01de78471ad7f010e806864b7000f9fd0b0d9d6e00056659f6de4d94d0778d1ffecb2c7c69ff74af55a91e4153513ce2e165fc6424a8c870d6082b53524aa683456b2dd5c8cf127ad2157052364dea66fa99b6ad57e359bce59fc07350b8cc81e09dd593a3650198f37a65f3bc8bdc22d030f680f572d04331981f59eb3cbe799a22add5e3a2163a8c668c16a9010ce07bfd5bb6f7ab4e78b9a7bf79faade09394c506786011b2e7aed9388c4432fbd065ad3957a17f9f83e8be36cf867c882fe88b2e02205fb794d2ef012553fb807ea56634fc6fec3cccc6427147f6a1c4b07be63a7b3c2b0e1c4a00f4537c866dbbfb69334c2a515020cdb7c6bb42d3ff377f3013704695e12c4cd1c6984fcb20d680011000000208104001082b9d01de78471ad202c009690fbc373000f9f793ba10abd43000000e4e2115627ae56f58f1512701c5b93f891712de9df4ab9b5cb82129f51079325ccd3a5ffc620b9b0b50ceeb48532594c6c349066eb466ca6cc0790e90f8bebdcdd2917c6a910568d7f5cdc09b6d3376af93b04e60ef315f667327525d1375e4a9997cc2357b2a7385bdd0a886becad62787040d6f54a87658d5546fc3abb8d4300110000002005e47c3c3a425606b7e47d90e4ed79000f9f793d4d06b64300000076100bce4f5ac6318e9ee7a4a08223a5acccb2c0659233b65a8c83f1d653f88770f7bb4a0f9b7b019d5af59f20f583af0a84af1f92e329e1b76ae2443f7cae6e60ac0c99503d98a2948e924f98e1f45706b19cc96e6825c5d540d7687e6addd37bc151c66cf421aac960f023a2e78a440549df4434f82a9e4e90539e0600e21c350e226e370632ae38ded7f6ee9b1b288d51021bee41e8e35d5f56d87d79c0cec9b86cd397562e7e449d4125297a51585e86c5d18aad4a7dd123abda1e2fb057f57eda4fd507871c4d63231e976efaa8134c83f8df6ef44cac55011ea7887c72959ee2fcb37993986226182e17b7e5d994f003c147dcbccee2353a6b9c511e65dc9db99b3840de85ccdb053f50c3a0de282cca3247d224c9f57f03e93be141e69abbb0b739f3fd18b85b31afa5ec51a7374885089bd52f7867a73c9b569d40d21d440637062ee3071aaf00308a5e7954673725e89597689b5dfea7c08249b88aecf7f635eb2460e9c79bcd4075e5343d73065640843f7d26ce2796f5eb9ffd9322f8843e7d3481fb856d30a58b23a320b82e0171001100000020").unwrap();;
+    for item in QRParser::new(&parser) {
+        println!("{:?} {}", item.header, encode_hex(item.body));
+    }
+    panic!();
+}
+
+#[test]
+fn testpmine() {
+    let parser = decode_hex("00cfd08d01d0f104cdccac464393148000fb8068c64500005460405bd08d60c6f2703a0bed3a2afc61a44f3f63cb001e02332e0ff29c7816eb3e52299e967c2c4fb158cc9f2efe90042951e39c113fa3a513504f4c0ed076a18d8b6da9dfe97d35837c8e14f9b78d815ae92d5b292fc765f3f4966bca92a94175da3ed1d336cb175d98cf5b9687d54a598d498d146e850a3d0bc13a2dd9c7335148b114f0b46497cb340ed4e08fee8bc07d07fc5c20109bfaa0918f720efa32b9fed4fa010dc12169aec0f9de29d6a27e0f5fe86b3395f023c4503326f2648d19ca428c0894c450ce3d7d4d5c629f28b74f34d2e243d7b18d6f18a97ad62ea2837a9bf9ecc5905efb5c2a33be9a001000000020810c001004cdccac46439314d8d90190fb77690000538f1c527c8b430000005eb20b37370c64cf682f3cf1f9c5a577985e051689207a3e7efa5c277852ec0c3ff9efe5d74e59194d9d0cfd04dee35eb50ac2dc97b8c48d331756669b84ad001114c2062acbfd243c105c095bcc0e30bfe9e5fe9e4287923066fd38dd6da2c30d4b780b396d75ca59753f0bf16ab8a8894627854e4eeb4392ca6f2df70e2a976e607e1c808977cd32e15c63ea45e76a037dde440d7dd2638e680689f3826dc89eab74a60bc72f5fa19685c1c2a0c7174b08d2f63175cd3370d9ca7dc41818b1e4b28b9c06445f72f76e71972470eba1fad75ba4dabbac6e001000000020").unwrap();;
     for item in QRParser::new(&parser) {
         println!("{:?} {}", item.header, encode_hex(item.body));
     }
@@ -773,22 +852,26 @@ pub struct IDSChannel {
 }
 
 impl IDSChannel {
-    fn new(pod: Pod, session_id: Vec<u8>, packet_parser: Arc<std::sync::RwLock<GlobalPacketParser>>, hbh_key: [u8; 64], internal_send: tokio::sync::mpsc::Sender<GlobalLinkInternalChange>) -> Self {
+    fn new(pod: Pod, session_id: Vec<u8>, packet_parser: Arc<GlobalPacketParser>, internal_send: tokio::sync::mpsc::Sender<GlobalLinkInternalChange>) -> Self {
         let (tracked_send, mut tracked_recv) = tokio::sync::mpsc::channel::<IDSChannelMessage>(1024);
 
         let pod_sid_clone = session_id.clone();
         let mut pod_copy = pod.clone();
+        let mut pod_dead = false;
         tokio::spawn(async move {
             let mut pending_messages: BTreeMap<Instant, LinkMessage> = BTreeMap::new();
-            let far_future = Instant::now() + Duration::from_secs(100 * 365 * 24 * 60 * 60);
             let mut ids_send_counters: HashMap<u16, u16> = HashMap::new();
             loop {
+                let far_future = Instant::now() + Duration::from_secs(1 * 60 * 60);
                 select! {
                     recv = tracked_recv.recv() => {
                         let Some(recv) = recv else { break };
 
                         match recv {
-                            IDSChannelMessage::NewPod(pod) => pod_copy = pod,
+                            IDSChannelMessage::NewPod(pod) => {
+                                pod_copy = pod;
+                                pod_dead = false;
+                            },
                             IDSChannelMessage::Queue(mut recv) => {
                                 let send_counter = ids_send_counters.entry(recv.command).or_default();
                                 *send_counter += 1;
@@ -800,17 +883,22 @@ impl IDSChannel {
                             }
                         }
                     },
-                    _ = sleep_until(pending_messages.keys().next().copied().unwrap_or(far_future)) => {
+                    _ = sleep_until(pending_messages.keys().next().copied().unwrap_or(far_future)), if !pod_dead => {
+                        if pending_messages.is_empty() { continue };
                         let next = pending_messages.pop_first().unwrap().1;
                         info!("Resending message with {next:?}");
                         send_pod(&pod_copy, &next.to_raw(Some(&pod_sid_clone)));
                         pending_messages.insert(Instant::now() + Duration::from_millis(500), next);
                     },
-                    datagram = pod_copy.read_datagram() => {
-                        let Ok(datagram) = datagram else { continue };
+                    datagram = pod_copy.read_datagram(), if !pod_dead => {
+                        let Ok(datagram) = datagram else {
+                            warn!("Got Pod Error {datagram:?}");
+                            pod_dead = true;
+                            continue
+                        };
                         info!("Got IDS Payload {}", encode_hex(&datagram));
 
-                        for parsed in packet_parser.read().unwrap().parse(&datagram, LinkType::Pod) {
+                        for parsed in packet_parser.parse(&datagram, LinkType::Pod) {
                             let Some(msg) = LinkMessage::from_raw(&parsed.data, &pod_sid_clone) else { continue };
                             info!("Got msg {msg:?}");
                             
@@ -1037,6 +1125,107 @@ impl QuickRelayAllocationsResponse {
             sending_states.entry(participant.id).or_insert((mapped_id, None));
         }
     }
+
+    async fn connect(
+        &self, 
+        sending_states: &mut HashMap<i64, (u64, Option<u16>)>, 
+        multiplex: Arc<MultiplexEndpoint>,
+        state: Arc<std::sync::RwLock<LinkState>>,
+    ) -> Result<(h3::client::Connection<h3_quinn::Connection, Bytes>, ConnectedLink), PushError> {
+        let mut client_crypto: ClientConfig = rustls_psk::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+            .with_no_client_auth();
+
+        let salt: [u8; 12] = rand::random();
+        
+        let hk = Hkdf::<Sha256>::new(Some(&salt), self.session_key.as_ref() /*always 20 bytes */);
+        let mut expanded_key = [0u8; 32];
+        hk.expand(b"QR-QUIC-V0", &mut expanded_key).unwrap();
+
+        let identity = [
+            vec![0],
+            salt.to_vec(),
+            self.session_token.as_ref().to_vec(),
+        ].concat();
+
+        let target_ip: [u8; 4] = self.relay_ip.as_ref().to_vec().try_into().unwrap();
+        
+        let server_name = ServerName::IpAddress(IpAddr::V4(Ipv4Addr::from(target_ip)));
+
+        let mut keys = PresharedKeySet::default();
+        keys.update(server_name.clone(), Arc::new([PresharedKey::external(
+            &identity, 
+            &expanded_key
+        ).unwrap()]));
+        client_crypto.preshared_keys = Arc::new(keys);
+
+        client_crypto.preshared_keys.keys(&server_name).unwrap();
+        client_crypto.alpn_protocols = vec!["h3".into()];
+        client_crypto.key_log = Arc::new(KeyLogFile::new());
+
+        let hbh_info = [
+            b"QR-HBH-KDF",
+            self.relay_id.as_ref(),
+            &self.id.to_be_bytes(),
+        ].concat();
+        let mut hbh_key_material = [0u8; 64];
+        hk.expand(&hbh_info, &mut hbh_key_material).unwrap();
+
+
+        let info = [
+            b"QuickRelay KDF",
+            self.relay_id.as_ref(),
+            &self.id.to_be_bytes(),
+        ].concat();
+        let mut session_key_material = [0u8; 48];
+        hk.expand(&info, &mut session_key_material).unwrap();
+
+        let mut ids_id_map = HashMap::new();
+        self.generate_participant_map(sending_states, &mut ids_id_map, &session_key_material);
+        info!("Relay ID Map: {:?}", ids_id_map);
+
+        *state.write().unwrap() = LinkState {
+            hbh_key: hbh_key_material,
+            ids_id_map,
+            session_key_material,
+        };
+
+        let runtime = default_runtime().unwrap();
+
+        let mut client_config =
+            quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_crypto).unwrap()));
+        let mut endpoint = quinn::Endpoint::new_with_abstract_socket(
+            EndpointConfig::default(),
+            None,
+            multiplex.clone(),
+            runtime
+        ).unwrap();
+
+        let qr_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::from_octets(target_ip), self.relay_port));
+
+        let mut transport_config = TransportConfig::default();
+        transport_config.max_idle_timeout(Some(IdleTimeout::try_from(Duration::from_secs(35)).unwrap()));
+        transport_config.keep_alive_interval(Some(Duration::from_secs(15)));
+
+        client_config.transport_config(Arc::new(transport_config));
+        endpoint.set_default_client_config(client_config);
+
+        let conn = endpoint
+            .connect(qr_addr, 
+                &std::net::Ipv4Addr::from_octets(target_ip).to_string()).unwrap()
+            .await?;
+
+        let h3_conn = Connection::new(conn.clone());
+
+        let (driver, send_request) = client::new(h3_conn).await?;
+
+        Ok((driver, ConnectedLink {
+            relay_addr: qr_addr,
+            quic: conn,
+            h3: send_request
+        }))
+    }
 }
 
 fn generate_quic_pod_id(r#type: u32) -> [u8; 4] {
@@ -1053,7 +1242,7 @@ fn send_pod(pod: &Pod, msg: &[u8]) {
         ..Default::default()
     }.build_manual();
     header.extend_from_slice(&msg);
-    pod.send_datagram(header.into()).unwrap();
+    let _ = pod.send_datagram(header.into());
 }
 
 // all the places where packets can come from
@@ -1172,7 +1361,7 @@ impl<'t> Iterator for QRParser<'t> {
 
         if self.counter != 1 || intermediate.header.has_transition_streams {
             // following packet
-            self.p = intermediate.header.parse_loose_body(self.total, &mut intermediate.body);
+            self.p = intermediate.header.parse_loose_body(self.total, &mut intermediate.body)?;
         } else {
             // main packet, save channel characteristics
             intermediate.header.save_good_packet();
@@ -1198,8 +1387,7 @@ fn packet_parse() {
 }
 
 struct GlobalPacketParser {
-    participant_map: HashMap<u64, i64>, 
-    hbh_key: [u8; 64],
+    link_state: Arc<std::sync::RwLock<LinkState>>,
     change_send: tokio::sync::mpsc::Sender<GlobalLinkInternalChange>,
     current_version: AtomicU8,
     current_bytes: AtomicUsize,
@@ -1208,7 +1396,8 @@ struct GlobalPacketParser {
 impl GlobalPacketParser {
     fn parse<'t>(&'t self, p: &'t [u8], link: LinkType) -> impl Iterator<Item = GlobalPacket> + use<'t> {
         let time_parsed = Instant::now();
-        QRParser::new(p).map(move |i| {
+        let link_state = self.link_state.read().unwrap();
+        QRParser::new(p).filter_map(move |i| {
             if let Some(version) = i.header.version {
                 if version != self.current_version.swap(version, Ordering::Relaxed) {
                     info!("Got version change! {version}");
@@ -1216,16 +1405,22 @@ impl GlobalPacketParser {
                 }
             }
             let current_idx = self.current_bytes.fetch_add(i.body.len(), Ordering::Relaxed).wrapping_add(i.body.len());
-            GlobalPacket {
-                participant: i.header.participant_id.and_then(|p| self.participant_map.get(&p).copied()),
+            Some(GlobalPacket {
+                participant: i.header.participant_id.and_then(|p| link_state.ids_id_map.get(&p).copied()),
                 link,
                 data: if i.header.attr_needs_hbh_encryption == Some(true) {
-                    let hbh_message = PsidsLinkHbhEncryptedPayload::decode(&mut &*i.body).expect("Bad HBH encrypted payload!!");
-                    let enc_key: [u8; 32] = self.hbh_key[32..].try_into().unwrap();
+                    let hbh_message = PsidsLinkHbhEncryptedPayload::decode(&mut &*i.body).map_err(|i| {
+                        info!("Bad HBH encrypted payload!! {i}");
+                        i
+                    }).ok()?;
+                    let enc_key: [u8; 32] = link_state.hbh_key[32..].try_into().unwrap();
                     let cipher = Aes256Gcm::new(&enc_key.into());
                     let mut message = hbh_message.cipher_text().to_vec();
-                    cipher.decrypt_in_place_detached(Nonce::from_slice(hbh_message.initialization_vector()), &[], 
-                        &mut message, Tag::from_slice(hbh_message.authentication_tag())).unwrap(); // TODO don't panic, log and drop
+                    if let Err(e) = cipher.decrypt_in_place_detached(Nonce::from_slice(hbh_message.initialization_vector()), &[], 
+                            &mut message, Tag::from_slice(hbh_message.authentication_tag())) {
+                        warn!("Failed to decode HBH message {e}!");
+                        return None
+                    }
                     
                     message
                 } else {
@@ -1237,7 +1432,7 @@ impl GlobalPacketParser {
                 packet_size: i.body.len(),
                 probe_id: i.header.probe_groupid,
                 original: Some(i.header),
-            }
+            })
         })
     }
 }
@@ -1923,7 +2118,7 @@ impl MultiplexEndpoint {
         self: Arc<Self>, 
         receiver: Arc<dyn Fn(GlobalPacket) + Send + Sync>,
         internal_send: tokio::sync::mpsc::Sender<GlobalLinkInternalChange>,
-        packet_parser: Arc<std::sync::RwLock<GlobalPacketParser>>,
+        packet_parser: Arc<GlobalPacketParser>,
         mut poll: mio::Poll,
         message_receiver: std::sync::mpsc::Receiver<MultiplexMessage>,
         is_initiator: bool,
@@ -2017,7 +2212,6 @@ impl MultiplexEndpoint {
                                         continue
                                     }
                                     // This is a ChannelData TURN packet
-                                    let packet_parser = packet_parser.read().expect("Read map poisoned");
                                     let msg = TurnData::parse_manual(packet).unwrap();
                                     for parsed in packet_parser.parse(msg.message, LinkType::Relay) {
                                         receiver(parsed);
@@ -2181,13 +2375,13 @@ pub enum GlobalLinkChange {
     NewMaterial(IdsqrProtoMaterial),
     RequestedStreams(Vec<u32>),
     ActiveParticipants(Vec<u64>),
+    LinkFailed,
 }
 
 pub struct GlobalLink {
     pub session_id: Vec<u8>,
     pub relay_addr: SocketAddr,
-    pub quic: quinn::Connection,
-    pub h3: DebugMutex<SendRequest<h3_quinn::OpenStreams, rasn::prelude::OctetString>>,
+    connected: Arc<DebugMutex<ConnectedLink>>,
     pub identity: IdentityManager,
     pub handle: String,
     pub state: Arc<DebugMutex<GlobalLinkState>>,
@@ -2196,9 +2390,8 @@ pub struct GlobalLink {
     relay_split: Arc<MultiplexEndpoint>,
 
     internal_send: tokio::sync::mpsc::Sender<GlobalLinkInternalChange>,
-    packet_parser: Arc<std::sync::RwLock<GlobalPacketParser>>,
-    hbh_key: [u8; 64],
-    session_key_material: [u8; 48],
+    packet_parser: Arc<GlobalPacketParser>,
+    link_state: Arc<std::sync::RwLock<LinkState>>,
 
     data_callback: Arc<dyn Fn(GlobalPacket) + Send + Sync>, 
 
@@ -2216,6 +2409,7 @@ pub struct GlobalLink {
 impl Drop for GlobalLink {
     fn drop(&mut self) {
         self.relay_split.messenger.send(MultiplexMessage::Finish);
+        info!("CLEANUP: LINK DROP");
     }
 }
 
@@ -2265,52 +2459,8 @@ impl GlobalLink {
         Ok(data.payload.into())
     }
 
-    pub async fn contact_qr(&self, method: &str, path: &str, message: IdsqrProtoH3Message) -> Result<IdsqrProtoH3Message, PushError> {
-        let body = message.encode_to_vec();
-        
-        let txn_id: u32 = rand::random();
-        let req = Request::builder()
-            .method(method)
-            .uri(format!("https://{}/QR/{}", self.relay_addr, path))
-            .header("version", "1.1")
-            .header("user-agent", "GFT/2.0")
-            .header("accept", "*/*")
-            .header("txn_id", txn_id.to_string())
-            .header("content-length", body.len().to_string())
-            .body(())
-            .map_err(|e| PushError::LinkError(format!("QR request build: {e:?}")))?;
-
-        let mut stream = self.h3.lock().await.send_request(req).await
-            .map_err(|e| {
-                warn!("QR send_request failed (H3 link likely gone): {e:?}");
-                PushError::LinkError(format!("QR send_request: {e:?}"))
-            })?;
-
-        if let Err(e) = stream.send_data(body.into()).await {
-            warn!("QR send_data failed: {e:?}");
-        }
-        if let Err(e) = stream.finish().await {
-            warn!("QR finish failed: {e:?}");
-        }
-
-        let mut total = vec![];
-        match stream.recv_response().await {
-            Ok(resp) => {
-                if !resp.status().is_success() {
-                    warn!("QR request failed with status {} {}", resp.status().as_u16(), encode_hex(&total));
-                }
-            }
-            Err(e) => warn!("QR recv_response failed: {e:?}"),
-        }
-        while let Ok(Some(mut chunk)) = stream.recv_data().await {
-            while chunk.has_remaining() {
-                let cnt = chunk.chunk().len();
-                total.extend_from_slice(chunk.chunk());
-                chunk.advance(cnt);
-            }
-        }
-
-        IdsqrProtoH3Message::decode(Cursor::new(total)).map_err(|e| PushError::LinkError(format!("QR decode: {e:?}")))
+    pub async fn contact_qr(&self, method: &str, path: &str, message: &IdsqrProtoH3Message) -> Result<IdsqrProtoH3Message, PushError> {
+        self.connected.lock().await.contact_qr(method, path, message).await
     }
 
     async fn handle_ids(&self, packet: GlobalPacket, ids: LinkMessage) -> Result<(), PushError> {
@@ -2445,7 +2595,7 @@ impl GlobalLink {
                 ..Default::default()
             };
 
-            self.contact_qr("PUT", "Material", body).await?;
+            self.contact_qr("PUT", "Material", &body).await?;
         }
 
         Ok(())
@@ -2531,7 +2681,7 @@ impl GlobalLink {
         info!("Got versions change {new_version}!");
         let mut state = self.state.lock().await;
         state.session_request_id += 1;
-        let resp = self.contact_qr("PUT", "SessionInfo", IdsqrProtoH3Message {
+        let resp = self.contact_qr("PUT", "SessionInfo", &IdsqrProtoH3Message {
             sessioninfo_request: Some(qrp::IdsqrProtoSessionInfoRequest {
                 request_id: Some(state.session_request_id),
                 ..Default::default()
@@ -2549,7 +2699,7 @@ impl GlobalLink {
         let mut state = self.state.lock().await;
         state.session_request_id += 1;
         info!("Link subscribing to streams {:?}", state.subscribed_streams);
-        let resp = self.contact_qr("PUT", "SessionInfo", IdsqrProtoH3Message {
+        let resp = self.contact_qr("PUT", "SessionInfo", &IdsqrProtoH3Message {
             sessioninfo_request: Some(qrp::IdsqrProtoSessionInfoRequest {
                 request_id: Some(state.session_request_id),
                 generation_counter: Some(state.session_generation),
@@ -2588,13 +2738,13 @@ impl GlobalLink {
             .header("txn_id", txn_id.to_string())
             .body(()).unwrap();
 
-        let mut stream = self.h3.lock().await.send_request(req).await.unwrap();
-        stream.finish().await.unwrap();
+        let mut stream = self.connected.lock().await.h3.send_request(req).await?;
+        stream.finish().await?;
 
         let sender = self.internal_send.clone(); 
+        let resp = stream.recv_response().await?;
         tokio::spawn(async move {
             let mut total = vec![];
-            let resp = stream.recv_response().await.unwrap();
             while let Some(mut chunk) = stream.recv_data().await.ok().and_then(|i| i) {
                 let base = total.len();
                 total.resize(base + chunk.remaining(), 0);
@@ -2625,6 +2775,10 @@ impl GlobalLink {
             a.entry(i.participant.clone()).or_default().push(i.id);
             a
         })
+    }
+
+    pub async fn get_reverse_participant_map(&self) -> HashMap<i64, String> {
+        self.state.lock().await.configuration.allocations.iter().map(|i| (i.id, i.participant.clone())).collect()
     }
 
     pub fn try_send_direct(&self, data: &[u8]) -> bool {
@@ -2662,7 +2816,8 @@ impl GlobalLink {
             } else {
                 if link_id.is_none() {
                     warn!("No send state 2!");
-                    return Ok(())
+                    // intentionally do not bail here as we still need to confirm and send
+                    // control items to get to U1 mode in the first place.
                 }
                 link_id
             },
@@ -2699,7 +2854,7 @@ impl GlobalLink {
             ..QRMessage::default_attributes()
         };
 
-        let enc_key: [u8; 32] = self.hbh_key[..32].try_into().unwrap();
+        let enc_key: [u8; 32] = self.link_state.read().unwrap().hbh_key[..32].try_into().unwrap();
         let cipher = Aes256Gcm::new(&enc_key.into());
         let mut message = data.to_vec();
 
@@ -2757,19 +2912,30 @@ impl GlobalLink {
         self.send_relay(header, &outgoing.packet)
     }
 
-    pub async fn unalloc_bind(&self) -> Result<(), PushError> {
-        self.contact_qr("PUT", "UnAllocBind", IdsqrProtoH3Message {
-            unallocbind_request: Some(IdsqrProtoUnAllocBindRequest {
-                reason: Some(1),
-                client_context_blob: None,
+    async fn send_stats(&self) -> Result<(), PushError> {
+        let response = self.contact_qr("PUT", "Stats", &IdsqrProtoH3Message {
+            stats_request: Some(IdsqrProtoStatsRequest {
+                client_timestamp_ntp: Some(get_ntp_short_ts()),
+                // we are theoretically supposed to set this but I really can't be bothered
+                client_latency_ms: None,
+                ..Default::default()
             }),
             ..Default::default()
-        }).await?;
+        }).await?.stats_response;
 
-        // should connection close Application
-        // App error code 256
-        // reason "QR Disconnects"
+        info!("Got stats {response:?}");
 
+        Ok(())
+    }
+
+    pub async fn unalloc_bind(&self) -> Result<(), PushError> {
+        let link = self.connected.clone();
+        tokio::spawn(async move {
+            if let Err(e) = link.lock().await.unalloc_bind().await {
+                warn!("Failed to unbind! {e}");
+            }
+            warn!("Done unbinding!");
+        });
         Ok(())
     }
 
@@ -2821,6 +2987,7 @@ impl GlobalLink {
                 warn!("Got connection error, re-establishing link");
                 if let Err(e) = self.alloc_bind().await {
                     warn!("Failed to re-connect link {e}!");
+                    let _ = self.state_send.try_send(GlobalLinkChange::LinkFailed);
                 }
             },
             _ => {}
@@ -2909,7 +3076,7 @@ impl GlobalLink {
             ..Default::default()
         };
 
-        let resp = self.contact_qr("PUT", "AllocBind", body).await?;
+        let resp = self.contact_qr("PUT", "AllocBind", &body).await?;
 
         let r2 = resp.allocbind_response.unwrap();
 
@@ -2919,8 +3086,8 @@ impl GlobalLink {
 
         let avc_server = r2.quic_connection_infos.iter().find(|i| i.quic_connection_type == 0).expect("No AVC??");
         let ids_server = r2.quic_connection_infos.iter().find(|i| i.quic_connection_type == 1).expect("No IDS??");
-        let avc_pod = self.quic.create_pod(b"AVC", avc_conn_id, avc_server.quic_connection_id().to_vec().try_into().unwrap()).unwrap();
-        let ids_pod = self.quic.create_pod(b"IDS", ids_conn_id, ids_server.quic_connection_id().to_vec().try_into().unwrap()).unwrap();
+        let avc_pod = self.connected.lock().await.quic.create_pod(b"AVC", avc_conn_id, avc_server.quic_connection_id().to_vec().try_into().unwrap()).unwrap();
+        let ids_pod = self.connected.lock().await.quic.create_pod(b"IDS", ids_conn_id, ids_server.quic_connection_id().to_vec().try_into().unwrap()).unwrap();
 
 
         let was_bound = {
@@ -2933,7 +3100,7 @@ impl GlobalLink {
             if let Some(existing) = &mut state.ids_channel {
                 existing.update_pod(ids_pod).await;
             } else {
-                state.ids_channel = Some(IDSChannel::new(ids_pod, self.session_id.clone(), self.packet_parser.clone(), self.hbh_key, self.internal_send.clone()));
+                state.ids_channel = Some(IDSChannel::new(ids_pod, self.session_id.clone(), self.packet_parser.clone(), self.internal_send.clone()));
             }
             state.link_id = r2.link_id();
 
@@ -2953,7 +3120,7 @@ impl GlobalLink {
         tokio::spawn(async move {
             while let Ok(datagram) = avc_pod.read_datagram().await {
                 // info!("Got avc datagram {:?}", encode_hex(&datagram));
-                for parsed in packet_parser.read().unwrap().parse(&datagram, LinkType::Pod) {
+                for parsed in packet_parser.parse(&datagram, LinkType::Pod) {
                     sender(parsed);
                 }
                 tokio::task::coop::consume_budget().await;
@@ -3031,9 +3198,9 @@ impl GlobalLink {
         info!("Installing new config for link {config:?}!");
 
         {
-            let mut parser = self.packet_parser.write().unwrap();
+            let parser = &mut *self.link_state.write().unwrap();
             let mut sending_states = self.participant_states.write().unwrap();
-            config.generate_participant_map(&mut sending_states, &mut parser.participant_map, &self.session_key_material);
+            config.generate_participant_map(&mut sending_states, &mut parser.ids_id_map, &parser.session_key_material);
         }
 
         let participants: HashSet<String> = config.allocations.iter().map(|i| i.participant.clone()).collect();
@@ -3053,72 +3220,8 @@ impl GlobalLink {
 
         let _ = rustls_psk::crypto::CryptoProvider::install_default(rustls_psk::crypto::ring::default_provider());
 
-        let mut client_crypto: ClientConfig = rustls_psk::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
-            .with_no_client_auth();
-
-        let salt: [u8; 12] = rand::random(); // used for deviceAES128CTRKeys:
-        
-        let hk = Hkdf::<Sha256>::new(Some(&salt), response.session_key.as_ref() /*always 20 bytes */);
-        let mut expanded_key = [0u8; 32];
-        hk.expand(b"QR-QUIC-V0", &mut expanded_key).unwrap();
-
-        let identity = [
-            vec![0],
-            salt.to_vec(),
-            response.session_token.as_ref().to_vec(),
-        ].concat();
-
-        let target_ip: [u8; 4] = response.relay_ip.as_ref().to_vec().try_into().unwrap();
-        
-        let server_name = ServerName::IpAddress(IpAddr::V4(Ipv4Addr::from(target_ip)));
-
-        let mut keys = PresharedKeySet::default();
-        keys.update(server_name.clone(), Arc::new([PresharedKey::external(
-            &identity, 
-            &expanded_key
-        ).unwrap()]));
-        client_crypto.preshared_keys = Arc::new(keys);
-
-        client_crypto.preshared_keys.keys(&server_name).unwrap();
-        client_crypto.alpn_protocols = vec!["h3".into()];
-        client_crypto.key_log = Arc::new(KeyLogFile::new());
-
-        let hbh_info = [
-            b"QR-HBH-KDF",
-            response.relay_id.as_ref(),
-            &response.id.to_be_bytes(),
-        ].concat();
-        let mut hbh_key_material = [0u8; 64];
-        hk.expand(&hbh_info, &mut hbh_key_material).unwrap();
-
-
-        let info = [
-            b"QuickRelay KDF",
-            response.relay_id.as_ref(),
-            &response.id.to_be_bytes(),
-        ].concat();
-        let mut session_key_material = [0u8; 48];
-        hk.expand(&info, &mut session_key_material).unwrap();
-
-        let mut sending_states = HashMap::new();
-        let mut ids_id_map = HashMap::new();
-        response.generate_participant_map(&mut sending_states, &mut ids_id_map, &session_key_material);
-        info!("Relay ID Map: {:?}", ids_id_map);
-
         let (internal_send, mut internal_recv) = tokio::sync::mpsc::channel(1024);
-
-        let packet_parser = Arc::new(std::sync::RwLock::new(GlobalPacketParser {
-            participant_map: ids_id_map,
-            hbh_key: hbh_key_material,
-            change_send: internal_send.clone(),
-            current_version: AtomicU8::new(0),
-            current_bytes: AtomicUsize::new(0),
-        }));
-
-        let runtime = default_runtime().unwrap();
-
+        let target_ip: [u8; 4] = response.relay_ip.as_ref().to_vec().try_into().unwrap();
         let poll = mio::Poll::new().unwrap();
         let (message_sender, message_receiver) = std::sync::mpsc::sync_channel(1024);
         let multiplex_endpoint = Arc::new(MultiplexEndpoint {
@@ -3132,80 +3235,33 @@ impl GlobalLink {
             }
         });
 
-        let mut client_config =
-            quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_crypto).unwrap()));
-        let mut endpoint = quinn::Endpoint::new_with_abstract_socket(
-            EndpointConfig::default(),
-            None,
-            multiplex_endpoint.clone(),
-            runtime
-        ).unwrap();
+        let link_state = Arc::new(std::sync::RwLock::new(LinkState {
+            hbh_key: [0; 64],
+            ids_id_map: HashMap::new(),
+            session_key_material: [0; 48],
+        }));
 
-        let main_socket = std::sync::RwLock::new(None);
+        let packet_parser = Arc::new(GlobalPacketParser {
+            link_state: link_state.clone(),
+            change_send: internal_send.clone(),
+            current_version: AtomicU8::new(0),
+            current_bytes: AtomicUsize::new(0),
+        });
+
         let qr_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::from_octets(target_ip), response.relay_port));
         multiplex_endpoint.clone().start(data_callback.clone(), internal_send.clone(), packet_parser.clone(), poll, message_receiver, is_initiator, qr_addr, response.session_id.clone().into());
 
-        let mut transport_config = TransportConfig::default();
-        transport_config.max_idle_timeout(None);
-        transport_config.keep_alive_interval(Some(Duration::from_secs(60)));
-
-        client_config.transport_config(Arc::new(transport_config));
-        endpoint.set_default_client_config(client_config);
-
-        info!("FT: link::new socket ready, qr_addr={qr_addr}, connecting...");
-        let conn = {
-            let server_name_str = std::net::Ipv4Addr::from_octets(target_ip).to_string();
-            let connecting = match endpoint.connect(qr_addr, &server_name_str) {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!("FT: link::new endpoint.connect() error: {e:?}");
-                    return Err(PushError::LinkError(format!("endpoint.connect: {e:?}")));
-                }
-            };
-            match tokio::time::timeout(Duration::from_secs(10), connecting).await {
-                Ok(Ok(conn)) => conn,
-                Ok(Err(e)) => {
-                    warn!("FT: link::new QUIC handshake error: {e:?}");
-                    return Err(PushError::LinkError(format!("QUIC handshake: {e:?}")));
-                }
-                Err(_) => {
-                    warn!("FT: link::new QUIC handshake TIMED OUT after 10s (relay {qr_addr} not responding)");
-                    return Err(PushError::LinkError(format!("QUIC handshake timeout to {qr_addr}")));
-                }
-            }
-        };
-        info!("FT: link::new QUIC connected to {qr_addr}");
-
-        let h3_conn = Connection::new(conn.clone());
-
-        let (mut driver, send_request) = match tokio::time::timeout(Duration::from_secs(10), client::new(h3_conn)).await {
-            Ok(Ok(v)) => v,
-            Ok(Err(e)) => {
-                warn!("FT: link::new H3 open error: {e:?}");
-                return Err(PushError::LinkError(format!("H3 open: {e:?}")));
-            }
-            Err(_) => {
-                warn!("FT: link::new H3 open TIMED OUT");
-                return Err(PushError::LinkError("H3 open timeout".into()));
-            }
-        };
-        info!("FT: link::new H3 opened");
-        tokio::spawn(async move {
-            let e = driver.wait_idle().await;
-            eprintln!("LINK CLEANUP: H3 connection error: {e}");
-        });
+        let mut sending_states = HashMap::new();
+        let (mut connection, connected) = response.connect(&mut sending_states, multiplex_endpoint.clone(), link_state.clone()).await?;
 
         let (state_send, state_recv) = tokio::sync::mpsc::channel(1024);
-
-
         info!("EVENT: Link created");
 
         let me = Arc::new(Self {
             session_id: response.session_id.clone().into(),
             my_id: response.id,
             relay_addr: qr_addr,
-            quic: conn,
-            h3: DebugMutex::new(send_request),
+            connected: Arc::new(DebugMutex::new(connected)),
             identity: identity_manager,
             handle: handle.to_string(),
             state: Arc::new(DebugMutex::new(GlobalLinkState {
@@ -3232,20 +3288,75 @@ impl GlobalLink {
 
             internal_send,
             relay_split: multiplex_endpoint,
-            hbh_key: hbh_key_material,
-            session_key_material,
             data_callback,
+            link_state,
 
             link_is_up: AtomicBool::new(false),
             participant_states: std::sync::RwLock::new(sending_states),
-            current_direct_socket: main_socket,
+            current_direct_socket: std::sync::RwLock::new(None),
 
             state_send,
             state_recv: DebugMutex::new(Some(state_recv)),
             
             // GROUP CHANGE
             relay_mode: AtomicBool::new(relay_mode),
+            // also used as a flag to determine whether we are already connected to QR.
             avc_pod: std::sync::RwLock::new(None),
+        });
+
+        let keepalive = Arc::downgrade(&me);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(15));
+            interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            interval.tick().await;
+
+            loop {
+                interval.tick().await;
+                let Some(upgrade) = keepalive.upgrade() else { break };
+                if let Err(e) = upgrade.send_stats().await {
+                    warn!("Failed to send stats {e}!");
+                }
+            }
+            info!("LINK CLEANUP: Keepalive exit");
+        });
+
+        let keepalive = Arc::downgrade(&me);
+        tokio::spawn(async move {
+            let mut task = tokio::spawn(async move { connection.wait_idle().await });
+            loop {
+                let e = task.await.unwrap();
+                info!("H3 connection error: {e}");
+                let Some(upgrade) = keepalive.upgrade() else { break };
+                if matches!(e, ConnectionError::Timeout) {
+                    let _ = upgrade.state_send.try_send(GlobalLinkChange::LinkFailed);
+                    break;
+                }
+                upgrade.link_is_up.store(false, Ordering::Relaxed);
+                *upgrade.avc_pod.write().unwrap() = None;
+                info!("Reconnecting link!");
+                let mut sending_states = upgrade.participant_states.read().unwrap().clone();
+                let (mut c, connected) = match upgrade.state.lock().await.configuration.connect(
+                    &mut sending_states, 
+                    upgrade.relay_split.clone(), 
+                    upgrade.link_state.clone()
+                ).await {
+                    Ok(i) => i,
+                    Err(e) => {
+                        warn!("Reconnecting didn't work {e}");
+                        let _ = upgrade.state_send.try_send(GlobalLinkChange::LinkFailed);
+                        break;
+                    }
+                };
+                *upgrade.participant_states.write().unwrap() = sending_states;
+                *upgrade.connected.lock().await = connected;
+                task = tokio::spawn(async move { c.wait_idle().await });
+                if let Err(e) = upgrade.alloc_bind().await {
+                    warn!("Failed to re-connect link {e}!");
+                    let _ = upgrade.state_send.try_send(GlobalLinkChange::LinkFailed);
+                    break;
+                }
+            }
+            info!("LINK CLEANUP: H3 exit");
         });
 
         let me_copy = Arc::downgrade(&me);

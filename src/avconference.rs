@@ -1,4 +1,4 @@
-use std::{collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque}, fmt::{Debug, Display}, io::Cursor, net::{IpAddr, SocketAddr, SocketAddrV4}, ops::Deref, sync::{Arc, LazyLock, RwLockWriteGuard, atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering}}, time::{Duration, SystemTime, UNIX_EPOCH}, usize};
+use std::{collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque}, fmt::{Debug, Display}, io::Cursor, net::{IpAddr, SocketAddr, SocketAddrV4}, ops::{Add, Deref, Div, Mul}, sync::{Arc, LazyLock, RwLockWriteGuard, Weak, atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering}}, time::{Duration, SystemTime, UNIX_EPOCH}, usize};
 use quinn::crypto::rustls::QuicClientConfig;
 use h3::client;
 use h3_quinn::Connection;
@@ -11,12 +11,12 @@ use rtc_rtcp::reception_report::ReceptionReport;
 use rtc_rtp::{Header, Packet, codec::{h264::H264Packet, h265::{H265Packet, HevcPayloader}}, header::Extension, packetizer::{Depacketizer, Payloader}};
 use rtc_srtp::{cipher::new_cipher, context::Context, protection_profile::ProtectionProfile};
 use rustls::pki_types::{CertificateDer, Ipv4Addr, ServerName, UnixTime};
-use tokio::{select, sync::{Mutex, Notify, broadcast, mpsc}, time::{Instant, sleep_until}};
+use tokio::{select, sync::{Mutex, Notify, broadcast, mpsc}, time::{Instant, sleep, sleep_until}};
 use rtc_shared::{marshal::{Marshal, Unmarshal}, time::SystemInstant};
 use crate::{facetime::{FTWireMessage, my_conv_participant}, ids::link::{GlobalLinkChange, GlobalLinkOutgoingPacket, QuickRelayAllocationsResponse, qrp::{self, IdsqrProtoMaterial}}, util::{bin_deserialize, bin_serialize, decode_hex}};
 use std::str::FromStr;
 use crate::{APSConnection, APSMessage, IdentityManager, MessageTarget, OSConfig, PushError, aps::{APSInterestToken, get_message}, ids::{IDSRecvMessage, identity_manager::{IDSQuickRelaySettings, IDSSendMessage, IdentityResource, Raw}, link::{GlobalLink, GlobalPacket, LinkType}, user::{IDSService, QueryOptions}}, util::{CompactECKey, DebugMutex, DebugRwLock, base64_decode, base64_encode, deflate, duration_since_epoch, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, inflate, plist_to_bin, proto_deserialize_opt, proto_serialize_opt}};
-use log::{debug, info, warn};
+use log::{debug, info, warn, error};
 use openssl::{bn::BigNumContext, derive::Deriver, ec::{EcGroup, EcKey, EcPoint, PointConversionForm}, hash::MessageDigest, nid::Nid, pkey::{PKey, Private}, sha::sha1, sign::Signer, symm::{Cipher, Crypter, Mode, decrypt, encrypt}};
 use sha2::Sha256;
 use aes_gcm::KeyInit;
@@ -24,7 +24,7 @@ use hkdf::Hkdf;
 use uuid::Uuid;
 use plist::{Data, Dictionary, Value};
 use serde::{Deserialize, Serialize, Serializer};
-use prost::{Message, bytes::{Buf, BytesMut}};
+use prost::{Message, bytes::{Buf, Bytes, BytesMut}};
 use aes_gcm::{Aes256Gcm, Nonce, aead::{Aead, Payload}};
 use crate::facetime::facetimep::{ConversationInvitationPreference, ConversationLink, ConversationLinkLifetimeScope, ConversationMember, ConversationMessage, ConversationMessageType, ConversationParticipant, ConversationParticipantDidJoinContext, ConversationReport, EncryptedConversationMessage, Handle, HandleType};
 use avconferencep::{VcccMessage, VcccMessageAcknowledgment, VcCallInfoBlob, VcMediaNegotiationBlob, VcMediaNegotiationBlobAudioSettings, VcMediaNegotiationBlobBandwidthSettings, VcMediaNegotiationBlobMomentsSettings, VcMediaNegotiationBlobMultiwayAudioStream, VcMediaNegotiationBlobMultiwayVideoStream, VcMediaNegotiationBlobV2, VcMediaNegotiationBlobV2BandwidthSettings, VcMediaNegotiationBlobV2CameraSettingsU1, VcMediaNegotiationBlobV2CodecFeatures, VcMediaNegotiationBlobV2GeneralInfo, VcMediaNegotiationBlobV2MicrophoneSettingsU1, VcMediaNegotiationBlobV2MomentsSettings, VcMediaNegotiationBlobV2SettingsU1, VcMediaNegotiationBlobV2StreamGroup, VcMediaNegotiationBlobV2StreamGroupEncodeDecodeFeatures, VcMediaNegotiationBlobV2StreamGroupPayload, VcMediaNegotiationBlobV2StreamGroupStream, VcMediaNegotiationBlobV2VideoPayload, VcMediaNegotiationBlobVideoPayloadSettings, VcMediaNegotiationBlobVideoRuleCollection, VcMediaNegotiationBlobVideoSettings, VcMediaNegotiationFaceTimeSettings, VcccMessageWrapper};
@@ -58,6 +58,7 @@ struct StreamModifyOption {
     next: bool,
 }
 
+#[derive(PartialEq, Eq, Clone, Copy)]
 enum AVSessionPayload {
     H265,
     H264,
@@ -614,7 +615,6 @@ impl FTQualityZipper {
 
 pub struct AVSessionSSRC {
     owner: u64,
-    owner_handle: String,
     stream_index: u32,
     features: HashMap<u8, EnabledAVFeatures>,
     mkms: Vec<QuickRelayMkmMaterial>,
@@ -624,6 +624,7 @@ pub struct AVSessionSSRC {
     // when importing a new AVC data.
     srtp_contexts: HashMap<u32, MultiMkiContext>,
     codec: Option<FTQualityZipper>,
+    fec_data: BTreeMap<u32, HashMap<u8, FECData>>,
 }
 
 enum SSRCState {
@@ -638,6 +639,46 @@ const BITRATE_TABLE: &[usize] = &[
     8557, 9920,
 ];
 const U1_CHANGE_SETTLE_TIME: Duration = Duration::from_secs(5);
+
+// U1 outgoing rate control. Borrows the shape of WebRTC's GCC -- decrease fast, increase only on
+// sustained evidence, approach a rate that already failed with caution -- but drives off loss
+// alone. GCC's delay half needs per-packet arrival timing to build a usable gradient; the only
+// delay available here is q13 in the audio report, and measured over a real call it does not
+// separate healthy from congested (see the comment at the drop_tiers decision).
+//
+/// Settle window for *decreases*. The long settle exists to stop upgrade oscillation, so applying
+/// it to drops means shipping broken video for its full duration -- a measured 32% loss sat
+/// ignored for 3.8s behind it. It is not zero because a report arriving immediately after a change
+/// still describes the previous rate, and acting on that would double-drop on one event.
+const U1_DROP_SETTLE_TIME: Duration = Duration::from_millis(1500);
+/// Expected-packet counts below which a loss *fraction* is too noisy to act on at full strength.
+/// Windows this small come from low-bitrate or low-framerate streams, where one damaged frame can
+/// read as 20-40% loss. Rungs are ~1.35x apart, so even a single-rung cut is ~26% and a three-rung
+/// cut is well over half the rate -- the bigger the response, the better the estimate behind it
+/// needs to be.
+const U1_MIN_LOSS_SAMPLE: u64 = 25;
+/// Loss deadband. Below this, loss is treated as the background rate every real link has and
+/// does not block an increase; a chronically 1% lossy wifi link would otherwise ratchet to the
+/// floor and stay there.
+const U1_LOSS_IGNORE: f64 = 0.02;
+/// Above this, loss is congestion rather than noise.
+const U1_LOSS_CONGESTED: f64 = 0.10;
+/// Consecutive clean reports required before increasing. One clean sample is not evidence: the
+/// loss signal reads zero repeatedly in the middle of a collapse, which is how the old code
+/// bumped *up* while the far end was failing to decode.
+const U1_CLEAN_STREAK: usize = 4;
+/// How long the ceiling holds before relaxing by a *single* rung, letting one probe upward.
+///
+/// Deliberately not a "forget it all at once" timeout. A flat expiry meant the ceiling lifted at
+/// the same moment the bump backoff did, and the rate walked straight back into a rung that had
+/// already failed twice. Real controllers do not work that way either: GCC keeps a continuous
+/// estimate and approaches the last overuse point with additive increase, CUBIC remembers W_max
+/// until the next loss with no timeout at all. We cannot approach gradually in bitrate -- the
+/// rungs are ~1.35x apart -- so the gradual approach is expressed in time instead.
+///
+/// The interval is wide because a failed probe is expensive here: one rung up, but potentially
+/// four rungs back down. A controller that can probe at +8% can afford to do it every few seconds.
+const U1_CEILING_PROBE_INTERVAL: Duration = Duration::from_secs(90);
 
 pub struct AVSessionState {
     pub participant_session_ids: HashMap<u64, String>,
@@ -656,6 +697,10 @@ pub struct AVSessionState {
     quality_bump_failures: usize,
     active_participants: HashSet<u64>,
     current_video_bitrate: usize,
+    /// Consecutive reports with loss at or below the deadband.
+    u1_clean_streak: usize,
+    /// Rate index that most recently failed, and when it did.
+    u1_failed_rung: Option<(usize, Instant)>,
 }
 
 impl AVSessionState {
@@ -724,7 +769,7 @@ impl AVSessionState {
         Ok(())
     }
 
-    fn get_media_config(&self, p: u64, handle: String, config: &AVConfig) -> HashMap<u32, AVSessionSSRC> {
+    fn get_media_config(&self, p: u64, config: &AVConfig) -> HashMap<u32, AVSessionSSRC> {
         let Some(encryption_state) = self.encryption_states.get(&p) else { return HashMap::new() };
         
         if encryption_state.mkm.is_empty() {
@@ -737,7 +782,6 @@ impl AVSessionState {
             
             map.insert(u1.rtp_ssrc(), AVSessionSSRC {
                 owner: p,
-                owner_handle: handle.clone(),
                 stream_index: group.stream_group(),
                 mkms: encryption_state.mkm.clone(),
                 features: u1.encode_decode_features.iter()
@@ -750,6 +794,7 @@ impl AVSessionState {
                 group_ssrcs: group.streams.iter().map(|i| i.rtp_ssrc()).collect(),
                 srtp_contexts: HashMap::new(),
                 codec: None,
+                fec_data: BTreeMap::new(),
             });
         }
         map
@@ -1294,7 +1339,7 @@ impl RecvStatTracker {
         }
         let payload = AVSessionPayload::from_id(header.payload_type as u32).unwrap();
 
-       let result = if !header.extensions.is_empty() {
+        let result = if !header.extensions.is_empty() {
             let mut record_index = self.stats.records.read().unwrap();
             let stream_identifier = (ssrc.owner, ssrc.stream_index);
             if !record_index.contains_key(&stream_identifier) {
@@ -1334,7 +1379,7 @@ impl RecvStatTracker {
                     // info!("Audio data {data:?}");
                     if let Some(time) = data.current_send_timestamp {
                         self.stats.last_feedback.store(time, Ordering::Relaxed);
-                        self.stats.total_recv_count.fetch_add(1, Ordering::Relaxed);
+                        self.stats.last_feedback_time.store(duration_since_epoch().as_millis() as u64, Ordering::Relaxed);
                     }
 
                     let change_time = self.stats.frame_change_time.load(Ordering::Relaxed);
@@ -1350,6 +1395,10 @@ impl RecvStatTracker {
                 }
             }
         } else { None };
+
+        if payload.is_audio() {
+            self.stats.total_recv_count.fetch_add(1, Ordering::Relaxed);
+        }
 
         time_slice.expected_count += elapsed_packets as usize;
 
@@ -1473,6 +1522,7 @@ pub trait TimingTarget: Send + Sync {
 #[derive(Default)]
 struct IncomingFrameStats {
     last_feedback: AtomicU16,
+    last_feedback_time: AtomicU64,
     total_recv_count: AtomicU16,
     total_recv_bytes: AtomicU64,
     audio_burst_loss: AtomicU8,
@@ -1545,153 +1595,157 @@ impl IncomingFrameHandler {
         let mut counter: u32 = 0;
         let mut stat_tracker = RecvStatTracker::new(stats.clone(), audio);
         while let Ok(command) = channel.recv() {
-            let packets = match command {
-                IncomingFrameCommand::Packet(header, packet) => vec![(header, packet)],
-                IncomingFrameCommand::Keys(keys) => {
-                    let mut packets_process = vec![];
-                    for (id, mut ssrc) in keys {
-                        // Waiting for config
-                        for key in ssrc.mkms.iter().map(|i| {
-                            let mki: [u8; 2] = i.mki[..2].try_into().unwrap();
-                            Some(mki)
-                        }).chain(std::iter::once(None)) {
-                            if let Some(SSRCState::Waiting(item, _)) = ssrc_state.insert((id, key), SSRCState::Valid) {
-                                packets_process.extend(item);
-                            }
-                            master_ssrc_map.insert(id, (id, false));
-                            for ssrc in &ssrc.group_ssrcs {
-                                master_ssrc_map.insert(*ssrc, (id, true));
-                                if let Some(SSRCState::Waiting(item, _)) = ssrc_state.insert((*ssrc, key), SSRCState::Valid) {
+            if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let packets = match command {
+                    IncomingFrameCommand::Packet(header, packet) => vec![(header, packet)],
+                    IncomingFrameCommand::Keys(keys) => {
+                        let mut packets_process = vec![];
+                        for (id, mut ssrc) in keys {
+                            // Waiting for config
+                            for key in ssrc.mkms.iter().map(|i| {
+                                let mki: [u8; 2] = i.mki[..2].try_into().unwrap();
+                                Some(mki)
+                            }).chain(std::iter::once(None)) {
+                                if let Some(SSRCState::Waiting(item, _)) = ssrc_state.insert((id, key), SSRCState::Valid) {
                                     packets_process.extend(item);
                                 }
+                                master_ssrc_map.insert(id, (id, false));
+                                for ssrc in &ssrc.group_ssrcs {
+                                    master_ssrc_map.insert(*ssrc, (id, true));
+                                    if let Some(SSRCState::Waiting(item, _)) = ssrc_state.insert((*ssrc, key), SSRCState::Valid) {
+                                        packets_process.extend(item);
+                                    }
+                                }
+                            }
+
+                            if let Some(existing) = ssrc_map.get_mut(&id) {
+                                std::mem::swap(existing, &mut ssrc);
+                                existing.srtp_contexts = ssrc.srtp_contexts;
+                                existing.codec = ssrc.codec;
+                                existing.fec_data = ssrc.fec_data;
+                            } else {
+                                ssrc_map.insert(id, ssrc);
+                            }
+                        }
+                        warn!("Got avc, replaying {} packets", packets_process.len());
+                        packets_process
+                    }
+                };
+                counter = counter.wrapping_add(1);
+                if counter % 100 == 0 {
+                    info!("Media probe state {:?}", stat_tracker.probe_states);
+                }
+                for (header, recv) in packets {
+                    let Some(payload) = AVSessionPayload::from_id(header.payload_type as u32) else {
+                        warn!("No payload entry for {}", header.payload_type);
+                        continue
+                    };
+                    let Some(participant) = recv.participant else {
+                        warn!("No participant; dropping entry!!");
+                        continue
+                    };
+
+                    let ssrc = master_ssrc_map.get(&header.ssrc);
+                    let mki: Option<[u8; 2]> = if let Some(&(_ssrc, is_group)) = ssrc {
+                        Some(if is_group {
+                            recv.data[recv.data.len() - 6..recv.data.len() - 6 + 2].try_into().unwrap()
+                        } else {
+                            let hmac_len = payload.tag_len();
+                            if header.sequence_number & 0x7f == 0 {
+                                recv.data[recv.data.len() - hmac_len - 6..recv.data.len() - hmac_len - 6 + 2].try_into().unwrap()
+                            } else {
+                                recv.data[recv.data.len() - hmac_len - 2..recv.data.len() - hmac_len - 2 + 2].try_into().unwrap()
+                            }
+                        })
+                    } else { None };
+
+                    let (ssrc, is_group, mki) = match ssrc_state.entry((header.ssrc, mki)).or_insert_with(|| SSRCState::Waiting(vec![], SystemTime::now() + Duration::from_secs(5))) {
+                        SSRCState::Dead => {
+                            warn!("Dropping dead ssrc {}!!, MKI {:?}", header.ssrc, mki);
+                            continue
+                        },
+                        SSRCState::Waiting(w, exp) => {
+                            if exp.elapsed().is_ok() {
+                                // we're dead
+                                ssrc_state.insert((header.ssrc, mki), SSRCState::Dead);
+                                continue
+                            }
+                            warn!("Waiting for SSRC {}, MKI {:?}", header.ssrc, mki);
+                            w.push((header, recv));
+                            continue
+                        },
+                        SSRCState::Valid => (ssrc_map.get_mut(&ssrc.unwrap().0).unwrap(), ssrc.unwrap().1, mki.unwrap()),
+                    };
+
+                    // info!("Header {:?} {} {}", header, recv.packet_id, duration_since_epoch().as_secs_f64());
+                    let tracked_packets = if let Some(prev_seq) = ssrc_seq.get_mut(&header.ssrc) {
+                        let jump = header.sequence_number.wrapping_sub(*prev_seq);
+                        if jump > 1 && jump < 256 {
+                            // we dropped packets
+                            let nack: BytesMut = TransportLayerNack {
+                                sender_ssrc: *rtcp_sender.entry(header.ssrc).or_insert_with(|| rand::random()),
+                                media_ssrc: header.ssrc,
+                                nacks: range_to_pair(*prev_seq + 1, jump - 1)
+                            }.marshal().unwrap();
+                            warn!("Sending NACK for {} packets at {}, idx {:?} {}", jump - 1, *prev_seq + 1, header, encode_hex(&recv.data));
+                            if let Err(e) = control.try_send(AVInternalMessage::RtcpOutgoing(participant, nack)) {
+                                warn!("Failed to queue nack {e}");
                             }
                         }
 
-                        if let Some(existing) = ssrc_map.get_mut(&id) {
-                            std::mem::swap(existing, &mut ssrc);
-                            existing.srtp_contexts = ssrc.srtp_contexts;
-                            existing.codec = ssrc.codec;
-                        } else {
-                            ssrc_map.insert(id, ssrc);
+                        if jump > 1 && jump < 1500 {
+                            if audio {
+                                stats.audio_burst_loss.fetch_max((jump as u8 - 1).min(15), Ordering::Relaxed);
+                            } else {
+                                stats.video_burst_loss.fetch_max((jump as u8 - 1).min(15), Ordering::Relaxed);
+                            }
                         }
-                    }
-                    warn!("Got avc, replaying {} packets", packets_process.len());
-                    packets_process
-                }
-            };
-            counter = counter.wrapping_add(1);
-            if counter % 100 == 0 {
-                info!("Media probe state {:?}", stat_tracker.probe_states);
-            }
-            for (header, recv) in packets {
-                let Some(payload) = AVSessionPayload::from_id(header.payload_type as u32) else {
-                    warn!("No payload entry for {}", header.payload_type);
-                    continue
-                };
-                let Some(participant) = recv.participant else {
-                    warn!("No participant; dropping entry!!");
-                    continue
-                };
 
-                let ssrc = master_ssrc_map.get(&header.ssrc);
-                let mki: Option<[u8; 2]> = if let Some(&(_ssrc, is_group)) = ssrc {
-                    Some(if is_group {
-                        recv.data[recv.data.len() - 6..recv.data.len() - 6 + 2].try_into().unwrap()
+                        if jump < 1500 { // larger than this we presume it is sending packets in the past (wrapped around)
+                            *prev_seq = header.sequence_number;
+                            jump
+                        } else { 0 /* backwards; don't count */ }
                     } else {
-                        let hmac_len = payload.tag_len();
-                        if header.sequence_number & 0x7f == 0 {
-                            recv.data[recv.data.len() - hmac_len - 6..recv.data.len() - hmac_len - 6 + 2].try_into().unwrap()
-                        } else {
-                            recv.data[recv.data.len() - hmac_len - 2..recv.data.len() - hmac_len - 2 + 2].try_into().unwrap()
-                        }
-                    })
-                } else { None };
+                        ssrc_seq.insert(header.ssrc, header.sequence_number);
+                        1
+                    };
 
-                let (ssrc, is_group, mki) = match ssrc_state.entry((header.ssrc, mki)).or_insert_with(|| SSRCState::Waiting(vec![], SystemTime::now() + Duration::from_secs(5))) {
-                    SSRCState::Dead => {
-                        warn!("Dropping dead ssrc {}!!, MKI {:?}", header.ssrc, mki);
-                        continue
-                    },
-                    SSRCState::Waiting(w, exp) => {
-                        if exp.elapsed().is_ok() {
-                            // we're dead
-                            ssrc_state.insert((header.ssrc, mki), SSRCState::Dead);
+                    
+                    let video_meta = stat_tracker.track(&recv, &header, tracked_packets, &control, &ssrc);
+                    
+                    let context = ssrc.srtp_contexts.entry(header.ssrc).or_default().get_context_for_mki(mki, || {
+                        let mkm = ssrc.mkms.iter().find(|i| &i.mki[..mki.len()] == mki).unwrap();
+                        let key = mkm.get_key(header.ssrc);
+
+                        new_cipher(
+                            &key[..16], 
+                            &key[16..], 
+                            if is_group { ProtectionProfile::Aes128CmMkiNoAuth } else { payload.profile() }
+                        ).unwrap()
+                    });
+
+                    let mut result = match context.decrypt_rtp_with_header(&recv.data, &header) {
+                        Ok(res) => res,
+                        Err(e) => {
+                            info!("Error {e} {}", encode_hex(&recv.data));
                             continue
                         }
-                        warn!("Waiting for SSRC {}, MKI {:?}", header.ssrc, mki);
-                        w.push((header, recv));
-                        continue
-                    },
-                    SSRCState::Valid => (ssrc_map.get_mut(&ssrc.unwrap().0).unwrap(), ssrc.unwrap().1, mki.unwrap()),
-                };
+                    };
+                    let unmarshalled = rtc_rtp::Packet::unmarshal(&mut result).unwrap();
 
-                // info!("Header {:?} {} {}", header, recv.packet_id, duration_since_epoch().as_secs_f64());
-                let tracked_packets = if let Some(prev_seq) = ssrc_seq.get_mut(&header.ssrc) {
-                    let jump = header.sequence_number.wrapping_sub(*prev_seq);
-                    if jump > 1 && jump < 256 {
-                        // we dropped packets
-                        let nack: BytesMut = TransportLayerNack {
-                            sender_ssrc: *rtcp_sender.entry(header.ssrc).or_insert_with(|| rand::random()),
-                            media_ssrc: header.ssrc,
-                            nacks: range_to_pair(*prev_seq + 1, jump - 1)
-                        }.marshal().unwrap();
-                        warn!("Sending NACK for {} packets at {}, idx {:?} {}", jump - 1, *prev_seq + 1, header, encode_hex(&recv.data));
-                        if let Err(e) = control.try_send(AVInternalMessage::RtcpOutgoing(participant, nack)) {
-                            warn!("Failed to queue nack {e}");
-                        }
+                    if ssrc.fec_data.len() > 5 {
+                        ssrc.fec_data.pop_first();
                     }
 
-                    if jump > 1 && jump < 1500 {
-                        if audio {
-                            stats.audio_burst_loss.fetch_max((jump as u8 - 1).min(15), Ordering::Relaxed);
-                        } else {
-                            stats.video_burst_loss.fetch_max((jump as u8 - 1).min(15), Ordering::Relaxed);
-                        }
-                    }
+                    // info!("Result seq={} ts={} ssrc={} {:?}",
+                    //     unmarshalled.header.sequence_number,
+                    //     unmarshalled.header.timestamp,
+                    //     unmarshalled.header.ssrc,
+                    //     encode_hex(&unmarshalled.payload));
 
-                    if jump < 1500 { // larger than this we presume it is sending packets in the past (wrapped around)
-                        *prev_seq = header.sequence_number;
-                        jump
-                    } else { 0 /* backwards; don't count */ }
-                } else {
-                    ssrc_seq.insert(header.ssrc, header.sequence_number);
-                    1
-                };
-
-                
-                let video_meta = stat_tracker.track(&recv, &header, tracked_packets, &control, &ssrc);
-
-                // Send periodic RTCP Receiver Reports
-                if let Some(rr_buf) = stat_tracker.maybe_build_rr() {
-                    if let Err(e) = control.try_send(AVInternalMessage::RtcpOutgoing(participant, rr_buf)) {
-                        warn!("Failed to queue RTCP RR: {e}");
-                    }
-                }
-                
-                let context = ssrc.srtp_contexts.entry(header.ssrc).or_default().get_context_for_mki(mki, || {
-                    let mkm = ssrc.mkms.iter().find(|i| &i.mki[..mki.len()] == mki).unwrap();
-                    let key = mkm.get_key(header.ssrc);
-
-                    new_cipher(
-                        &key[..16], 
-                        &key[16..], 
-                        if is_group { ProtectionProfile::Aes128CmMkiNoAuth } else { payload.profile() }
-                    ).unwrap()
-                });
-
-                let mut result = match context.decrypt_rtp_with_header(&recv.data, &header) {
-                    Ok(res) => res,
-                    Err(e) => {
-                        info!("Error {e} {}", encode_hex(&recv.data));
-                        continue
-                    }
-                };
-                let unmarshalled = rtc_rtp::Packet::unmarshal(&mut result).unwrap();
-
-                // info!("Result {:?}", encode_hex(&unmarshalled.payload));
-
-                let packets = match payload {
-                    AVSessionPayload::Red => {
+                    let mut packets = vec![];
+                    
+                    if payload == AVSessionPayload::Red {
                         let mut segments = vec![];
                         let mut bytes = &unmarshalled.payload[..];
                         loop {
@@ -1714,7 +1768,7 @@ impl IncomingFrameHandler {
                                 break;
                             }
                         }
-                        let mut result = vec![];
+                        
                         for (mut header, mut len) in segments {
                             if len == 0 {
                                 len = bytes.len();
@@ -1727,97 +1781,137 @@ impl IncomingFrameHandler {
                             }
 
                             // info!("Header RED {:?} {}", header, encode_hex(&bytes[..len]));
-                            result.push(Packet {
+                            packets.push(Packet {
                                 header,
                                 payload: bytes[..len].to_vec().into(),
                             });
                             
                             bytes = &bytes[len..];
                         }
-                        result
-                    },
-                    _unk => vec![unmarshalled],
-                };
-
-                for unmarshalled in packets {
-                    let payload_type = unmarshalled.header.payload_type;
-                    let channel_type = ChannelType::from_payload(unmarshalled.header.payload_type);
-                    if !ssrc.codec.as_ref().is_some_and(|i| i.payload_type == channel_type) {
-                        ssrc.codec = Some(FTQualityZipper {
-                            payload_type: channel_type,
-                            ..Default::default()
-                        });
-                    }
-                    let Some(codec) = ssrc.codec.as_mut() else {
-                        warn!("No payload entry for {}", unmarshalled.header.payload_type);
-                        continue
-                    };
-                    let header_ssrc = unmarshalled.header.ssrc;
-
-                    codec.push(unmarshalled);
-                    
-                    while let Some((sample, orig_dropped)) = codec.pop() {
-                        let net_dropped = orig_dropped.saturating_sub(sample.prev_padding_packets);
-                        if net_dropped > 0 {
-                            stat_tracker.register_loss(net_dropped as usize);
-                        }
-                        
-                        let mut data = &sample.data[..];
-                        // info!("Got sample {}", encode_hex(&data));
-                        if data.is_empty() {
-                            warn!("Got empty sample!");
-                            continue;
-                        }
-                        if let Some((remaining, config)) = DecoderConfiguration::parse(data, channel_type) {
-                            info!("mediainfo {:?}", config);
-                            incoming_handler.read().unwrap().handle(ChannelMessage {
-                                participant: ssrc.owner,
-                                participant_handle: ssrc.owner_handle.clone(),
-                                stream_id: if is_group { header_ssrc & 0xffff } else { 0 },
-                                r#type: channel_type,
-                                timestamp: header.timestamp,
-                                prev_dropped: 0,
-                                metadata: HashMap::new(),
-                                camera_meta: video_meta.as_ref().map(|i| i.camera_status),
-                                frame: ChannelFrame::Configuration(config),
+                    } else if let Some(fec) = video_meta.as_ref().and_then(|v| v.fec_header.as_ref()) {
+                        let group = ssrc.fec_data.entry(header.timestamp).or_default()
+                            .entry(fec.group_id).or_insert_with(|| {
+                                let position = (if fec.is_data {
+                                    fec.position
+                                } else {
+                                    7
+                                } - fec.start_position) / fec.symbols_per_packet;
+                                let first_seq = header.sequence_number.wrapping_sub(position as u16);
+                                FECData::new(fec.symbols_per_packet, fec.start_position, first_seq)
                             });
+                        group.ingest(fec, &unmarshalled.payload);
+                        if !fec.is_data {
+                            for missing in group.missing_idx() {
+                                let seq = group.start_seq.wrapping_add(missing);
+                                let Some(data) = group.recover(missing) else { break };
+                                packets.push(Packet {
+                                    header: Header {
+                                        sequence_number: seq,
+                                        marker: fec.last_group && group.last_idx() == missing,
+                                        ..header.clone()
+                                    },
+                                    payload: data.into(),
+                                })
+                            }
+                        } else {
+                            packets.push(unmarshalled);
+                        }
+                    } else {
+                        packets.push(unmarshalled);
+                    }
 
-                            // scan for next NAL
-                            if remaining.is_empty() {
+                    for unmarshalled in packets {
+                        let payload_type = unmarshalled.header.payload_type;
+                        let Some(channel_type) = ChannelType::from_payload(payload_type) else {
+                            // can still happen because RED can unfold new payload types (13; Comfort Noise)
+                            warn!("No payload entry for {}", payload_type);
+                            continue
+                        };
+                        if !ssrc.codec.as_ref().is_some_and(|i| i.payload_type == channel_type) {
+                            ssrc.codec = Some(FTQualityZipper {
+                                payload_type: channel_type,
+                                ..Default::default()
+                            });
+                        }
+                        let Some(codec) = ssrc.codec.as_mut() else {
+                            warn!("No payload entry for {}", unmarshalled.header.payload_type);
+                            continue
+                        };
+                        let header_ssrc = unmarshalled.header.ssrc;
+
+                        codec.push(unmarshalled);
+                        
+                        while let Some((sample, orig_dropped)) = codec.pop() {
+                            let net_dropped = orig_dropped.saturating_sub(sample.prev_padding_packets);
+                            if net_dropped > 0 {
+                                stat_tracker.register_loss(net_dropped as usize);
+                            }
+                            
+                            let mut data = &sample.data[..];
+                            // info!("Got sample {}", encode_hex(&data));
+                            if data.is_empty() {
+                                warn!("Got empty sample!");
                                 continue;
                             }
-                            data = remaining;
-                        }
-                        // info!("Smaple before {} {} {}", encode_hex(&data), sample.prev_dropped_packets, recv.packet_id);
-                        let mut frame_meta = HashMap::new();
-                        let features = if is_group {
-                            match channel_type {
-                                ChannelType::H264 => Some(&*GROUP_H264_FEATURES),
-                                ChannelType::H265 => Some(&*GROUP_H265_FEATURES),
-                                ChannelType::Evs | ChannelType::Aac => None,
-                            }
-                        } else { ssrc.features.get(&payload_type) };
-                        if let Some(features) = features {
-                            let (decoded, meta) = features.parse_frame(&data);
-                            data = decoded;
-                            frame_meta = meta;
-                            // info!("sample {}", encode_hex(&data));
-                        }
+                            if let Some((remaining, config)) = DecoderConfiguration::parse(data, channel_type) {
+                                info!("mediainfo {:?}", config);
+                                incoming_handler.read().unwrap().handle(ChannelMessage {
+                                    participant: ssrc.owner,
+                                    stream_id: if is_group { header_ssrc & 0xffff } else { 0 },
+                                    r#type: channel_type,
+                                    timestamp: header.timestamp,
+                                    prev_dropped: 0,
+                                    metadata: HashMap::new(),
+                                    camera_meta: video_meta.as_ref().map(|i| i.camera_status),
+                                    frame: ChannelFrame::Configuration(config),
+                                });
 
-                        // info!("Handling packetd");
-                        incoming_handler.read().unwrap().handle(ChannelMessage {
-                            participant: ssrc.owner,
-                            participant_handle: ssrc.owner_handle.clone(),
-                            // maybe this if isn't nessesary, it's possible if not likely stream ID sent in u1 mode is ssrc & 0xffff.
-                            stream_id: if is_group { header_ssrc & 0xffff } else { 0 },
-                            r#type: channel_type,
-                            timestamp: sample.packet_timestamp,
-                            prev_dropped: sample.prev_dropped_packets.saturating_sub(sample.prev_padding_packets),
-                            metadata: frame_meta,
-                            camera_meta: video_meta.as_ref().map(|i| i.camera_status),
-                            frame: ChannelFrame::Sample(data.to_vec()),
-                        });
+                                // scan for next NAL
+                                if remaining.is_empty() {
+                                    continue;
+                                }
+                                data = remaining;
+                            }
+                            // info!("Smaple before {} {} {}", encode_hex(&data), sample.prev_dropped_packets, recv.packet_id);
+                            let mut frame_meta = HashMap::new();
+                            let features = if is_group {
+                                match channel_type {
+                                    ChannelType::H264 => Some(&*GROUP_H264_FEATURES),
+                                    ChannelType::H265 => Some(&*GROUP_H265_FEATURES),
+                                    ChannelType::Evs | ChannelType::Aac => None,
+                                }
+                            } else { ssrc.features.get(&payload_type) };
+                            if let Some(features) = features {
+                                let (decoded, meta) = features.parse_frame(&data);
+                                data = decoded;
+                                frame_meta = meta;
+                                // info!("sample {}", encode_hex(&data));
+                            }
+
+                            // info!("Handling packetd");
+                            incoming_handler.read().unwrap().handle(ChannelMessage {
+                                participant: ssrc.owner,
+                                // maybe this if isn't nessesary, it's possible if not likely stream ID sent in u1 mode is ssrc & 0xffff.
+                                stream_id: if is_group { header_ssrc & 0xffff } else { 0 },
+                                r#type: channel_type,
+                                timestamp: sample.packet_timestamp,
+                                prev_dropped: sample.prev_dropped_packets.saturating_sub(sample.prev_padding_packets),
+                                metadata: frame_meta,
+                                camera_meta: video_meta.as_ref().map(|i| i.camera_status),
+                                frame: ChannelFrame::Sample(data.to_vec()),
+                            });
+                        }
                     }
+                }
+            })) {
+                // the GlobalLink parser state for stacked packets is atrocious - 
+                // garbage sometimes goes in, panics sometimes come out.
+                if let Some(message) = e.downcast_ref::<&str>() {
+                    error!("recv panic: {message}");
+                } else if let Some(message) = e.downcast_ref::<String>() {
+                    error!("recv panic: {message}");
+                } else {
+                    error!("recv panic with non-string payload");
                 }
             }
         }
@@ -1844,6 +1938,10 @@ impl IncomingFrameHandler {
     }
     
     pub fn handle_packet(&self, recv: GlobalPacket) {
+        if recv.data.len() < 2 {
+            warn!("Packet too small!");
+            return;
+        }
         if (recv.data[0] & 0x80) == 0 {
             // not RTP/RTCP
             let _ = self.target_control.try_send(AVInternalMessage::SFrame(recv));
@@ -2455,6 +2553,383 @@ impl FTVideoCameraStatus {
     }
 }
 
+const GF16_MUL: [[u8; 16]; 16] = [
+    [ 0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0],
+    [ 0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15],
+    [ 0,  2,  4,  6,  8, 10, 12, 14,  3,  1,  7,  5, 11,  9, 15, 13],
+    [ 0,  3,  6,  5, 12, 15, 10,  9, 11,  8, 13, 14,  7,  4,  1,  2],
+    [ 0,  4,  8, 12,  3,  7, 11, 15,  6,  2, 14, 10,  5,  1, 13,  9],
+    [ 0,  5, 10, 15,  7,  2, 13,  8, 14, 11,  4,  1,  9, 12,  3,  6],
+    [ 0,  6, 12, 10, 11, 13,  7,  1,  5,  3,  9, 15, 14,  8,  2,  4],
+    [ 0,  7, 14,  9, 15,  8,  1,  6, 13, 10,  3,  4,  2,  5, 12, 11],
+    [ 0,  8,  3, 11,  6, 14,  5, 13, 12,  4, 15,  7, 10,  2,  9,  1],
+    [ 0,  9,  1,  8,  2, 11,  3, 10,  4, 13,  5, 12,  6, 15,  7, 14],
+    [ 0, 10,  7, 13, 14,  4,  9,  3, 15,  5,  8,  2,  1, 11,  6, 12],
+    [ 0, 11,  5, 14, 10,  1, 15,  4,  7, 12,  2,  9, 13,  6,  8,  3],
+    [ 0, 12, 11,  7,  5,  9, 14,  2, 10,  6,  1, 13, 15,  3,  4,  8],
+    [ 0, 13,  9,  4,  1, 12,  8,  5,  2, 15, 11,  6,  3, 14, 10,  7],
+    [ 0, 14, 15,  1, 13,  3,  2, 12,  9,  7,  6,  8,  4, 10, 11,  5],
+    [ 0, 15, 13,  2,  9,  6,  4, 11,  1, 14, 12,  3,  8,  7,  5, 10],
+];
+
+const GF16_INV: [u8; 16] = [ 0,  1,  9, 14, 13, 11,  7,  6, 15,  2, 12,  5, 10,  4,  3,  8];
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct Gf16 (u8);
+impl Gf16 {
+    #[inline]
+    fn new(x: u8) -> Self {
+        debug_assert!(x < 16);
+        Self(x)
+    }
+}
+
+impl Add for Gf16 {
+    type Output = Self;
+
+    #[inline]
+    fn add(self, rhs: Self) -> Self::Output {
+        Gf16(self.0 ^ rhs.0)
+    }
+}
+
+impl Mul for Gf16 {
+    type Output = Self;
+
+    #[inline]
+    fn mul(self, rhs: Self) -> Self::Output {
+        Gf16(GF16_MUL[self.0 as usize][rhs.0 as usize])
+    }
+}
+
+impl Div for Gf16 {
+    type Output = Self;
+
+    #[inline]
+    fn div(self, rhs: Self) -> Self::Output {
+        self.mul(Self(GF16_INV[rhs.0 as usize]))
+    }
+}
+
+const FEC_PARITY_MATRIX: [[Gf16; 7]; 8] = [
+    [Gf16( 4), Gf16( 5), Gf16( 1), Gf16( 9), Gf16( 8), Gf16(15), Gf16(13)],
+    [Gf16( 1), Gf16( 8), Gf16( 8), Gf16(14), Gf16(11), Gf16(15), Gf16( 1)],
+    [Gf16( 4), Gf16( 4), Gf16( 9), Gf16( 1), Gf16( 6), Gf16( 4), Gf16( 2)],
+    [Gf16( 8), Gf16(14), Gf16( 6), Gf16( 8), Gf16( 2), Gf16(11), Gf16(13)],
+    [Gf16( 1), Gf16( 4), Gf16( 3), Gf16( 9), Gf16(10), Gf16( 5), Gf16( 5)],
+    [Gf16( 7), Gf16( 3), Gf16( 1), Gf16( 8), Gf16( 7), Gf16(12), Gf16( 9)],
+    [Gf16( 2), Gf16(12), Gf16(10), Gf16(12), Gf16(12), Gf16( 9), Gf16( 3)],
+    [Gf16(12), Gf16(13), Gf16(15), Gf16( 2), Gf16( 7), Gf16(14), Gf16(13)],
+];
+
+#[derive(Clone, Copy)]
+struct FECRow {
+    values: [Gf16; 15],
+    missing: u16,
+}
+
+impl FECRow {
+    fn create(start: u8, received: u16) -> Self {
+        Self {
+            values: [Default::default(); 15],
+            missing: 0x7fff & !((1u16 << start.min(8)) - 1) & !received,
+        }
+    }
+
+    fn set(&mut self, idx: usize, value: u8) {
+        self.values[idx] = Gf16::new(value);
+        self.missing &= !(1 << idx);
+    }
+
+    fn compute_parity(&mut self) {
+        let mut r = [Gf16::default(); 7];
+        for d in self.values[..8].iter().copied() {
+            let f = d + r[0];
+
+            r = [
+                r[1] + Gf16(12) * f,
+                r[2] + Gf16(13) * f,
+                r[3] + Gf16(15) * f,
+                r[4] + Gf16(2) * f,
+                r[5] + Gf16(7) * f,
+                r[6] + Gf16(14) * f,
+                       Gf16(13) * f,
+            ];
+        }
+        self.values[8..].copy_from_slice(&r);
+        self.missing &= 0xff;
+    }
+
+    fn known(&self, i: usize) -> bool {
+        (self.missing >> i) & 1 == 0
+    }
+
+    fn repair(&mut self) -> bool {
+        if self.missing & 0xff == 0 {
+            return true; // nothing erased -- the overwhelmingly common case
+        }
+        let lost: Vec<usize> = (0..8).filter(|&i| !self.known(i)).collect();
+        let eqs: Vec<usize> = (8..15).filter(|&j| self.known(j)).collect();
+        if eqs.len() < lost.len() {
+            return false;
+        }
+
+        // Augmented matrix, one row per erasure: coefficients then right-hand side.
+        let n = lost.len();
+        let mut m = [[Gf16(0); 9]; 7];
+        for (row, &j) in m.iter_mut().zip(&eqs) {
+            for (cell, &i) in row.iter_mut().zip(&lost) {
+                *cell = FEC_PARITY_MATRIX[i][j - 8];
+            }
+            row[n] = (0..8)
+                .filter(|&i| self.known(i))
+                .fold(self.values[j], |acc, i| acc + self.values[i] * FEC_PARITY_MATRIX[i][j - 8]);
+        }
+
+        for col in 0..n {
+            let pivot = (col..n).find(|&r| m[r][col].0 != 0);
+            let Some(pivot) = pivot else { return false };
+            m.swap(col, pivot);
+            let scale = m[col][col];
+            for c in col..=n {
+                m[col][c] = m[col][c] / scale;
+            }
+            for r in 0..n {
+                let f = m[r][col];
+                if r == col || f.0 == 0 {
+                    continue;
+                }
+                for c in col..=n {
+                    let t = m[col][c] * f;
+                    m[r][c] = m[r][c] + t;
+                }
+            }
+        }
+
+        for (r, &i) in lost.iter().enumerate() {
+            self.values[i] = m[r][n];
+            self.missing &= !(1 << i);
+        }
+        true
+    }
+}
+
+struct FECGroup {
+    rows: Vec<FECRow>,
+    symbols_per_packet: u8,
+    received: u16,
+}
+
+impl FECGroup {
+    fn new(symbols_per_packet: u8) -> Self {
+        Self {
+            rows: vec![],
+            symbols_per_packet,
+            received: 0
+        }
+    }
+
+    fn missing_data(&self) -> u16 {
+        if self.rows.is_empty() {
+            return 0xff
+        }
+        self.rows.last().unwrap().missing & 0xff
+    }
+
+    fn ingest(&mut self, header: &FECHeader, data: &[u8]) {
+        let position = (header.position + if header.is_data { 0 } else { 8 }) as usize;
+        let mut nibbles = data.iter().flat_map(|&i| [i >> 4, i & 0xf]);
+
+        let row_count = (data.len() * 2 + self.symbols_per_packet as usize - 1) / 
+            self.symbols_per_packet as usize;
+
+
+        if self.rows.len() < row_count {
+            self.rows.resize(row_count, FECRow::create(header.start_position, self.received));
+        }
+
+        for row in &mut self.rows {
+            let mut idx = 0;
+            while idx < self.symbols_per_packet as usize {
+                let i = position + idx;
+                row.set(i, nibbles.next().unwrap_or_default());
+                self.received |= 1 << i;
+                idx += 1;
+            }
+        }
+    }
+
+    fn compute_parity(&mut self) {
+        for row in &mut self.rows {
+            row.compute_parity();
+        }
+    }
+
+    fn get_data(&self, start: u8) -> Vec<u8> {
+        let mut items = self.rows.iter().flat_map(|i| &i.values[start as usize..(start + self.symbols_per_packet) as usize]);
+        let mut result = Vec::with_capacity(self.rows.len() * self.symbols_per_packet as usize / 2);
+        while let Some(high) = items.next() {
+            let Some(low) = items.next() else { break };
+            result.push((high.0 << 4) | low.0);
+        }
+        result
+    }
+
+    fn recover(&mut self, start: u8) -> Option<Vec<u8>> {
+        for row in &mut self.rows {
+            if !row.repair() {
+                return None
+            }
+        }
+
+        Some(self.get_data(start))
+    }
+
+    fn validate(&self) {
+        for row in &self.rows {
+            let mut computed = *row;
+            computed.missing = 0;
+            computed.compute_parity();
+            for (idx, i) in row.values[8..].iter().enumerate() {
+                if (row.missing >> (8 + idx)) & 1 != 0 { continue }
+                assert_eq!(*i, computed.values[8 + idx]);
+            }
+        }
+    }
+}
+
+struct FECData {
+    data: FECGroup,
+    size: FECGroup,
+    start: u8,
+    start_seq: u16,
+}
+
+impl FECData {
+    fn new(symbols_per_packet: u8, start: u8, start_seq: u16) -> Self {
+        Self {
+            data: FECGroup::new(symbols_per_packet),
+            size: FECGroup::new(symbols_per_packet),
+            start,
+            start_seq,
+        }
+    }
+
+    fn last_idx(&self) -> u16 {
+        ((7 - self.start) / self.data.symbols_per_packet) as u16
+    }
+
+    fn recover(&mut self, idx: u16) -> Option<Vec<u8>> {
+        let position = self.start + idx as u8 * self.data.symbols_per_packet;
+        let mut data = self.data.recover(position)?;
+        let size = self.size.recover(position)?;
+        let size = u16::from_le_bytes(size[..2].try_into().unwrap());
+        data.resize(size as usize, 0);
+        Some(data)
+    }
+
+    fn ingest(&mut self, header: &FECHeader, data: &[u8]) {
+        self.data.ingest(header, &data);
+        if let Some(parity) = &header.parity {
+            self.size.ingest(header, &parity.redundant_bits_for_payload_size.to_le_bytes());
+        } else {
+            self.size.ingest(header, &(data.len() as u16).to_le_bytes());
+        }
+    }
+
+    fn missing_idx(&self) -> Vec<u16> {
+        let missing = self.data.missing_data();
+        let mut result = vec![];
+        let mut start = self.start;
+        let mut idx = 0;
+        while start < 8 {
+            if missing & (1 << start) != 0 {
+                result.push(idx);
+            }
+            start += self.data.symbols_per_packet;
+            idx += 1;
+        }
+        result
+    }
+
+    fn get_parity<'t>(&'t mut self) -> impl Iterator<Item = (u8, u16, Vec<u8>)> + use<'t> {
+        self.data.compute_parity();
+        self.size.compute_parity();
+
+        (8..15)
+            .step_by(self.data.symbols_per_packet as usize)
+            .map(|row| (row - 8, 
+                    u16::from_le_bytes(self.size.get_data(row).try_into().unwrap()), 
+                    self.data.get_data(row)))
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FECParitySubheader {
+    pub redundant_bits_for_payload_size: u16,
+    pub parity_sequence_number: u16,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FECHeader {
+    pub version: u8,
+    pub symbols_per_packet: u8,
+    pub position: u8,
+    pub is_data: bool,
+    pub group_id: u8,
+    pub last_group: bool,
+    pub start_position: u8,
+    pub fec_percentage: u16,
+    pub parity: Option<FECParitySubheader>,
+}
+
+impl FECHeader {
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != 4 && bytes.len() != 8 {
+            return None
+        }
+
+        let common = u32::from_be_bytes(bytes[..4].try_into().ok()?);
+        let parity = if bytes.len() == 8 {
+            Some(FECParitySubheader {
+                redundant_bits_for_payload_size: u16::from_be_bytes(bytes[4..6].try_into().ok()?),
+                parity_sequence_number: u16::from_be_bytes(bytes[6..8].try_into().ok()?),
+            })
+        } else {
+            None
+        };
+
+        Some(Self {
+            version: (common >> 30) as u8,
+            symbols_per_packet: ((common >> 27) & 0x7) as u8,
+            position: ((common >> 23) & 0xf) as u8,
+            is_data: common & 0x00400000 != 0,
+            group_id: ((common >> 15) & 0x7f) as u8,
+            last_group: common & 0x00004000 != 0,
+            start_position: ((common >> 10) & 0xf) as u8,
+            fec_percentage: (common & 0x3ff) as u16,
+            parity,
+        })
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let common = ((self.version as u32 & 0x3) << 30)
+            | ((self.symbols_per_packet as u32 & 0x7) << 27)
+            | ((self.position as u32 & 0xf) << 23)
+            | ((self.is_data as u32) << 22)
+            | ((self.group_id as u32 & 0x7f) << 15)
+            | ((self.last_group as u32) << 14)
+            | ((self.start_position as u32 & 0xf) << 10)
+            | self.fec_percentage as u32 & 0x3ff;
+        let mut result = common.to_be_bytes().to_vec();
+        if let Some(parity) = self.parity {
+            result.extend_from_slice(&parity.redundant_bits_for_payload_size.to_be_bytes());
+            result.extend_from_slice(&parity.parity_sequence_number.to_be_bytes());
+        }
+        result
+    }
+}
+
 // VCMediaControlInfoFaceTimeVideo
 #[derive(Debug, Default, Clone)]
 struct FTVideoControlData {
@@ -2464,7 +2939,7 @@ struct FTVideoControlData {
     ltr_timestamp: Option<u32>,
     total_packets_per_frame: Option<u16>,
     frame_sequence_number: Option<u16>,
-    fec_header: Option<Vec<u8>>,
+    fec_header: Option<FECHeader>,
     probe: Option<u32>,
 }
 
@@ -2485,7 +2960,8 @@ impl FTVideoControlData {
                 Some(u16::from_be_bytes(payload.drain(..2).collect::<Vec<_>>().try_into().unwrap()))
             } else { None },
             fec_header: if (profile & 0x4) != 0 {
-                Some(payload.drain(..payload.len() - if profile & 0x8 != 0 { 4 } else { 0 }).collect())
+                let header = payload.drain(..payload.len() - if profile & 0x8 != 0 { 4 } else { 0 }).collect::<Vec<_>>();
+                Some(FECHeader::from_bytes(&header).unwrap())
             } else { None },
             probe: if (profile & 0x8) != 0 {
                 Some(u32::from_be_bytes(payload.drain(..4).collect::<Vec<_>>().try_into().unwrap()))
@@ -2505,11 +2981,47 @@ impl FTVideoControlData {
             self.ltr_timestamp.map(|i| i.to_be_bytes().to_vec()).unwrap_or_default(),
             if self.version == 2 { self.total_packets_per_frame.map(|i| i.to_be_bytes().to_vec()).unwrap_or_default() } else { vec![] },
             if self.version == 2 { self.frame_sequence_number.map(|i| i.to_be_bytes().to_vec()).unwrap_or_default() } else { vec![] },
-            self.fec_header.clone().unwrap_or_default(),
+            self.fec_header.as_ref().map(FECHeader::to_bytes).unwrap_or_default(),
             self.probe.map(|i| i.to_be_bytes().to_vec()).unwrap_or_default(),
         ].concat();
         (result, body)
     }
+}
+
+#[test]
+fn test_fec_header() {
+    let data = decode_hex("4bc04c64").unwrap();
+    let header = FECHeader::from_bytes(&data).unwrap();
+    assert_eq!(header, FECHeader {
+        version: 1,
+        symbols_per_packet: 1,
+        position: 7,
+        is_data: true,
+        group_id: 0,
+        last_group: true,
+        start_position: 3,
+        fec_percentage: 100,
+        parity: None,
+    });
+    assert_eq!(header.to_bytes(), data);
+
+    let data = decode_hex("4a004c64081b02d6").unwrap();
+    let header = FECHeader::from_bytes(&data).unwrap();
+    assert_eq!(header, FECHeader {
+        version: 1,
+        symbols_per_packet: 1,
+        position: 4,
+        is_data: false,
+        group_id: 0,
+        last_group: true,
+        start_position: 3,
+        fec_percentage: 100,
+        parity: Some(FECParitySubheader {
+            redundant_bits_for_payload_size: 0x081b,
+            parity_sequence_number: 0x02d6,
+        }),
+    });
+    assert_eq!(header.to_bytes(), data);
 }
 
 fn build_rvra1(width: u32, height: u32) -> [u8; 2] {
@@ -2587,18 +3099,21 @@ enum SendControl {
     Ack (u64, u64),
 }
 
-fn manage_control(link: Arc<GlobalLink>) -> tokio::sync::mpsc::Sender<SendControl> {
+fn manage_control(link: Weak<GlobalLink>) -> tokio::sync::mpsc::Sender<SendControl> {
     let (control_send, mut control_recv) = tokio::sync::mpsc::channel(1024);
     tokio::spawn(async move {
         let mut pending_messages: BTreeMap<Instant, PendingControlMessage> = BTreeMap::new();
-        let far_future = Instant::now() + Duration::from_secs(100 * 365 * 24 * 60 * 60);
         loop {
+            let far_future = Instant::now() + Duration::from_secs(1 * 60 * 60);
             select! {
                 recv = control_recv.recv() => {
                     let Some(i) = recv else { break };
                     match i {
                         SendControl::Send(i) => {
                             info!("Control Sending message! {i:?}");
+                            let Some(link) = link.upgrade() else {
+                                break;
+                            };
                             if let Err(e) = link.send_control(i.participant as i64, &i.data) {
                                 warn!("Control send error {e}");
                             }
@@ -2616,8 +3131,12 @@ fn manage_control(link: Arc<GlobalLink>) -> tokio::sync::mpsc::Sender<SendContro
                     }
                 },
                 _ = sleep_until(pending_messages.keys().next().copied().unwrap_or(far_future)) => {
+                    if pending_messages.is_empty() { continue };
                     let next = pending_messages.pop_first().unwrap().1;
                     info!("Control Resending message with {next:?}");
+                    let Some(link) = link.upgrade() else {
+                        break;
+                    };
                     if let Err(e) = link.send_control(next.participant as i64, &next.data) {
                         warn!("Control resend error {e}");
                     }
@@ -2637,15 +3156,17 @@ struct AVChannelHistory {
     history: VecDeque<(u16, GlobalLinkOutgoingPacket)>,
     last_frame: u16,
     last_probe: u16,
+    last_fec_seq: u16,
 }
 
 impl AVChannelHistory {
-    fn add_packet(&mut self, seq: u16, packet: GlobalLinkOutgoingPacket, frame: u16, probe: u16) {
+    fn add_packet(&mut self, seq: u16, packet: GlobalLinkOutgoingPacket, frame: u16, probe: u16, last_fec_seq: u16) {
         if let Some(back) = self.history.back() {
             assert_eq!(back.0, seq.wrapping_sub(1));
         }
         self.last_frame = frame;
         self.last_probe = probe;
+        self.last_fec_seq = last_fec_seq;
         self.history.push_back((seq, packet));
         if self.history.len() > 1000 {
             self.history.pop_front();
@@ -2687,12 +3208,31 @@ fn skip_frame_is_a_valid_annex_b_hevc_filler_nal() {
     assert_eq!(nals[0][nals[0].len() - 1], 0x80);
 }
 
+fn balanced_chunks<T>(
+    v: Vec<T>,
+    max_size: usize,
+) -> impl Iterator<Item = Vec<T>> {
+    assert!(max_size > 0);
+
+    let n = v.len();
+    let chunks = n.div_ceil(max_size);
+    let mut iter = v.into_iter();
+
+    (0..chunks).map(move |i| {
+        let remaining_chunks = chunks - i;
+        let size = iter.len().div_ceil(remaining_chunks);
+
+        iter.by_ref().take(size).collect()
+    })
+}
+
 pub struct VideoSender {
     hevc: HevcPayloader,
     context: Context,
     frame_number: u16,
     sequence_number: u16,
     probe_number: u16,
+    fec_number: u16,
     pending_desc: Option<DecoderConfiguration>,
     cached_image_desc: Option<ImageDescription>,
     last_probe: Option<Instant>,
@@ -2783,14 +3323,15 @@ impl VideoSender {
             nal.splice(0..0, raw.clone());
         }
 
-        let mut payloads = self.hevc.payload(1024, &nal.into()).unwrap();
+        let mut payloads = self.hevc.payload(1024, &nal.into()).unwrap()
+            .into_iter().map(|i| (None, i)).collect::<Vec<(Option<FECHeader>, Bytes)>>();
 
         if let Some(DecoderConfiguration::ImageDescription(desc)) = &desc {
             let format = [
                 &[0x92, 0xe6, 0xc0, 0xa3][..],
                 &desc.encode()
             ].concat();
-            payloads.insert(0, format.into());
+            payloads.insert(0, (None, format.into()));
         }
 
         if payloads.is_empty() {
@@ -2804,19 +3345,20 @@ impl VideoSender {
 
         let time_since_last_probe = self.last_probe.map(|i| i.elapsed()).unwrap_or(Duration::from_hours(1));
         let mut probe_id = None;
-        if payloads.len() > 2 ||
+        if (payloads.len() > 2 ||
             (time_since_last_probe > Duration::from_secs(5) && payloads.len() > 1) ||
-            time_since_last_probe > Duration::from_secs(10) {
-            
+            time_since_last_probe > Duration::from_secs(10)) && self.to_participant.is_none() /* only probe in group calls */ {
+            // FEC is never done in groups, if that changes, this calculation needs to account for that.
 
             if payloads.len() < 2 {
                 // Generate Annex-B first, then pass it through the HEVC
                 // payloader. Directly placing Annex-B bytes in an RTP payload
                 // would incorrectly include the start code on the wire.
-                let target_payload_len = payloads[0].len().max(3);
+                let target_payload_len = payloads[0].1.len().max(3);
                 let mut fake_frame = vec![0; target_payload_len + 4];
                 generate_skip_frame(&mut fake_frame);
-                let fake_payloads = self.hevc.payload(1024, &fake_frame.into()).unwrap();
+                let fake_payloads = self.hevc.payload(1024, &fake_frame.into()).unwrap()
+                    .into_iter().map(|i| (None, i)).collect::<Vec<(Option<FECHeader>, Bytes)>>();
                 debug_assert_eq!(fake_payloads.len(), 1);
                 payloads.extend(fake_payloads);
                 info!("Inserting fake frame for probe!");
@@ -2829,7 +3371,7 @@ impl VideoSender {
             self.last_probe = Some(Instant::now());
         }
 
-        let payloads_len = payloads.len();
+        let mut payloads_len = payloads.len();
         let extension = FTVideoControlData {
             version: if self.to_participant.is_some() { 2 } else { 1 },
             camera_status: self.camera_source,
@@ -2839,9 +3381,79 @@ impl VideoSender {
             ..Default::default()
         };
 
-        let ext = extension.to_ext();
+        if payloads_len > 3 && self.to_participant.is_some() {
+            let symbols_per_packet: u8 = match payloads_len {
+                2 => 4,
+                3 | 4 => 2,
+                _ => 1,
+            };
+        
+            let nchunks = payloads.chunks(8 / symbols_per_packet as usize).len();
+            let payloads_copy = std::mem::take(&mut payloads);
+            for (chunk_idx, group) in balanced_chunks(payloads_copy, 8 / symbols_per_packet as usize).enumerate() {
+                let start = 8 - group.len() as u8 * symbols_per_packet;
+                let mut fec = FECData::new(symbols_per_packet, start, self.sequence_number);
+                let parity_packets: u8 = match payloads.len() {
+                    ..6 => 1,
+                    6.. => 2,
+                };
+                let group_len = group.len();
+                let last_group = chunk_idx + 1 == nchunks;
+                for (idx, mut packet) in group.into_iter().enumerate() {
+                    let header = FECHeader {
+                        version: 1,
+                        symbols_per_packet,
+                        position: start + idx as u8 * symbols_per_packet,
+                        is_data: true,
+                        group_id: chunk_idx as u8,
+                        last_group,
+                        start_position: start,
+                        fec_percentage: 100 * parity_packets as u16 / group_len as u16,
+                        parity: None,
+                    };
+
+                    fec.ingest(&header, &packet.1);
+                    packet.0 = Some(header);
+                    payloads.push(packet);
+                }
+
+                if last_group {
+                    payloads_len = payloads.len();
+                }
+                
+                for (position, size_red, data) in fec.get_parity().take(parity_packets as usize) {
+                    let header = FECHeader {
+                        version: 1,
+                        symbols_per_packet,
+                        position,
+                        is_data: false,
+                        group_id: chunk_idx as u8,
+                        last_group,
+                        start_position: start,
+                        fec_percentage: 100 * parity_packets as u16 / group_len as u16,
+                        parity: Some(FECParitySubheader {
+                            redundant_bits_for_payload_size: size_red,
+                            parity_sequence_number: self.fec_number,
+                        }),
+                    };
+
+                    self.fec_number = self.fec_number.wrapping_add(1);
+
+                    payloads.push((Some(header), data.into()));
+                }
+            }
+        }
+
         for (idx, payload) in payloads.into_iter().enumerate() {
             // info!("SEnding video payload {}", encode_hex(&payload));
+
+            let is_data = !payload.0.is_some_and(|i| !i.is_data);
+
+            let extension = FTVideoControlData {
+                fec_header: payload.0,
+                ..extension.clone()
+            };
+            let ext = extension.to_ext();
 
             let packet = Packet {
                 header: Header {
@@ -2850,7 +3462,7 @@ impl VideoSender {
                     extension: true,
                     marker: idx == payloads_len - 1,
                     payload_type: 100,
-                    sequence_number: self.sequence_number,
+                    sequence_number: self.sequence_number - if !is_data { 1 /* we already incremented, undo that. */ } else { 0 },
                     timestamp,
                     ssrc: self.ssrc,
                     csrc: vec![],
@@ -2861,7 +3473,7 @@ impl VideoSender {
                     }],
                     extensions_padding: 0,
                 },
-                payload,
+                payload: payload.1,
             };
 
             // info!("Sending header {:?}", packet.header);
@@ -2871,7 +3483,6 @@ impl VideoSender {
             let encrypted = self.context.encrypt_rtp(&result).unwrap();
             self.sent_octets = self.sent_octets.wrapping_add(encrypted.len() as u64);
             self.sent_packets = self.sent_packets.wrapping_add(1);
-            self.sequence_number = self.sequence_number.wrapping_add(1);
 
             // info!("SEnding video payload Encrypted {}", encode_hex(&encrypted));
 
@@ -2883,12 +3494,17 @@ impl VideoSender {
                 packet: encrypted,
             };
             
-            self.packet_buffer.lock().unwrap().add_packet(packet.header.sequence_number, p.clone(), self.frame_number, self.probe_number);
+            if is_data {
+                self.sequence_number = self.sequence_number.wrapping_add(1);
+                self.packet_buffer.lock().unwrap().add_packet(packet.header.sequence_number, p.clone(), self.frame_number, self.probe_number, self.fec_number);
+            }
             // if (1560u16..1561).contains(&self.sequence_number) {
             if false {
                 warn!("Dropping packet {}", self.sequence_number);
             } else {
-                self.link.send(&p)?;
+                if let Err(e) = self.link.send(&p) {
+                    warn!("Failed to send vidoe packet {e}!");
+                }
             }
 
         }
@@ -2957,6 +3573,8 @@ impl VideoSender {
     }
 }
 
+const AFRC_LOG_INTERVAL_PACKETS: u16 = 50;
+
 pub struct AudioSender {
     context: Context,
     sequence_number: u16,
@@ -3014,6 +3632,14 @@ impl AudioSender {
             let current_send = ((timestamp as u64 + 52676) * 16 / 375) as u16;
             stats.outgoing_send_time.store(current_send, Ordering::Relaxed);
 
+            let queue_sent = stats.last_feedback_time.load(Ordering::Relaxed);
+            let queue_delay = duration_since_epoch().as_millis() as u64 - queue_sent;
+            let queue_delay_1024 = if queue_sent == 0 {
+                0
+            } else {
+                (queue_delay * 128 / 125).clamp(1, u16::MAX as u64)
+            };
+
             let extension = FTAudioControlData {
                 version: 2,
                 total_kb_recv: (stats.total_recv_bytes.load(Ordering::Relaxed) / 1000) as u16,
@@ -3021,7 +3647,7 @@ impl AudioSender {
                 current_send_timestamp: Some(current_send),
                 audio_burst_loss: stats.audio_burst_loss.swap(0, Ordering::Relaxed),
                 audio_received_packets: stats.total_recv_count.load(Ordering::Relaxed),
-                queuing_delay: Some(0),
+                queuing_delay: Some(queue_delay_1024 as u16),
                 q13_one_way_delay: Some(q13_timestamp_int),
                 video_burst_loss: Some(stats.video_burst_loss.swap(0, Ordering::Relaxed)),
                 video_packet_loss: Some(worst.0),
@@ -3032,7 +3658,9 @@ impl AudioSender {
                 ..Default::default()
             };
 
-            // info!("Sending AFRC {extension:?}");
+            if self.sequence_number % AFRC_LOG_INTERVAL_PACKETS == 0 {
+                info!("Sending AFRC {extension:?}");
+            }
             // to induce a quality slowdown
             // burst loss fine, q13_one_way_delay 3000
             // packet loss/frame size large.
@@ -3044,7 +3672,7 @@ impl AudioSender {
             //     current_send_timestamp: Some(((timestamp as u64 + 52676) * 16 / 375) as u16),
             //     audio_burst_loss: stats.audio_burst_loss.swap(0, Ordering::Relaxed),
             //     audio_received_packets: stats.total_recv_count.load(Ordering::Relaxed),
-            //     queuing_delay: Some(0),
+            //     queuing_delay: Some(1),
             //     q13_one_way_delay: Some(3000),
             //     video_burst_loss: Some(15),
             //     video_packet_loss: Some(5),
@@ -3098,7 +3726,7 @@ impl AudioSender {
             packet: encrypted,
         };
         
-        self.packet_buffer.lock().unwrap().add_packet(packet.header.sequence_number, p.clone(), 0, 0);
+        self.packet_buffer.lock().unwrap().add_packet(packet.header.sequence_number, p.clone(), 0, 0, 0);
         // if (1560u16..1562).contains(&payloader.sequence_number) {
         if false {
             warn!("Dropping packet {}", self.sequence_number);
@@ -3120,6 +3748,7 @@ pub enum AVControlCommand {
     },
     SelectVideoBitrate(usize),
     ActiveParticipants(HashSet<u64>),
+    CallFailed,
 }
 
 pub struct AVSession {
@@ -3184,13 +3813,15 @@ impl AVSession {
                 last_quality_bump: start_now,
                 last_quality_downgrade: start_now,
                 quality_bump_failures: 0,
+                u1_clean_streak: 0,
+                u1_failed_rung: None,
                 active_participants: HashSet::new(),
                 current_video_bitrate: BITRATE_TABLE.len() / 2,
             }),
             av_config,
             session_id: group_id,
             frame_handler: packet_handler,
-            outgoing_control: manage_control(relay_session.clone()),
+            outgoing_control: manage_control(Arc::downgrade(&relay_session)),
 
             ssrc_packet_buffer: Default::default(),
 
@@ -3295,6 +3926,9 @@ impl AVSession {
                                 warn!("Initiated U1 True failed {e}");
                             }
                         }
+                    },
+                    GlobalLinkChange::LinkFailed => {
+                        session.call_failed().await;
                     }
                 }
             }
@@ -3400,37 +4034,46 @@ impl AVSession {
         let mut data = self.state.lock().await;
         data.video_enabled = video;
         drop(data);
-        self.send_stream_groups_state().await
+        self.send_stream_groups_state(None).await
     }
 
-    async fn send_stream_groups_state(&self) -> Result<(), PushError> {
+    async fn send_stream_groups_state(&self, to: Option<u64>) -> Result<(), PushError> {
         let data = self.state.lock().await;
         let video = data.video_enabled;
-        let mine = *data.participant_session_ids.keys().next().unwrap();
+        let participants = data.active_participants.clone();
         drop(data);
         info!("Sending stream group state!");
-        self.send_control_message(mine, VCControlData::StreamGroupState(HashMap::from_iter([
-            (136, 0),
-            (128, if video { 1 } else { 2 }),
-            (10, 0),
-            (132, 0),
-            (11, 0),
-            (129, 1),
-            (133, 0),
-            (1, if video { 1 } else { 2 }),
-            (2, 1),
-            (3, 0),
-            (134, 0),
-            (4, 0),
-            (5, if video { 1 } else { 2 }),
-            (130, 0),
-            (6, 1),
-            (135, 0),
-            (7, 0),
-            (8, 0),
-            (131, 0),
-            (9, 0),
-        ]))).await?;
+        let send = |item| {
+            self.send_control_message(item, VCControlData::StreamGroupState(HashMap::from_iter([
+                (136, 0),
+                (128, if video { 1 } else { 2 }),
+                (10, 0),
+                (132, 0),
+                (11, 0),
+                (129, 1),
+                (133, 0),
+                (1, if video { 1 } else { 2 }),
+                (2, 1),
+                (3, 0),
+                (134, 0),
+                (4, 0),
+                (5, if video { 1 } else { 2 }),
+                (130, 0),
+                (6, 1),
+                (135, 0),
+                (7, 0),
+                (8, 0),
+                (131, 0),
+                (9, 0),
+            ])))
+        };
+        if let Some(to) = to {
+            send(to).await?;
+        } else {
+            for to in participants {
+                send(to).await?;
+            }
+        }
         Ok(())
     }
 
@@ -3525,12 +4168,12 @@ impl AVSession {
 
         info!("Video send main ssrc {} extra {:?}", ssrc, extra_ssrcs);
 
-        let (sequence_number, frame_number, probe_number) = self.ssrc_packet_buffer.lock().unwrap().get(&ssrc)
+        let (sequence_number, frame_number, probe_number, fec_number) = self.ssrc_packet_buffer.lock().unwrap().get(&ssrc)
                 .and_then(|l| {
                     let lock = l.lock().unwrap();
-                    lock.history.back().map(|i| (i.0.wrapping_add(1), lock.last_frame.wrapping_add(1), lock.last_probe))
+                    lock.history.back().map(|i| (i.0.wrapping_add(1), lock.last_frame.wrapping_add(1), lock.last_probe, lock.last_fec_seq))
                 })
-                .unwrap_or((1532, 990, 0 /* is this supposed to be 1? or zero? */));
+                .unwrap_or((1532, 990, 0 /* is this supposed to be 1? or zero? */, 0));
 
         Ok(VideoSender {
             hevc: Default::default(), 
@@ -3544,6 +4187,7 @@ impl AVSession {
             frame_number,
             sequence_number,
             probe_number,
+            fec_number,
             pending_desc: None,
             cached_image_desc: None,
 
@@ -3566,12 +4210,12 @@ impl AVSession {
         })
     }
 
-    pub async fn import_avc(&self, p: u64, handle: String, avc_data: &[u8]) -> Result<(), PushError> {
+    pub async fn import_avc(&self, p: u64, avc_data: &[u8]) -> Result<(), PushError> {
         let mut state = self.state.lock().await;
         state.import_avc(p, avc_data)?;
 
-        self.frame_handler.handle_keys(state.get_media_config(p, handle.clone(), &self.av_config), true);
-        self.frame_handler.handle_keys(state.get_media_config(p, handle, &self.av_config), false);
+        self.frame_handler.handle_keys(state.get_media_config(p, &self.av_config), true);
+        self.frame_handler.handle_keys(state.get_media_config(p, &self.av_config), false);
 
         drop(state);
         self.update_subscribed_streams().await?;
@@ -3590,8 +4234,17 @@ impl AVSession {
                 }
             }
         }
-        self.link.update_subscribed_streams().await?;
+        if let Err(e) = self.link.update_subscribed_streams().await {
+            warn!("Failed to update subscribed streams {e}!");
+            self.call_failed().await;
+            return Err(e);
+        }
         Ok(())
+    }
+
+    async fn call_failed(&self) {
+        // WARNING: no guarantee any lock will be free at this point
+        let _ = self.control_sender.try_send(AVControlCommand::CallFailed);
     }
 
     pub fn register_timing_target(&self, participant: u64, timing_target: Arc<dyn TimingTarget>) {
@@ -3729,7 +4382,11 @@ impl AVSession {
         let mut state = self.state.lock().await;
         let participant = state.encryption_states.entry(owner_id).or_default();
         participant.prekey = Some(item);
-        state.ensure_keys(owner_id, self).await?;
+        if let Err(e) = state.ensure_keys(owner_id, self).await {
+            warn!("Failed to handle prekey; failing connection! {e}");
+            self.call_failed().await;
+            return Err(e)
+        }
 
         Ok(())
     }
@@ -3746,12 +4403,12 @@ impl AVSession {
         let avc = participant.try_decrypt(&self.session_id)?;
         drop(state);
         if let Some(avc) = avc {
-            self.import_avc(owner_id, handle, &avc).await?;
+            self.import_avc(owner_id, &avc).await?;
         }
         Ok(())
     }
 
-    pub async fn handle_mkm(&self, owner_id: u64, mut item: QuickRelayMkmMaterial, handle: String) -> Result<(), PushError> {
+    pub async fn handle_mkm(&self, owner_id: u64, mut item: QuickRelayMkmMaterial, _handle: String) -> Result<(), PushError> {
         let mut state = self.state.lock().await;
         item.mkm = state.decode_key_material(item.mkm.as_ref())?;
         let s = state.encryption_states.entry(owner_id).or_default();
@@ -3769,8 +4426,8 @@ impl AVSession {
             s.mkm.push(mat);
         }
         // get_media_config will return an empty array IF no AVC blob has been configured
-        self.frame_handler.handle_keys(state.get_media_config(owner_id, handle.clone(), &self.av_config), true);
-        self.frame_handler.handle_keys(state.get_media_config(owner_id, handle, &self.av_config), false);
+        self.frame_handler.handle_keys(state.get_media_config(owner_id, &self.av_config), true);
+        self.frame_handler.handle_keys(state.get_media_config(owner_id, &self.av_config), false);
 
         Ok(())
     }
@@ -3795,7 +4452,7 @@ impl AVSession {
                     let avc = participant.try_decrypt(&self.session_id)?;
                     drop(state);
                     if let Some(avc) = avc {
-                        self.import_avc(owner_id, "".to_string(), &avc).await?;
+                        self.import_avc(owner_id, &avc).await?;
                     }
                 }
                 13 => {
@@ -3881,7 +4538,7 @@ impl AVSession {
     async fn handle_control(&self, recv: AVInternalMessage) -> Result<(), PushError> {
         match recv {
             AVInternalMessage::Rtcp(rtcp) => {
-                let rtcp_packet = rtc_rtcp::packet::unmarshal(&mut &rtcp.data[..]).unwrap();
+                let rtcp_packet = rtc_rtcp::packet::unmarshal(&mut &rtcp.data[..])?;
                 for packet in rtcp_packet {
                     info!("Got RTCP packet {:?} {:?}", rtcp.link, packet);
                     if let Some(nack) = packet.as_any().downcast_ref::<TransportLayerNack>() {
@@ -3945,7 +4602,7 @@ impl AVSession {
                             info!("Got control message {item:?}");
                             match item {
                                 VCControlData::FetchStreamGroupState => {
-                                    self.send_stream_groups_state().await?;
+                                    self.send_stream_groups_state(Some(id as u64)).await?;
                                 },
                                 VCControlData::OneToOneEnabledState(enabled) => {
                                     let state = self.state.lock().await;
@@ -4024,14 +4681,54 @@ impl AVSession {
                         && damaged_video_frames >= 2;
                     let loss = video_loss_fraction.unwrap_or_default();
                     let no_recent_packet_loss = video_samples != 0 && video_packets_lost == 0;
-                    let high_q13 = latest_q13 >= 2000;
+                    // The multi-rung cuts are gated on having enough packets to believe the
+                    // fraction. A 2/9 window reads as 22% loss, but the standard error at n=9 is
+                    // ~13 points -- that is one frame of noise, and it was observed cutting the
+                    // rate by three rungs. Thin windows still react, just one tier lower.
+                    let loss_confident = video_packets_expected >= U1_MIN_LOSS_SAMPLE;
+                    // Extreme loss is conclusive even in a small window, and the sample gate must
+                    // not swallow it: 13 of 16 packets lost is ~81% with a lower bound still north
+                    // of 60%, yet a flat confidence requirement produced no action at all. The
+                    // evidence needed should scale with the size of the claim, not be a fixed bar.
+                    let loss_undeniable = video_packets_lost >= 6 && loss >= 0.40;
                     let loss_drop_tiers = match loss {
-                        loss if loss >= 0.40 => 4,
-                        loss if loss >= 0.20 => 3,
-                        loss if sustained_packet_loss && loss >= 0.08 => 2,
-                        loss if sustained_packet_loss && loss > 0.0 => 1,
+                        loss if loss >= 0.40 && (loss_confident || loss_undeniable) => 4,
+                        loss if loss >= 0.20 && loss_confident => 3,
+                        // A moderate cut needs either a window big enough to trust the fraction,
+                        // or loss that actually persisted across frames. One damaged frame in a
+                        // small window reads as 15-25% loss, and because dropping the rate also
+                        // shrinks the window, that was observed walking the rate down 12 -> 10 -> 8
+                        // with each reading noisier than the last -- noise driving its own spiral.
+                        loss if loss >= U1_LOSS_CONGESTED
+                            && (loss_confident || sustained_packet_loss) => 2,
+                        // Below the congestion threshold, only loss that is actually persistent is
+                        // worth acting on -- a single damaged frame is normal on any real link.
+                        loss if sustained_packet_loss && loss > U1_LOSS_IGNORE => 1,
                         _ => 0,
                     };
+                    // Loss confined to a single frame is a burst, not sustained overload, so cap
+                    // how far it can cut. Observed repeatedly: 8/32, 6/25 and 6/30 each had one
+                    // damaged frame and each took three rungs, ~59% of the rate, off a transient.
+                    // `sustained` is a poor *gate* here because these windows hold only 2-4 frames
+                    // and it fails for lack of samples -- but it is a fine bound on magnitude. If
+                    // the burst really is congestion it persists into the next report and drops
+                    // again 1.5s later; nothing is lost but the overshoot.
+                    let loss_drop_tiers = if sustained_packet_loss || loss_undeniable {
+                        loss_drop_tiers
+                    } else {
+                        loss_drop_tiers.min(2)
+                    };
+
+                    // Delay is the early signal, and it earns its place: measured over a real call,
+                    // q13 at >=10% loss ran p90=5289 against p90=453 when loss was zero, and
+                    // `>=2000 && rising` was followed by >=10% loss within ~3s on 6 of 10
+                    // occurrences, against a 1.3% base rate. It leads the loss by about a second.
+                    //
+                    // Requiring *both* absolute elevation and a rising trend is what keeps the
+                    // absolute threshold safe on other networks: a link that simply sits at a high
+                    // one-way delay (cellular, satellite) reads high but not rising, so it does not
+                    // trip. Only a link whose delay is climbing -- a queue actually filling -- does.
+                    let high_q13 = latest_q13 >= 2000;
                     let q13_drop_tiers = if sustained_packet_loss {
                         match latest_q13 {
                             8000.. => 4,
@@ -4041,17 +4738,42 @@ impl AVSession {
                             _ => 0,
                         }
                     } else if high_q13 && q13_rising {
+                        // Early warning only, so a single rung: right about 60% of the time, which
+                        // justifies acting but not over-correcting.
                         1
                     } else {
                         0
                     };
                     let drop_tiers = loss_drop_tiers.max(q13_drop_tiers);
 
-                    let wants_upgrade = q13_sample_count >= 2
-                        && latest_q13 < 2000
-                        && !q13_rising
-                        && no_recent_packet_loss;
                     let mut state = self.state.lock().await;
+
+                    // A single clean report means nothing -- the loss signal reads zero repeatedly
+                    // mid-collapse. Only a run of them is evidence the path is actually healthy.
+                    let report_is_clean = loss <= U1_LOSS_IGNORE
+                        && video_samples != 0
+                        && !(high_q13 && q13_rising);
+                    state.u1_clean_streak = if report_is_clean { state.u1_clean_streak + 1 } else { 0 };
+
+                    // A rate that recently failed is not retried until the memory expires. A clean
+                    // streak was tried first and is not enough: ~10s of quiet was treated as
+                    // evidence the rate had become viable, and it climbed straight back to the rung
+                    // that had just failed and collapsed at 71% loss. Below the ceiling we climb
+                    // normally; at it we wait for the memory to age out and then probe once.
+                    let failed_rung = state.u1_failed_rung
+                        .map(|(rung, when)| {
+                            rung + (when.elapsed().as_secs() / U1_CEILING_PROBE_INTERVAL.as_secs()) as usize
+                        })
+                        .filter(|rung| *rung < BITRATE_TABLE.len());
+                    let blocked_by_ceiling = failed_rung
+                        .is_some_and(|rung| state.current_video_bitrate + 1 >= rung);
+
+                    let wants_upgrade = q13_sample_count >= 2
+                        && !high_q13
+                        && !q13_rising
+                        && no_recent_packet_loss
+                        && !blocked_by_ceiling
+                        && state.u1_clean_streak >= U1_CLEAN_STREAK;
                     if state.last_quality_bump.elapsed() > Duration::from_secs(60)
                         && state.last_quality_bump > state.last_quality_downgrade
                     {
@@ -4060,10 +4782,20 @@ impl AVSession {
                     let bump_backoff_elapsed = state.quality_bump_failures == 0
                         || state.last_quality_downgrade.elapsed().as_secs()
                             > (60 * (1u64 << state.quality_bump_failures.saturating_sub(1).min(4))).min(15 * 60);
-                    let (bucket, held_for): (isize, Option<&str>) = if state.last_stream_change.elapsed() < U1_CHANGE_SETTLE_TIME {
+                    // Decreases and increases are deliberately gated differently. The settle window
+                    // is there to stop the increase path oscillating; a decrease is a response to
+                    // damage already happening, and delaying it only prolongs the damage.
+                    let settle = state.last_stream_change.elapsed();
+                    let (bucket, held_for): (isize, Option<&str>) = if drop_tiers != 0 {
+                        if settle < U1_DROP_SETTLE_TIME {
+                            (0, Some("drop settle (report predates last change)"))
+                        } else {
+                            (-(drop_tiers as isize), None)
+                        }
+                    } else if settle < U1_CHANGE_SETTLE_TIME {
                         (0, Some("recent quality change"))
-                    } else if drop_tiers != 0 {
-                        (-(drop_tiers as isize), None)
+                    } else if blocked_by_ceiling && state.u1_clean_streak >= U1_CLEAN_STREAK {
+                        (0, Some("at recent failure ceiling"))
                     } else if wants_upgrade && !bump_backoff_elapsed {
                         (0, Some("failed quality bump backoff"))
                     } else if wants_upgrade {
@@ -4073,7 +4805,11 @@ impl AVSession {
                     };
 
                     info!(
-                        "U1 send rate bucket {bucket} held_for={held_for:?}: q13 first={first_q13:?} latest={latest_q13} rising={q13_rising}, video loss={video_packets_lost}/{video_packets_expected} ({video_loss_fraction:?}) damaged={damaged_video_frames}/{video_samples} sustained={sustained_packet_loss} no_recent_loss={no_recent_packet_loss}, bump_failures={}",
+                        "U1 send rate bucket {bucket} held_for={held_for:?}: rate={}kbps(rung {}) q13 first={first_q13:?} latest={latest_q13} rising={q13_rising}, video loss={video_packets_lost}/{video_packets_expected} ({video_loss_fraction:?}) damaged={damaged_video_frames}/{video_samples} sustained={sustained_packet_loss} no_recent_loss={no_recent_packet_loss}, clean_streak={}/{} failed_rung={failed_rung:?} bump_failures={}",
+                        BITRATE_TABLE[state.current_video_bitrate],
+                        state.current_video_bitrate,
+                        state.u1_clean_streak,
+                        U1_CLEAN_STREAK,
                         state.quality_bump_failures
                     );
 
@@ -4091,10 +4827,34 @@ impl AVSession {
                                     info!("U1 quality bump failed after {} secs!", state.last_quality_bump.elapsed().as_secs());
                                     state.quality_bump_failures += 1;
                                 }
+                                // Remember the rate we were *at* when it broke, not the one we are
+                                // retreating to. Climbing straight back into it is what turned
+                                // every one of these events into a repeating sawtooth.
+                                //
+                                // Within a single retreat -- several drops in a row with no bump
+                                // between -- keep the *highest* rung, so the bottom of the walk-down
+                                // is not mistaken for the ceiling. But a failure that happens after
+                                // climbing again is new information: the safe rate is lower than we
+                                // thought, so it replaces the old ceiling instead of being maxed
+                                // away. Without this, failing at 16 under a remembered ceiling of 17
+                                // leaves 16 open and simply moves the sawtooth down a rung.
+                                let climbed_since_last_failure =
+                                    state.last_quality_bump > state.last_quality_downgrade;
+                                let previous = state.u1_failed_rung
+                                    .filter(|_| !climbed_since_last_failure)
+                                    .filter(|(_, when)| when.elapsed() < U1_CEILING_PROBE_INTERVAL)
+                                    .map(|(rung, _)| rung);
+                                state.u1_failed_rung = Some((
+                                    previous.map_or(old_bitrate, |p| p.max(old_bitrate)),
+                                    Instant::now(),
+                                ));
                                 state.last_quality_downgrade = Instant::now();
                             } else {
                                 state.last_quality_bump = Instant::now();
                             }
+                            // The next few reports still describe the old rate, so they are not
+                            // evidence about the new one either way.
+                            state.u1_clean_streak = 0;
                             state.last_stream_change = Instant::now();
                             info!("Changed U1 bitrate to {}", BITRATE_TABLE[state.current_video_bitrate]);
                             self.frame_handler.stats.frame_change_time.store(self.frame_handler.stats.outgoing_send_time.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -4535,21 +5295,20 @@ pub enum ChannelType {
 }
 
 impl ChannelType {
-    fn from_payload(payload: u8) -> Self {
-        match payload {
+    fn from_payload(payload: u8) -> Option<Self> {
+        Some(match payload {
             100 => Self::H265,
             123 => Self::H264,
             104 => Self::Aac,
             108 => Self::Evs,
-            _unk => panic!("Unk ch {payload}"),
-        }
+            _unk => return None,
+        })
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct ChannelMessage {
     pub participant: u64,
-    pub participant_handle: String,
     pub stream_id: u32,
     pub r#type: ChannelType,
     pub frame: ChannelFrame,
