@@ -4737,9 +4737,10 @@ impl AVSession {
                             2000.. => 1,
                             _ => 0,
                         }
-                    } else if high_q13 && q13_rising {
-                        // Early warning only, so a single rung: right about 60% of the time, which
-                        // justifies acting but not over-correcting.
+                    } else if high_q13 && q13_rising && video_packets_lost > 0 {
+                        // Early warning only, and only if actual loss was observed on the wire.
+                        // Without loss, q13 represents link latency/jitter, not queue collapse,
+                        // and acting on it alone collapses video to 10kbps unrecoverably.
                         1
                     } else {
                         0
@@ -4816,6 +4817,12 @@ impl AVSession {
                     if bucket != 0 {
                         let old_bitrate = state.current_video_bitrate;
                         state.current_video_bitrate = state.current_video_bitrate.saturating_add_signed(bucket);
+                        // Minimum floor: rung 8 (422 kbps). Below 400kbps, Apple devices display
+                        // "Connection is unstable" and H.264 video collapses into macroblock distortion.
+                        const MIN_VIDEO_RUNG: usize = 8;
+                        if state.current_video_bitrate < MIN_VIDEO_RUNG {
+                            state.current_video_bitrate = MIN_VIDEO_RUNG;
+                        }
                         if state.current_video_bitrate >= BITRATE_TABLE.len() {
                             state.current_video_bitrate = BITRATE_TABLE.len() - 1;
                         }
