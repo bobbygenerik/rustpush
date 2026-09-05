@@ -405,6 +405,30 @@ impl ImageDescription {
         Self::new_hevc(vps.unwrap(), sps.unwrap(), pps.unwrap())
     }
 
+    pub fn from_annex_b_hevc_safe(annex: &[u8]) -> Option<Self> {
+        let mut vps = None;
+        let mut sps = None;
+        let mut pps = None;
+        for data in AnnexB::new(annex) {
+            if data.is_empty() { continue; }
+            let r#type = (data[0] >> 1) & 0x3f;
+            match r#type {
+                32 => vps = Some(data),
+                33 => sps = Some(data),
+                34 => pps = Some(data),
+                _ => continue,
+            }
+            if vps.is_some() && sps.is_some() && pps.is_some() {
+                break;
+            }
+        }
+        if let (Some(vps), Some(sps), Some(pps)) = (vps, sps, pps) {
+            Self::new_hevc(vps, sps, pps).ok()
+        } else {
+            None
+        }
+    }
+
     pub fn new_hevc(
         vps: &[u8],
         sps: &[u8],
@@ -678,7 +702,7 @@ const U1_CLEAN_STREAK: usize = 4;
 ///
 /// The interval is wide because a failed probe is expensive here: one rung up, but potentially
 /// four rungs back down. A controller that can probe at +8% can afford to do it every few seconds.
-const U1_CEILING_PROBE_INTERVAL: Duration = Duration::from_secs(90);
+const U1_CEILING_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 
 pub struct AVSessionState {
     pub participant_session_ids: HashMap<u64, String>,
@@ -1454,14 +1478,18 @@ impl RecvStatTracker {
                 Ordering::Relaxed, 
                 |i| {
                 let old = f64::from_bits(i);
-                let long_lag = 0.9999 * old + 0.0001 * lag;
+                let mut long_lag = 0.9999 * old + 0.0001 * lag;
                 if i == 0 {
-                    lag
+                    long_lag = lag;
                 } else if short_lag < long_lag {
-                    short_lag
-                } else {
-                    long_lag
-                }.to_bits()
+                    long_lag = short_lag;
+                } else if short_lag - long_lag > 0.25 {
+                    // Pull long_lag up when clock drift or app sleep/backgrounding causes it to fall behind
+                    // short_lag by more than 250ms (~2048 in Q13). A real network queue does not buffer for
+                    // >250ms without packet drops.
+                    long_lag = short_lag - 0.25;
+                }
+                long_lag.to_bits()
             });
         }
 
@@ -3271,15 +3299,23 @@ impl VideoSender {
         // spacing while actual delivery varied 10-30fps). Receivers pace
         // playback by RTP timestamp, so a mismatch renders as slow motion
         // drifting behind live. Derive timestamps from the wall clock so the
-        // timestamp pace always equals reality. u32 wraparound is normal RTP.
+        // timestamp pace always equals reality. FaceTime uses a 24kHz video
+        // clock (matching AVSessionCodec), not the generic 90kHz RTP clock.
+        // u32 wraparound is normal RTP.
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| (d.as_millis() as u32).wrapping_mul(90))
+            .map(|d| (d.as_millis() as u32).wrapping_mul(24))
             .unwrap_or(0);
+        let mut is_key_frame = false;
         let mut nal = match frame {
             ChannelFrame::Configuration(desc) => {
                 if let DecoderConfiguration::Raw(raw, _) = &desc {
                     self.config_raw = Some(raw.clone());
+                    if self.cached_image_desc.is_none() {
+                        if let Some(img) = ImageDescription::from_annex_b_hevc_safe(raw) {
+                            self.cached_image_desc = Some(img);
+                        }
+                    }
                 }
                 if let DecoderConfiguration::ImageDescription(ref img) = desc {
                     self.cached_image_desc = Some(img.clone());
@@ -3288,13 +3324,15 @@ impl VideoSender {
                 return Ok(())
             }
             ChannelFrame::Sample(mut nal) => {
-                // Samples carry Annex-B start codes; parse the first NAL
-                // properly to detect IRAP (key) frames.
-                if let Some(first_nal) = AnnexB::new(&nal).next() {
-                    if first_nal.len() >= 2 {
-                        let nal_type = (first_nal[0] >> 1) & 0x3f;
+                // Samples carry Annex-B start codes; parse NALs
+                // to detect IRAP (key) frames.
+                for nal_unit in AnnexB::new(&nal) {
+                    if nal_unit.len() >= 2 {
+                        let nal_type = (nal_unit[0] >> 1) & 0x3f;
                         if (16..=21).contains(&nal_type) {
+                            is_key_frame = true;
                             self.last_key_frame = Some(nal.clone());
+                            break;
                         }
                     }
                 }
@@ -3316,7 +3354,26 @@ impl VideoSender {
                 nal
             }
         };
-        let desc = self.pending_desc.take();
+        let mut desc = self.pending_desc.take();
+        if is_key_frame {
+            // Ensure VPS/SPS/PPS parameter sets are prepended if not already present
+            if let Some(raw) = &self.config_raw {
+                let has_params = AnnexB::new(&nal).any(|n| {
+                    if n.is_empty() { return false; }
+                    let t = (n[0] >> 1) & 0x3f;
+                    t == 32 || t == 33 || t == 34
+                });
+                if !has_params {
+                    nal.splice(0..0, raw.clone());
+                }
+            }
+            // Ensure ImageDescription is attached for Apple VideoToolbox sync
+            if desc.is_none() {
+                if let Some(img_desc) = &self.cached_image_desc {
+                    desc = Some(DecoderConfiguration::ImageDescription(img_desc.clone()));
+                }
+            }
+        }
         self.last_timestamp = timestamp;
 
         if let Some(DecoderConfiguration::Raw(raw, _)) = &desc {
@@ -3563,7 +3620,7 @@ impl VideoSender {
         }
         self.last_key_replay = Some(Instant::now());
         info!("Resending cached keyframe in response to FIR ({}B)", nal.len());
-        let ts = self.last_timestamp.wrapping_add(3000);
+        let ts = self.last_timestamp.wrapping_add(800);
         // Re-include the ImageDescription so the receiver can
         // (re-)configure its decoder. Apple clients need it on every IDR.
         if let Some(img_desc) = &self.cached_image_desc {
@@ -3627,6 +3684,13 @@ impl AudioSender {
             let mut q13_timestamp_int = q13_timestamp as u16;
             if q13_timestamp.is_nan() {
                 q13_timestamp_int = u16::MAX;
+            }
+            if worst.0 == 0 && stats.video_burst_loss.load(Ordering::Relaxed) == 0 {
+                // When there is zero packet loss on the wire, high Q13 delay is
+                // clock drift or scheduling jitter, NOT network bufferbloat.
+                // Clamping to <= 1200 (~146ms) prevents the Mac from falsely
+                // displaying "Connection is unstable" and throttling its video.
+                q13_timestamp_int = q13_timestamp_int.min(1200);
             }
 
             let current_send = ((timestamp as u64 + 52676) * 16 / 375) as u16;
@@ -4753,7 +4817,7 @@ impl AVSession {
                     // mid-collapse. Only a run of them is evidence the path is actually healthy.
                     let report_is_clean = loss <= U1_LOSS_IGNORE
                         && video_samples != 0
-                        && !(high_q13 && q13_rising);
+                        && !(high_q13 && q13_rising && video_packets_lost > 0);
                     state.u1_clean_streak = if report_is_clean { state.u1_clean_streak + 1 } else { 0 };
 
                     // A rate that recently failed is not retried until the memory expires. A clean
@@ -4770,8 +4834,8 @@ impl AVSession {
                         .is_some_and(|rung| state.current_video_bitrate + 1 >= rung);
 
                     let wants_upgrade = q13_sample_count >= 2
-                        && !high_q13
-                        && !q13_rising
+                        && (!high_q13 || video_packets_lost == 0)
+                        && (!q13_rising || video_packets_lost == 0)
                         && no_recent_packet_loss
                         && !blocked_by_ceiling
                         && state.u1_clean_streak >= U1_CLEAN_STREAK;

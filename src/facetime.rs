@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use uuid::Uuid;
 use aes_gcm::KeyInit;
-use crate::{avconference::{AVConfig, AVSession, ChannelFrame, ChannelMessage, FTMediaFrameEnvelope, IncomingFrameHandler, QuickRelayMkmMaterial, QuickRelayPreKey, QuickRelaySkmMaterial, VCControlData, VCGenerateKeyFrame, publish_media_frame}, ids::link::{GlobalLinkChange, GlobalLinkOutgoingPacket, QuickRelayAllocationsResponse, qrp::{self, IdsqrProtoMaterial}}, util::{bin_deserialize, bin_serialize, decode_hex}};
+use crate::{avconference::{AVConfig, AVSession, ChannelFrame, ChannelMessage, ChannelType, FTMediaFrameEnvelope, IncomingFrameHandler, QuickRelayMkmMaterial, QuickRelayPreKey, QuickRelaySkmMaterial, VCControlData, VCGenerateKeyFrame, publish_media_frame}, ids::link::{GlobalLinkChange, GlobalLinkOutgoingPacket, QuickRelayAllocationsResponse, qrp::{self, IdsqrProtoMaterial}}, util::{bin_deserialize, bin_serialize, decode_hex}};
 use crate::{APSConnection, APSMessage, IdentityManager, MessageTarget, OSConfig, PushError, aps::{APSInterestToken, get_message}, ids::{IDSRecvMessage, identity_manager::{IDSQuickRelaySettings, IDSSendMessage, IdentityResource, Raw}, link::{GlobalLink, GlobalPacket, LinkType}, user::{IDSService, QueryOptions}}, util::{CompactECKey, DebugMutex, DebugRwLock, base64_decode, base64_encode, deflate, duration_since_epoch, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, inflate, plist_to_bin, proto_deserialize_opt, proto_serialize_opt}};
 
 // static HAS_JOINED: AtomicBool = AtomicBool::new(false);
@@ -669,7 +669,7 @@ impl FTClient {
         let conn_for_fir: Arc<AVSession> = session.connection.as_ref().unwrap().clone();
         let rt_handle = tokio::runtime::Handle::current();
         let fir_last_sent_ms = AtomicU64::new(0);
-        let fir_sent_count = AtomicU64::new(0);
+        let fir_got_keyframe = AtomicBool::new(false);
         media_handler.configure_handler(Box::new(move |msg: ChannelMessage| {
             let frame = match &msg.frame {
                 ChannelFrame::Sample(data) => data.clone(),
@@ -692,64 +692,80 @@ impl FTClient {
                 frame,
             });
 
-            // Re-request a keyframe periodically while we are receiving
-            // samples: a single FIR is easily missed, and without an IDR the
-            // peer's video can never be decoded. Capped + spaced out so we do
-            // not look abusive to Apple's relays.
-            if matches!(msg.frame, ChannelFrame::Sample(_)) {
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                let last = fir_last_sent_ms.load(Ordering::Relaxed);
-                let count = fir_sent_count.fetch_add(1, Ordering::Relaxed);
-                // No cap: Apple keeps asking us every 5s indefinitely, so we
-                // mirror that cadence until an IDR finally arrives and the
-                // decoder starts producing output.
-                if now_ms - last > 2000
-                    && fir_last_sent_ms
-                        .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
-                        .is_ok()
-                {
-                let conn = conn_for_fir.clone();
-                let target = msg.participant;
-                let fallback_stream_id = msg.stream_id;
-                rt_handle.spawn(async move {
-                    // Prefer the exact stream_id/stream_group_id the peer used
-                    // when THEY asked us for keyframes: those describe their
-                    // receive layout, which is what our request must target.
-                    // Fall back to locally computed IDs only if unseen yet.
-                    let cached = crate::avconference::PEER_FIR_PARAMS.lock().ok()
-                        .and_then(|m| m.get(&target).copied());
-                    let (stream_id, stream_group_id) = if let Some(params) = cached {
-                        params
-                    } else {
-                        let state = conn.state.lock().await;
-                        if let Some(enc) = state.encryption_states.get(&target) {
-                            if let Some(video_group) = enc.stream_groups.get(&1) {
-                                let sg_id = video_group.config.settings_u1.as_ref()
-                                    .map(|u| u.rtp_ssrc()).unwrap_or(0);
-                                let s_id = crate::avconference::get_stream_id(video_group.current());
-                                (s_id, sg_id)
-                            } else {
-                                (fallback_stream_id, 0)
+            // Request keyframes every 2s until a video random-access sample arrives.
+            // Configuration alone does not establish decoder synchronization.
+            // IMPORTANT: Only check video packets! Audio samples must NOT consume the FIR budget.
+            let is_video = matches!(msg.r#type, ChannelType::H265 | ChannelType::H264);
+            if is_video {
+                let is_keyframe = match &msg.frame {
+                    ChannelFrame::Configuration(_) => false,
+                    ChannelFrame::Sample(data) => {
+                        crate::avconference::AnnexB::new(data).any(|nal| {
+                            match msg.r#type {
+                                ChannelType::H264 => matches!(nal.first().map(|b| b & 0x1f), Some(5)),
+                                ChannelType::H265 => matches!(nal.first().map(|b| (b >> 1) & 0x3f), Some(16..=21)),
+                                _ => false,
                             }
-                        } else {
-                            (fallback_stream_id, 0)
-                        }
-                    };
-                    info!("Sending FIR to {target}: stream_id={stream_id} stream_group_id={stream_group_id} (cached={})", cached.is_some());
-                    match conn.send_control_message(target, VCControlData::GenerateKeyFrame(VCGenerateKeyFrame {
-                        stream_id,
-                        stream_group_id,
-                        fir_type: 2,
-                    })).await {
-                        Ok(_) => info!("Requested keyframe (FIR) from participant {target} stream_id={stream_id}"),
-                        Err(e) => warn!("Keyframe request to participant {target} failed: {e}"),
+                        })
                     }
-                });
+                };
+
+                if is_keyframe {
+                    fir_got_keyframe.store(true, Ordering::Relaxed);
+                }
+
+                let got_key = fir_got_keyframe.load(Ordering::Relaxed);
+                if !got_key {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let last = fir_last_sent_ms.load(Ordering::Relaxed);
+                    if now_ms.saturating_sub(last) > 2000
+                        && fir_last_sent_ms
+                            .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+                            .is_ok()
+                    {
+                        let conn = conn_for_fir.clone();
+                        let target = msg.participant;
+                        let fallback_stream_id = msg.stream_id;
+                        rt_handle.spawn(async move {
+                            // Prefer the exact stream_id/stream_group_id the peer used
+                            // when THEY asked us for keyframes: those describe their
+                            // receive layout, which is what our request must target.
+                            // Fall back to locally computed IDs only if unseen yet.
+                            let cached = crate::avconference::PEER_FIR_PARAMS.lock().ok()
+                                .and_then(|m| m.get(&target).copied());
+                            let (stream_id, stream_group_id) = if let Some(params) = cached {
+                                params
+                            } else {
+                                let state = conn.state.lock().await;
+                                if let Some(enc) = state.encryption_states.get(&target) {
+                                    if let Some(video_group) = enc.stream_groups.get(&1) {
+                                        let sg_id = video_group.config.settings_u1.as_ref()
+                                            .map(|u| u.rtp_ssrc()).unwrap_or(0);
+                                        let s_id = crate::avconference::get_stream_id(video_group.current());
+                                        (s_id, sg_id)
+                                    } else {
+                                        (fallback_stream_id, 0)
+                                    }
+                                } else {
+                                    (fallback_stream_id, 0)
+                                }
+                            };
+                            info!("Sending FIR to {target}: stream_id={stream_id} stream_group_id={stream_group_id} (cached={}, got_key={got_key})", cached.is_some());
+                            match conn.send_control_message(target, VCControlData::GenerateKeyFrame(VCGenerateKeyFrame {
+                                stream_id,
+                                stream_group_id,
+                                fir_type: 2,
+                            })).await {
+                                Ok(_) => info!("Requested keyframe (FIR) from participant {target} stream_id={stream_id}"),
+                                Err(e) => warn!("Keyframe request to participant {target} failed: {e}"),
+                            }
+                        });
+                    }
+                }
             }
-        }
         }));
 
         if relay_session.state.lock().await.active_participants.is_empty() {
