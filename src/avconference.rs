@@ -3274,6 +3274,9 @@ pub struct VideoSender {
     /// Rust, and a peer that missed the initial IDR stays black forever.
     last_key_frame: Option<Vec<u8>>,
     last_timestamp: u32,
+    /// Latest caller-supplied 90kHz capture tick (pre-rescale), kept so FIR
+    /// keyframe replays can continue the capture timeline with correct pacing.
+    last_ts90: u32,
     last_key_replay: Option<Instant>,
     /// RTCP Sender Report accounting: without periodic SRs the peer cannot
     /// map our RTP timestamps to its playout clock and discards every frame
@@ -3293,19 +3296,22 @@ pub struct VideoSender {
 }
 
 impl VideoSender {
-    pub fn send_video_frame(&mut self, frame: ChannelFrame, _timestamp: u32) -> Result<(), PushError> {
-        // The native HAL/codec stamps frames at synthetic uniform intervals
-        // that do NOT track real capture pace (observed: constant 3000-tick
-        // spacing while actual delivery varied 10-30fps). Receivers pace
-        // playback by RTP timestamp, so a mismatch renders as slow motion
-        // drifting behind live. Derive timestamps from the wall clock so the
-        // timestamp pace always equals reality. FaceTime uses a 24kHz video
-        // clock (matching AVSessionCodec), not the generic 90kHz RTP clock.
-        // u32 wraparound is normal RTP.
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| (d.as_millis() as u32).wrapping_mul(24))
-            .unwrap_or(0);
+    pub fn send_video_frame(&mut self, frame: ChannelFrame, timestamp90: u32) -> Result<(), PushError> {
+        // OUTGOING VIDEO RTP TIMESTAMPING
+        //
+        // FaceTime paces decode of video frames off the RTP timestamp AND
+        // anchors the playout clock (VCVideoPlayer
+        // externalSourcePlayoutTimeInSeconds) to the session's AUDIO clock.
+        // The caller (native camera pipeline) supplies MediaCodec
+        // presentationTimeUs on the Android uptime clock, prescaled to 90kHz
+        // ticks (`pts_us * 90 / 1000`). Rescale to the 24kHz FaceTime video
+        // clock so video shares one clock domain with audio; do NOT stamp
+        // wall-clock epoch here (`(epoch_ms as u32) * 24`): that epoch-32-bit
+        // residual sat ~31.8h ahead of the audio-anchored playout clock, so
+        // the peer scheduled every decode alarm hours into the future
+        // (numAlarmsProcessedForDecode=0, remote video frozen).
+        // (u32 wraparound is normal RTP.)
+        let timestamp = (u64::from(timestamp90) * 24 / 90) as u32;
         let mut is_key_frame = false;
         let mut nal = match frame {
             ChannelFrame::Configuration(desc) => {
@@ -3374,6 +3380,11 @@ impl VideoSender {
                 }
             }
         }
+        // Keep the video RTP stream monotonic: camera frames and FIR replays
+        // interleave on one sender, and a backwards timestamp step would
+        // re-anchor the receiver's jitter buffer on every incident.
+        self.last_ts90 = timestamp90.max(self.last_ts90);
+        let timestamp = self.last_timestamp.max(timestamp);
         self.last_timestamp = timestamp;
 
         if let Some(DecoderConfiguration::Raw(raw, _)) = &desc {
@@ -3458,7 +3469,12 @@ impl VideoSender {
                 let last_group = chunk_idx + 1 == nchunks;
                 for (idx, mut packet) in group.into_iter().enumerate() {
                     let header = FECHeader {
-                        version: 1,
+                        // FEC header version 0: Apple's 1:1 receiver rejects
+                        // version-1 headers ("FECHeader_UnpackHeaderFromBuffer:
+                        // FEC Header version mismatch expected 0, but got 1")
+                        // and drops the packet. The version-1 test vectors
+                        // below were captured on group-call traffic.
+                        version: 0,
                         symbols_per_packet,
                         position: start + idx as u8 * symbols_per_packet,
                         is_data: true,
@@ -3480,7 +3496,7 @@ impl VideoSender {
                 
                 for (position, size_red, data) in fec.get_parity().take(parity_packets as usize) {
                     let header = FECHeader {
-                        version: 1,
+                        version: 0,
                         symbols_per_packet,
                         position,
                         is_data: false,
@@ -3620,7 +3636,10 @@ impl VideoSender {
         }
         self.last_key_replay = Some(Instant::now());
         info!("Resending cached keyframe in response to FIR ({}B)", nal.len());
-        let ts = self.last_timestamp.wrapping_add(800);
+        // Continue the caller's capture timeline (~30fps of pacing after the
+        // last frame) on the 90kHz capture clock; send_video_frame rescales to
+        // the 24kHz RTP clock and enforces monotonicity against live frames.
+        let ts = self.last_ts90.wrapping_add(90 * 33);
         // Re-include the ImageDescription so the receiver can
         // (re-)configure its decoder. Apple clients need it on every IDR.
         if let Some(img_desc) = &self.cached_image_desc {
@@ -4270,6 +4289,7 @@ impl AVSession {
             config_raw: None,
             last_key_frame: None,
             last_timestamp: 0,
+            last_ts90: 0,
             last_key_replay: None,
         })
     }
