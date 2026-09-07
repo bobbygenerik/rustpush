@@ -3349,15 +3349,52 @@ impl VideoSender {
                     }
                 }
                 if self.to_participant.is_some() {
-                    self.enabled_features.add_footer(&mut nal, HashMap::from_iter([
+                    // 1:1 calls: emit the SAME footer format as the group path
+                    // (RVRA1 + CH1 + CR + FA, cf. GROUP_H265_FEATURES). The Mac
+                    // enables RVRA1 ("FLS2;RVRA1;CH1;CR;CF;FA;" - macos
+                    // features) and our PT123 feature string advertises
+                    // RVRA1:1, but this path never sent it, so the Mac had no
+                    // per-frame render-area hint and fell back to landscape
+                    // geometry for portrait streams.
+                    GROUP_H265_FEATURES.add_footer(&mut nal, HashMap::from_iter([
+                        // Advertise the orientation-aware render area so portrait streams
+                        // (coded as 1280x720 with orientation=0) are rendered in a 720x1280 area.
+                        ("RVRA1", {
+                            let (w, h) = self.cached_image_desc.as_ref()
+                                .map(|d| (d.desc.width as u32, d.desc.height as u32))
+                                .unwrap_or((1280, 720));
+                            let (render_w, render_h) = match self.camera_source.orientation {
+                                DeviceOrientation::Portrait | DeviceOrientation::PortraitUpsideDown => {
+                                    (w.min(h), w.max(h))
+                                }
+                                DeviceOrientation::LandscapeLeft | DeviceOrientation::LandscapeRight => {
+                                    (w.max(h), w.min(h))
+                                }
+                            };
+                            build_rvra1(render_w, render_h).to_vec()
+                        }),
                         ("CH1", vec![0x00, 0x00]),
-                        ("CR", vec![0x65, 0x43, 0x00, 0x00]),
+                        ("CR", vec![0x00, 0x00, 0x00, 0x00]),
                         ("FA", vec![0x3e, 0x3e, 0xc0, 0xc0]),
                     ]));
                 } else {
                     GROUP_H265_FEATURES.add_footer(&mut nal, HashMap::from_iter([
-                        // FIX GROUP RESOLUTION
-                        ("RVRA1", build_rvra1(1280, 720).to_vec()),
+                        // FIX GROUP RESOLUTION: advertise the orientation-aware render area
+                        // so portrait streams are not mapped into a landscape render area.
+                        ("RVRA1", {
+                            let (w, h) = self.cached_image_desc.as_ref()
+                                .map(|d| (d.desc.width as u32, d.desc.height as u32))
+                                .unwrap_or((1280, 720));
+                            let (render_w, render_h) = match self.camera_source.orientation {
+                                DeviceOrientation::Portrait | DeviceOrientation::PortraitUpsideDown => {
+                                    (w.min(h), w.max(h))
+                                }
+                                DeviceOrientation::LandscapeLeft | DeviceOrientation::LandscapeRight => {
+                                    (w.max(h), w.min(h))
+                                }
+                            };
+                            build_rvra1(render_w, render_h).to_vec()
+                        }),
                         ("CH1", vec![0x00, 0x00]),
                         ("CR", vec![0x00, 0x00, 0x00, 0x00]),
                         ("FA", vec![0x3e, 0x3e, 0xc0, 0xc0]),
@@ -5227,7 +5264,13 @@ fn h264_sps_dimens(nal: &[u8]) -> Option<(i32, i32)> {
 }
 
 fn skip_h265_profile_tier_level(reader: &mut SpsBitReader<'_>, sub_layers: usize) -> Option<()> {
-    reader.skip_bits(96)?;
+    // General profile_tier_level is exactly 88 bits: profile_space(2) +
+    // tier(1) + profile_idc(5) + compatibility(32) + progressive/interlaced/
+    // non_packed/frame_only(4) + reserved(43) + inbld(1). Skipping 96 here
+    // desyncs every SPS parse by 8 bits, which made h265_sps_dimens fail and
+    // silently advertise a 1280x720 fallback to Apple clients even when the
+    // encoder emits portrait dimensions.
+    reader.skip_bits(88)?;
     let mut profile_present = [false; 8];
     let mut level_present = [false; 8];
     for i in 0..sub_layers {
@@ -5425,6 +5468,7 @@ pub struct FTMediaFrameEnvelope {
     pub timestamp: u32,
     pub width: Option<i32>,
     pub height: Option<i32>,
+    pub camera_orientation: Option<u8>,
     #[serde(serialize_with = "serialize_frame_b64")]
     pub frame: Vec<u8>,
 }
@@ -5569,7 +5613,7 @@ impl AVConfig {
                     ..Default::default()
                 },
             ]),
-            enabled_features: EnabledAVFeatures::from_str("FLS2;CH1;CR;CF;FA;"),
+            enabled_features: EnabledAVFeatures::from_str("FLS2;RVRA1;CH1;CR;CF;FA;"),
             supported_features: EnabledAVFeatures::from_str("FLS2;VRAE;CH1;CR;CF;FA;POS;HTS;EOD;RR;QP;SW;"),
             h264_features: EnabledAVFeatures::from_str("FLS2;CH1;CR;FA;"),
             h264_supported: EnabledAVFeatures::from_str("FLS2;CH1;CR;FA;POS;HTS;EOD;RR;QP;SW;"),
@@ -5886,7 +5930,7 @@ impl AVConfig {
                                 preferred_format_ext1: Some(8),
                             },
                         ],
-                        feature_string: Some("FLS;RVRA1:1;AS:2;MS:-1;LTR;CABAC;CR:3;LF:-1;PR;CH1:4;FA:5;AR:16/9,2/3;XR:16/9,2/3;".to_string()),
+                        feature_string: Some("FLS;RVRA1:1;AS:2;MS:-1;LTR;CABAC;CR:3;LF:-1;PR;CH1:4;FA:5;AR:16/9,9/16;XR:3/2,2/3;XRF:16/9,9/16;".to_string()),
                         parameter_set: Some(1),
                     },
                     VcMediaNegotiationBlobVideoPayloadSettings {
@@ -5923,7 +5967,7 @@ impl AVConfig {
                                 ..Default::default()
                             },
                         ],
-                        feature_string: Some("FLS;RVRA1:0;PR;LF:-1;CR:1;CF:2;CH1:3;FA:4;AR:16/9,2/3;XR:16/9,2/3;".to_string()),
+                        feature_string: Some("FLS;RVRA1:0;PR;LF:-1;CR:1;CF:2;CH1:3;FA:4;AR:16/9,9/16;XR:3/2,2/3;XRF:16/9,9/16;".to_string()),
                         parameter_set: Some(14),
                     },
                 ],
@@ -6405,3 +6449,4 @@ impl ControlKeySet {
         data
     }
 }
+

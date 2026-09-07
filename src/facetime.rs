@@ -689,6 +689,7 @@ impl FTClient {
                 timestamp: msg.timestamp,
                 width,
                 height,
+                camera_orientation: msg.camera_meta.map(|m| m.orientation as u8),
                 frame,
             });
 
