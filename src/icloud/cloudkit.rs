@@ -1324,7 +1324,7 @@ impl<'t> CloudKitContainer<'t> {
             .send().await?;
 
         if response.status().as_u16() == 401 {
-            client.token_provider.refresh_mme().await?;
+            client.token_provider.refresh_mme(&mut *client.token_provider.state.lock().await).await?;
         }
 
         let response: CkInitResponse = response.json().await?;
@@ -2037,7 +2037,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
             .send().await?;
 
         if response.status().as_u16() == 401 {
-            self.client.token_provider.refresh_mme().await?;
+            self.client.token_provider.refresh_mme(&mut *self.client.token_provider.state.lock().await).await?;
         }
         if response.status().as_u16() == 429 {
             return Err(PushError::TooManyRequests);
@@ -2081,7 +2081,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
     pub async fn get_assets<V: Write + Send + Sync>(&self, responses: &[AssetGetResponse], assets: Vec<(&cloudkit_proto::Asset, V)>) -> Result<(), PushError> {
         let mut requests: HashMap<&String, Vec<(&cloudkit_proto::Asset, V)>> = HashMap::new();
         for asset in assets {
-            requests.entry(asset.0.bundled_request_id.as_ref().expect("No bundled asset!")).or_default().push(asset);
+            requests.entry(asset.0.bundled_request_id.as_ref().ok_or(PushError::NoAsset)?).or_default().push(asset);
         }
         
         let mmcs_config = MMCSConfig {
@@ -2096,7 +2096,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
         };
 
         for (request, asset) in requests {
-            let response = responses.iter().find(|r| r.asset_id.as_ref() == Some(request)).expect("No bundled asset!");
+            let response = responses.iter().find(|r| r.asset_id.as_ref() == Some(request)).ok_or(PushError::NoAsset)?;
             let authorized = AuthorizedOperation {
                 body: response.body.clone().expect("No body!!"),
                 ..Default::default()

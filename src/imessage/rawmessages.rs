@@ -447,6 +447,60 @@ struct RawIMessage {
 }
 
 
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(untagged)]
+pub enum BalloonRawData {
+    Wire(NSData),       // Gzipped/NSData
+    Backup(Data),       // CloudKit
+}
+
+impl BalloonRawData {
+    fn compress(mut self) -> Result<Self, PushError> {
+        match &mut self {
+            Self::Wire(data) => {
+                data.data = gzip(data.data.as_ref())?.into();
+            },
+            Self::Backup(data) => { },
+        }
+        Ok(self)
+    }
+
+    fn decompress(mut self) -> Result<Self, PushError> {
+        match &mut self {
+            Self::Wire(data) => {
+                data.data = ungzip(data.data.as_ref())?.into();
+            },
+            Self::Backup(data) => { },
+        }
+        Ok(self)
+    }
+
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Wire(data) => data.data.as_ref(),
+            Self::Backup(data) => data.as_ref(),
+        }
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        match self {
+            Self::Wire(data) => data.data.into(),
+            Self::Backup(data) => data.into(),
+        }
+    }
+
+    fn new(data: Vec<u8>, is_backup: bool) -> Self {
+        if is_backup {
+            Self::Backup(data.into())
+        } else {
+            Self::Wire(NSData {
+                data: data.into(),
+                class: NSDataClass::NSMutableData
+            })
+        }
+    }
+}
+
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 struct RawBalloonData {
@@ -456,9 +510,9 @@ struct RawBalloonData {
     #[serde(rename = "an")]
     app_name: String,
     #[serde(rename = "ai")]
-    app_icon: Option<NSData>,
+    app_icon: Option<BalloonRawData>,
     session_identifier: Option<NSUUID>,
-    live_layout_info: Option<NSData>,
+    live_layout_info: Option<BalloonRawData>,
     #[serde(rename = "URL")]
     url: NSURL,
     appid: Option<u64>,

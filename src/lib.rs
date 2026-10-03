@@ -22,7 +22,7 @@ pub use icloud::keychain;
 pub use icloud::mmcs;
 pub use icloud::pcs;
 
-pub use util::CompactECKey;
+pub use util::{CompactECKey, rfc6637_wrap_key, rfc6637_unwrap_key};
 
 #[cfg(feature = "macos-validation-data")]
 pub mod macos;
@@ -36,13 +36,13 @@ pub mod mmcsp {
 use std::collections::HashMap;
 use std::fmt::Debug;
 
-pub use icloud_auth::{DefaultAnisetteProvider, GenerateVerificationTokenRequest, default_provider, ArcAnisetteClient, LoginClientInfo, LoginState, AppleAccount, VerifyBody, TrustedPhoneNumber};
+pub use icloud_auth::{PersistAccountData, FetchedToken, DefaultAnisetteProvider, GenerateVerificationTokenRequest, default_provider, ArcAnisetteClient, LoginClientInfo, LoginState, AppleAccount, VerifyBody, TrustedPhoneNumber};
 
 pub use util::{DebugRwLock, DebugMutex};
 use activation::ActivationInfo;
 pub use aps::{APSConnectionResource, APSConnection, APSMessage, APSState};
 use async_trait::async_trait;
-pub use auth::{request_update_account, UpdateAccountFinish};
+pub use auth::{ request_update_account, UpdateAccountFinish};
 pub use mmcs::{FileContainer, prepare_put};
 pub use omnisette::AnisetteProvider;
 pub use imessage::messages::{TypingApp, SetTranscriptBackgroundMessage, UpdateProfileMessage, UpdateProfileSharingMessage, MessageInst, ShareProfileMessage, SharedPoster, ScheduleMode, PermanentDeleteMessage, OperatedChat, DeleteTarget, MoveToRecycleBinMessage, TextFormat, TextEffect, TextFlags, LinkMeta, LPLinkMetadata, LPSpecializationMetadata, ReactMessageType, ErrorMessage, Reaction, UnsendMessage, EditMessage, UpdateExtensionMessage, PartExtension, ReactMessage, ChangeParticipantMessage, LPImageMetadata, RichLinkImageAttachmentSubstitute, LPIconMetadata, AttachmentType, ExtensionApp, BalloonLayout, Balloon, ConversationData, Message, MessageType, Attachment, NormalMessage, RenameMessage, IconChangeMessage, MessageParts, MessagePart, MMCSFile, IndexedMessagePart};
@@ -52,13 +52,13 @@ pub use util::{NSArrayClass, EntitlementsResponse, EntitlementAuthState, Resourc
 pub use ids::user::{IDSUser, register, IDSUserIdentity, IDSNGMIdentity, PrivateDeviceInfo, SupportAlert, SupportAction, ReportMessage};
 pub use ids::identity_manager::{SendJob, MessageTarget, IdentityManager, KeyCache};
 pub use ids::CertifiedContext;
-pub use auth::{authenticate_apple, login_apple_delegates, authenticate_phone, authenticate_smsless, AuthPhone, LoginDelegate, CircleClientSession, TokenProvider};
+pub use auth::{ authenticate_apple, login_apple_delegates, authenticate_phone, authenticate_smsless, AuthPhone, LoginDelegate, CircleClientSession, TokenProvider, TokenProviderState};
 pub use error::PushError;
 pub use cloudkit_proto;
 pub use cloudkit_derive;
 pub use imessage::name_photo_sharing;
 
-pub use auth::{IdmsAuthListener, IdmsMessage, IdmsRequestedSignIn, ApsData, ApsAlert, AkData, TeardownSignIn, CircleServerSession, IdmsCircleMessage};
+pub use auth::{ IdmsAuthListener, IdmsMessage, IdmsRequestedSignIn, ApsData, ApsAlert, AkData, TeardownSignIn, CircleServerSession, IdmsCircleMessage};
 
 use plist::Dictionary;
 pub use relay::RelayConfig;
