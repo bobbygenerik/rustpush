@@ -13,7 +13,7 @@ use omnisette::{default_provider, AnisetteHeaders, DefaultAnisetteProvider};
 use open_absinthe::nac::HardwareConfig;
 use openssl::sha::sha256;
 use plist::{Data, Dictionary, Value};
-use rustpush::{APSConnectionResource, APSState, Attachment, CircleClientSession, CircleServerSession, CompactECKey, ConversationData, DebugMutex, DebugRwLock, EntitlementAuthState, FileContainer, IDSNGMIdentity, IDSUser, IDSUserIdentity, IMClient, IdmsAuthListener, IdmsMessage, IndexedMessagePart, KeyedArchive, LoginDelegate, MADRID_SERVICE, MMCSFile, Message, MessageInst, MessageParts, MessageType, NormalMessage, PushError, RelayConfig, ShareProfileMessage, SharedPoster, TokenProvider, UpdateProfileMessage, authenticate_apple, authenticate_smsless, cloud_messages::{CloudMessagesClient, MESSAGES_SERVICE}, cloudkit::{CloudKitClient, CloudKitContainer, CloudKitSession, CloudKitState, DeleteRecordOperation, FetchZoneOperation, ZoneDeleteOperation, ZoneSaveOperation, record_identifier}, facetime::{FACETIME_SERVICE, FTClient, FTMember, FTMessage, FTState, VIDEO_SERVICE}, findmy::{BeaconNamingRecord, FindMyClient, FindMyState, FindMyStateManager, MULTIPLEX_SERVICE}, get_gateways_for_mccmnc, keychain::{CloudKey, KEYCHAIN_ZONES, KeychainClient, KeychainClientState}, login_apple_delegates, macos::MacOSConfig, name_photo_sharing::{IMessageNameRecord, IMessageNicknameRecord, IMessagePosterRecord, ProfilesClient}, passwords::{PasswordManager, PasswordState, SHARED_PASSWORDS_SERVICE}, pcs::{PCSKey, PCSPrivateKey}, posterkit::{PhotoPosterContentsFrame, PosterType, SimplifiedIncomingCallPoster, SimplifiedPoster, SimplifiedTranscriptPoster, TranscriptDynamicUserData}, prepare_put, register, sharedstreams::{AssetDetails, AssetFile, AssetMetadata, CollectionMetadata, FFMpegFilePackager, FileMetadata, FilePackager, PreparedAsset, PreparedFile, SharedStreamClient, SharedStreamsState, SyncController, SyncState, round_seconds}, statuskit::{StatusKitClient, StatusKitState, StatusKitStatus}};
+use rustpush::{APSConnectionResource, APSState, Attachment, CircleClientSession, CircleServerSession, CompactECKey, ConversationData, DebugMutex, DebugRwLock, EntitlementAuthState, FileContainer, IDSNGMIdentity, IDSUser, IDSUserIdentity, IMClient, IdmsAuthListener, IdmsMessage, IndexedMessagePart, KeyedArchive, LoginDelegate, MADRID_SERVICE, MMCSFile, Message, MessageInst, MessageParts, MessageType, NormalMessage, PushError, RelayConfig, ShareProfileMessage, SharedPoster, TokenProvider, TokenProviderState, UpdateProfileMessage, authenticate_apple, authenticate_smsless, cloud_messages::{CloudMessagesClient, MESSAGES_SERVICE}, cloudkit::{CloudKitClient, CloudKitContainer, CloudKitSession, CloudKitState, DeleteRecordOperation, FetchZoneOperation, ZoneDeleteOperation, ZoneSaveOperation, record_identifier}, facetime::{FACETIME_SERVICE, FTClient, FTMember, FTMessage, FTState, VIDEO_SERVICE}, findmy::{BeaconNamingRecord, FindMyClient, FindMyState, FindMyStateManager, MULTIPLEX_SERVICE}, get_gateways_for_mccmnc, keychain::{CloudKey, KEYCHAIN_ZONES, KeychainClient, KeychainClientState}, login_apple_delegates, macos::MacOSConfig, name_photo_sharing::{IMessageNameRecord, IMessageNicknameRecord, IMessagePosterRecord, ProfilesClient}, passwords::{PasswordManager, PasswordState, SHARED_PASSWORDS_SERVICE}, pcs::{PCSKey, PCSPrivateKey}, posterkit::{PhotoPosterContentsFrame, PosterType, SimplifiedIncomingCallPoster, SimplifiedPoster, SimplifiedTranscriptPoster, TranscriptDynamicUserData}, prepare_put, register, sharedstreams::{AssetDetails, AssetFile, AssetMetadata, CollectionMetadata, FFMpegFilePackager, FileMetadata, FilePackager, PreparedAsset, PreparedFile, SharedStreamClient, SharedStreamsState, SyncController, SyncState, round_seconds}, statuskit::{StatusKitClient, StatusKitState, StatusKitStatus}};
 use sha2::Sha256;
 use tokio::{fs, io::{self, AsyncBufReadExt, BufReader}, process::Command, sync::RwLock};
 use tokio::io::AsyncWriteExt;
@@ -353,12 +353,11 @@ async fn main() {
             input.trim().to_string()
         };
         
-        let mut account = AppleAccount::new_with_anisette(config.get_gsa_config(&*connection.state.read().await, false), anisette_client.clone()).unwrap();
+        let mut account = AppleAccount::new_with_anisette(config.get_gsa_config(&*connection.state.read().await, false), anisette_client.clone(), None, Box::new(|_| {})).unwrap();
         let result = account.login_email_pass(&gsa.user, gsa.pass.as_ref()).await.unwrap();
 
 
-        let spd = account.spd.as_ref().unwrap();
-        let dsid = spd["DsPrsId"].as_unsigned_integer().unwrap();
+        let dsid = account.persisted.as_ref().unwrap().dsid;
 
         // account.send_2fa_to_devices().await.unwrap();
         // let result = account.verify_2fa(tfa_closure()).await.unwrap();
@@ -402,28 +401,28 @@ async fn main() {
 
         // account.update_postdata("Testing").await.unwrap();
         let pet = account.get_pet().unwrap();
-        let spd = account.spd.as_ref().unwrap();
+        let persisted = account.persisted.as_ref().unwrap();
 
         let delegates = login_apple_delegates(&account, None, config.as_ref(), &[LoginDelegate::IDS, LoginDelegate::MobileMe]).await.unwrap();
         let user = authenticate_apple(delegates.ids.unwrap(), config.as_ref()).await.unwrap();
 
         let mobileme = delegates.mobileme.unwrap();
-        let findmy = FindMyState::new(spd["DsPrsId"].as_unsigned_integer().unwrap().to_string());
+        let findmy = FindMyState::new(persisted.dsid.to_string());
 
         let id_path = PathBuf::from_str("findmy.plist").unwrap();
         std::fs::write(id_path, findmy.encode().unwrap()).unwrap();
 
-        let sharedstreams = SharedStreamsState::new(spd["DsPrsId"].as_unsigned_integer().unwrap().to_string(), &mobileme);
+        let sharedstreams = SharedStreamsState::new(persisted.dsid.to_string(), &mobileme);
 
         let id_path = PathBuf::from_str("sharedstreams.plist").unwrap();
         std::fs::write(id_path, plist_to_string(&sharedstreams).unwrap()).unwrap();
 
-        let trustedpeers = KeychainClientState::new(spd["DsPrsId"].as_unsigned_integer().unwrap().to_string(), spd["adsid"].as_string().unwrap().to_string(), &mobileme);
+        let trustedpeers = KeychainClientState::new(persisted.dsid.to_string(), persisted.adsid.clone(), &mobileme);
 
         let id_path = PathBuf::from_str("trustedpeers.plist").unwrap();
         std::fs::write(id_path, plist_to_string(&trustedpeers).unwrap()).unwrap();
 
-        let cloudkitstate = CloudKitState::new(spd["DsPrsId"].as_unsigned_integer().unwrap().to_string());
+        let cloudkitstate = CloudKitState::new(persisted.dsid.to_string());
         let id_path = PathBuf::from_str("cloudkit.plist").unwrap();
         std::fs::write(id_path, plist_to_string(&cloudkitstate).unwrap()).unwrap();
 
@@ -505,7 +504,7 @@ async fn main() {
     let id_path = PathBuf::from_str("cloudkit.plist").unwrap();
     let state: CloudKitState = plist::from_file(&id_path).unwrap();
 
-    let token_provider = TokenProvider::new(account.clone(), config.clone());
+    let token_provider = TokenProvider::new(account.clone(), config.clone(), TokenProviderState::default(), Box::new(|_| {}));
 
     let cloudkit = Arc::new(CloudKitClient {
         state: DebugRwLock::new(state),
