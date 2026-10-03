@@ -969,14 +969,13 @@ impl IDSUser {
             .header("x-id-self-uri", handle)
             .header("x-push-token", &base64_encode(&aps.get_token().await))
             .header("x-protocol-version", &self.protocol_version.to_string())
-            .header("user-agent", &format!("com.apple.madrid-lookup {}", config.get_version_ua()));
+            .header("user-agent", &format!("com.apple.madrid-lookup {}", config.get_version_ua()))
+            .body(gzip(&body)?);
         if main_topic != topic {
             request = request.header("x-id-sub-service", topic);
         }
-        let request = request
-            .body(gzip(&body)?)
-            .sign(&self.registration[main_topic].id_keypair, KeyType::Id, &*aps.state.read().await, None)?
-            .send_apns(aps, topic).await;
+        let request = request.sign(&self.registration[main_topic].id_keypair, KeyType::Id, &*aps.state.read().await, None)?;
+        let request = request.send_apns_i_am_not_reading_the_aps_state(aps, topic).await;
 
         if let Err(PushError::WebTunnelError(5206 /* Response too large */)) = &request {
             info!("response too large, chopping in half!");
