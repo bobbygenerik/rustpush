@@ -685,6 +685,8 @@ impl FTClient {
         let fir_last_rearm_ms = AtomicU64::new(0);
         let fir_loss_log_count = AtomicU64::new(0);
         let video_chain = std::sync::Mutex::new(video_reference_chain::VideoReferenceChain::default());
+        #[cfg(not(target_arch = "wasm32"))]
+        let evs_decoders = std::sync::Mutex::new(HashMap::new());
         media_handler.configure_handler(Box::new(move |msg: ChannelMessage| {
             let frame = match &msg.frame {
                 ChannelFrame::Sample(data) => data.clone(),
@@ -710,13 +712,27 @@ impl FTClient {
             let configuration = matches!(msg.frame, ChannelFrame::Configuration(_));
             let deliver = !is_video || video_chain.lock().unwrap().accept(
                 (msg.participant, msg.stream_id), configuration, is_keyframe, msg.prev_dropped);
+            let mut frame = frame;
+            let mut codec = format!("{:?}", msg.r#type).to_lowercase();
+            #[cfg(not(target_arch = "wasm32"))]
+            if matches!(msg.r#type, ChannelType::Evs) && !configuration {
+                let mut decoders = evs_decoders.lock().unwrap();
+                let decoder = decoders.entry((msg.participant, msg.stream_id))
+                    .or_insert_with(crate::evs_decoder::EvsDecoder::new);
+                let Some(pcm) = decoder.as_mut().and_then(|decoder| decoder.decode_payload(&frame)) else {
+                    warn!("Rejected malformed/unsupported incoming EVS frame ({}B)", frame.len());
+                    return;
+                };
+                frame = pcm;
+                codec = "pcm16".into();
+            }
             if deliver {
                 publish_media_frame(FTMediaFrameEnvelope {
                     guid: media_guid.clone(),
                     participant: msg.participant,
                     participant_handle: String::new(),
                     stream_id: msg.stream_id,
-                    codec: format!("{:?}", msg.r#type).to_lowercase(),
+                    codec,
                     is_configuration: matches!(msg.frame, ChannelFrame::Configuration(_)),
                     timestamp: msg.timestamp,
                     width,
@@ -749,15 +765,16 @@ impl FTClient {
                     // lost before this frame) breaks our decode chain. The old
                     // latch never re-requested after the first IDR, leaving the
                     // view blocky until the peer's next natural keyframe; re-arm
-                    // the budget so the 2s FIR loop below asks for a fresh IDR.
-                    // Re-arms are spaced 4s so sustained loss cannot turn into
-                    // an IDR storm; decoder output completes recovery.
+                    // the budget so the FIR path below asks for a fresh IDR.
+                    // Re-arm for each new damaged chain. Requests themselves
+                    // are limited to 500ms, so loss does not wait up to four
+                    // seconds behind a previously recovered chain.
                     let now_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
                         .unwrap_or(0);
                     let last = fir_last_rearm_ms.load(Ordering::Relaxed);
-                    if now_ms.saturating_sub(last) > 4000
+                    if now_ms.saturating_sub(last) > 250
                         && fir_last_rearm_ms
                             .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
                             .is_ok()
@@ -777,7 +794,7 @@ impl FTClient {
                         .map(|d| d.as_millis() as u64)
                         .unwrap_or(0);
                     let last = fir_last_sent_ms.load(Ordering::Relaxed);
-                    if now_ms.saturating_sub(last) > 2000
+                    if now_ms.saturating_sub(last) > 500
                         && fir_last_sent_ms
                             .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
                             .is_ok()

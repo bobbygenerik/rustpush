@@ -10,6 +10,8 @@ pub mod avconference;
 pub mod sharedstreams;
 pub mod findmy;
 pub mod facetime;
+#[cfg(not(target_arch = "wasm32"))]
+mod evs_decoder;
 pub mod icloud;
 pub mod statuskit;
 pub mod passwords;
