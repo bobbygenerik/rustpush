@@ -3358,21 +3358,33 @@ impl VideoSender {
         let mut is_key_frame = false;
         let mut nal = match frame {
             ChannelFrame::Configuration(desc) => {
+                self.last_key_frame = None;
                 if let DecoderConfiguration::Raw(raw, _) = &desc {
+                    // Reparse every configuration: camera switches and quality
+                    // changes start a new reference chain and can change size.
+                    // Never replay an old IDR with new VPS/SPS/PPS metadata.
                     self.config_raw = Some(raw.clone());
-                    if self.cached_image_desc.is_none() {
-                        if let Some(img) = ImageDescription::from_annex_b_hevc_safe(raw) {
-                            self.cached_image_desc = Some(img);
-                        }
-                    }
+                    self.cached_image_desc = ImageDescription::from_annex_b_hevc_safe(raw);
+                    self.last_key_frame = None;
                 }
                 if let DecoderConfiguration::ImageDescription(ref img) = desc {
                     self.cached_image_desc = Some(img.clone());
                 }
-                self.pending_desc = Some(desc);
+                self.pending_desc = Some(self.cached_image_desc.as_ref()
+                    .map(|img| DecoderConfiguration::ImageDescription(img.clone()))
+                    .unwrap_or(desc));
                 return Ok(())
             }
             ChannelFrame::Sample(mut nal) => {
+                // A bounded bridge can fold a pending config into the next
+                // IDR. Refresh metadata from those inline parameter sets too.
+                if let Some((_, config)) = DecoderConfiguration::parse(&nal, ChannelType::H265) {
+                    if let DecoderConfiguration::Raw(ref raw, _) = config {
+                        if self.config_raw.as_deref() != Some(raw.as_slice()) {
+                            self.send_video_frame(ChannelFrame::Configuration(config), timestamp)?;
+                        }
+                    }
+                }
                 // Samples carry Annex-B start codes; parse NALs
                 // to detect IRAP (key) frames.
                 for nal_unit in AnnexB::new(&nal) {
