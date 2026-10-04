@@ -39,6 +39,9 @@ pub mod qrp {
     include!(concat!(env!("OUT_DIR"), "/qrp.rs"));
 }
 
+#[path = "relay_subscriptions.rs"]
+mod relay_subscriptions;
+
 const TOPIC: &'static str = "com.apple.private.alloy.facetime.multi";
 
 struct LinkState {
@@ -2665,18 +2668,17 @@ impl GlobalLink {
         let mut state = self.state.lock().await;
         state.session_request_id += 1;
         info!("Link subscribing to streams {:?}", state.subscribed_streams);
+        let (max_concurrent_streams, subscriptions) = relay_subscriptions::media_subscriptions(
+            self.relay_mode.load(Ordering::Relaxed), &state.subscribed_streams);
+        info!("Media subscription update: wildcard={} max_streams={max_concurrent_streams}",
+            subscriptions.iter().any(|s| s.wildcard_subscription == Some(true)));
         let resp = self.contact_qr("PUT", "SessionInfo", &IdsqrProtoH3Message {
             sessioninfo_request: Some(qrp::IdsqrProtoSessionInfoRequest {
                 request_id: Some(state.session_request_id),
                 generation_counter: Some(state.session_generation),
                 link_id: Some(state.link_id),
-                max_concurrent_streams: Some(0),
-                subscribed_streams: state.subscribed_streams.iter().map(|(id, streams)| IdsqrProtoSubscribedStream {
-                    wildcard_subscription: None,
-                    peer_participant_id: Some(*id),
-                    peer_stream_ids: streams.clone(),
-                    is_seamless_transition: None,
-                }).collect(),
+                max_concurrent_streams: Some(max_concurrent_streams),
+                subscribed_streams: subscriptions,
                 ..Default::default()
             }),
             ..Default::default()

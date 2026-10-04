@@ -19,6 +19,9 @@ use crate::{APSConnection, APSMessage, IdentityManager, MessageTarget, OSConfig,
 
 // static HAS_JOINED: AtomicBool = AtomicBool::new(false);
 
+#[path = "video_reference_chain.rs"]
+mod video_reference_chain;
+
 pub mod facetimep {
     include!(concat!(env!("OUT_DIR"), "/facetimep.rs"));
 }
@@ -216,6 +219,15 @@ pub struct FTSession {
     // VideoSender can be seeded with parameter sets on creation.
     #[serde(skip)]
     pub pending_video_config: Option<(Vec<u8>, u32)>,
+    // Latest local camera orientation (DeviceOrientation discriminant as u8:
+    // 0=Portrait, 1=PortraitUpsideDown, 2=LandscapeLeft, 3=LandscapeRight).
+    // Unlike pending_video_config this is NOT consumed on use: a mid-call
+    // VideoSender recreation must re-seed the latest value, not lose it.
+    // Drives the RVRA1 render-area footer and FTVideoControlData.camera_status
+    // the peer uses to lay the stream out; never updated it stayed Portrait and
+    // the peer rendered 9:16 forever.
+    #[serde(skip)]
+    pub pending_camera_orientation: Option<u8>,
 }
 
 impl Default for FTSession {
@@ -239,6 +251,7 @@ impl Default for FTSession {
             is_initiator: Default::default(),
             pending_keys: Default::default(),
             pending_video_config: Default::default(),
+            pending_camera_orientation: Default::default(),
         }
     }
 }
@@ -669,7 +682,9 @@ impl FTClient {
         let conn_for_fir: Arc<AVSession> = session.connection.as_ref().unwrap().clone();
         let rt_handle = tokio::runtime::Handle::current();
         let fir_last_sent_ms = AtomicU64::new(0);
-        let fir_got_keyframe = AtomicBool::new(false);
+        let fir_last_rearm_ms = AtomicU64::new(0);
+        let fir_loss_log_count = AtomicU64::new(0);
+        let video_chain = std::sync::Mutex::new(video_reference_chain::VideoReferenceChain::default());
         media_handler.configure_handler(Box::new(move |msg: ChannelMessage| {
             let frame = match &msg.frame {
                 ChannelFrame::Sample(data) => data.clone(),
@@ -679,26 +694,8 @@ impl FTClient {
                 let (w, h) = config.get_dimens();
                 if w > 0 && h > 0 { (Some(w), Some(h)) } else { (None, None) }
             } else { (None, None) };
-            publish_media_frame(FTMediaFrameEnvelope {
-                guid: media_guid.clone(),
-                participant: msg.participant,
-                participant_handle: String::new(),
-                stream_id: msg.stream_id,
-                codec: format!("{:?}", msg.r#type).to_lowercase(),
-                is_configuration: matches!(msg.frame, ChannelFrame::Configuration(_)),
-                timestamp: msg.timestamp,
-                width,
-                height,
-                camera_orientation: msg.camera_meta.map(|m| m.orientation as u8),
-                frame,
-            });
-
-            // Request keyframes every 2s until a video random-access sample arrives.
-            // Configuration alone does not establish decoder synchronization.
-            // IMPORTANT: Only check video packets! Audio samples must NOT consume the FIR budget.
             let is_video = matches!(msg.r#type, ChannelType::H265 | ChannelType::H264);
-            if is_video {
-                let is_keyframe = match &msg.frame {
+            let is_keyframe = match &msg.frame {
                     ChannelFrame::Configuration(_) => false,
                     ChannelFrame::Sample(data) => {
                         crate::avconference::AnnexB::new(data).any(|nal| {
@@ -710,13 +707,71 @@ impl FTClient {
                         })
                     }
                 };
+            let configuration = matches!(msg.frame, ChannelFrame::Configuration(_));
+            let deliver = !is_video || video_chain.lock().unwrap().accept(
+                (msg.participant, msg.stream_id), configuration, is_keyframe, msg.prev_dropped);
+            if deliver {
+                publish_media_frame(FTMediaFrameEnvelope {
+                    guid: media_guid.clone(),
+                    participant: msg.participant,
+                    participant_handle: String::new(),
+                    stream_id: msg.stream_id,
+                    codec: format!("{:?}", msg.r#type).to_lowercase(),
+                    is_configuration: matches!(msg.frame, ChannelFrame::Configuration(_)),
+                    timestamp: msg.timestamp,
+                    width,
+                    height,
+                    camera_orientation: msg.camera_meta.map(|m| m.orientation as u8),
+                    frame,
+                });
+            }
 
+            // FIR retries continue while a damaged reference chain is withheld.
+            if is_video {
                 if is_keyframe {
-                    fir_got_keyframe.store(true, Ordering::Relaxed);
+                    info!(
+                        "Incoming video keyframe: participant={} ts={} prev_dropped={}",
+                        msg.participant, msg.timestamp, msg.prev_dropped
+                    );
+                } else if msg.prev_dropped > 0 {
+                    // Rate-limited loss log for correlating with Dart tx stats:
+                    // first 5 events, then every 50th (a burst can report loss
+                    // on thousands of consecutive frames).
+                    let n = fir_loss_log_count.fetch_add(1, Ordering::Relaxed);
+                    if n < 5 || n % 50 == 0 {
+                        info!(
+                            "Incoming video loss: prev_dropped={} (event #{})",
+                            msg.prev_dropped,
+                            n + 1
+                        );
+                    }
+                    // Mid-call loss (prev_dropped = unrecovered packets/samples
+                    // lost before this frame) breaks our decode chain. The old
+                    // latch never re-requested after the first IDR, leaving the
+                    // view blocky until the peer's next natural keyframe; re-arm
+                    // the budget so the 2s FIR loop below asks for a fresh IDR.
+                    // Re-arms are spaced 4s so sustained loss cannot turn into
+                    // an IDR storm; decoder output completes recovery.
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let last = fir_last_rearm_ms.load(Ordering::Relaxed);
+                    if now_ms.saturating_sub(last) > 4000
+                        && fir_last_rearm_ms
+                            .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+                            .is_ok()
+                    {
+                        info!(
+                            "Video loss prev_dropped={} - re-arming FIR budget",
+                            msg.prev_dropped
+                        );
+                        conn_for_fir.rearm_video_decoder();
+                    }
                 }
 
-                let got_key = fir_got_keyframe.load(Ordering::Relaxed);
-                if !got_key {
+                let decoded_recently = conn_for_fir.video_decoder_is_recent();
+                if !decoded_recently {
                     let now_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
@@ -754,7 +809,7 @@ impl FTClient {
                                     (fallback_stream_id, 0)
                                 }
                             };
-                            info!("Sending FIR to {target}: stream_id={stream_id} stream_group_id={stream_group_id} (cached={}, got_key={got_key})", cached.is_some());
+                            info!("Sending FIR to {target}: stream_id={stream_id} stream_group_id={stream_group_id} (cached={}, decoded_recently={decoded_recently})", cached.is_some());
                             match conn.send_control_message(target, VCControlData::GenerateKeyFrame(VCGenerateKeyFrame {
                                 stream_id,
                                 stream_group_id,
@@ -963,6 +1018,7 @@ impl FTClient {
             is_initiator: true,
             pending_keys: Vec::new(),
             pending_video_config: None,
+            pending_camera_orientation: None,
 
             is_video,
         };

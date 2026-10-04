@@ -33,6 +33,9 @@ pub mod avconferencep {
     include!(concat!(env!("OUT_DIR"), "/avconferencep.rs"));
 }
 
+#[path = "facetime_aac.rs"]
+mod facetime_aac;
+
 struct AudioDepacketizer;
 
 impl Depacketizer for AudioDepacketizer {
@@ -664,6 +667,12 @@ const BITRATE_TABLE: &[usize] = &[
     802, 1078, 1450, 1949, 2620, 3522, 4735, 6365,
     8557, 9920,
 ];
+// The camera encoder starts at 2.5 Mbps (FaceTimeCameraCapture KEY_BIT_RATE);
+// start the controller's model at the matching rung (2620 kbps) instead of the
+// table midpoint (802 kbps) so the first SelectVideoBitrate reflects what is
+// actually on the wire -- with the midpoint the first change would yank the
+// encoder to ~600k-1.1M based on a model that never described the real rate.
+const INITIAL_VIDEO_RUNG: usize = 14; // 2620 kbps
 const U1_CHANGE_SETTLE_TIME: Duration = Duration::from_secs(5);
 
 // U1 outgoing rate control. Borrows the shape of WebRTC's GCC -- decrease fast, increase only on
@@ -3686,15 +3695,18 @@ impl VideoSender {
     /// Re-send the most recent keyframe (with parameter sets prepended) so a
     /// peer that answered our stream late - or lost the initial IDR - can
     /// start decoding. Called when an inbound FIR asks for a keyframe.
-    pub fn resend_key_frame(&mut self) -> Result<(), PushError> {
+    /// Returns `Ok(true)` when the peer should additionally get a fresh
+    /// encoder IDR (replay sent, or nothing cached to replay), `Ok(false)`
+    /// when throttled by the 1s replay window.
+    pub fn resend_key_frame(&mut self) -> Result<bool, PushError> {
         if let Some(last) = self.last_key_replay {
             if last.elapsed() < Duration::from_secs(1) {
-                return Ok(())
+                return Ok(false)
             }
         }
         let Some(mut nal) = self.last_key_frame.clone() else {
             warn!("FIR received but no keyframe cached yet");
-            return Ok(())
+            return Ok(true)
         };
         // Consume any pending config (and fall back to the stashed one) so
         // VPS/SPS/PPS ride along with the replayed IRAP.
@@ -3713,7 +3725,8 @@ impl VideoSender {
         if let Some(img_desc) = &self.cached_image_desc {
             self.pending_desc = Some(DecoderConfiguration::ImageDescription(img_desc.clone()));
         }
-        self.send_video_frame(ChannelFrame::Sample(nal), ts)
+        self.send_video_frame(ChannelFrame::Sample(nal), ts)?;
+        Ok(true)
     }
 }
 
@@ -3735,11 +3748,26 @@ pub struct AudioSender {
 
     is_u1: bool,
     last_worst: (u8, u8),
+    aac_encoder: Option<facetime_aac::FaceTimeAacEncoder>,
 }
 
 impl AudioSender {
+    /// PCM input is encoded to the negotiated 480-sample AAC-ELD format.
+    pub fn send_audio_pcm(&mut self, pcm: &[u8], timestamp: u32) -> Result<(), String> {
+        if self.aac_encoder.is_none() {
+            self.aac_encoder = Some(facetime_aac::FaceTimeAacEncoder::new()?);
+            info!("FaceTime AAC encoder: ELD 24kHz mono 480 samples no-SBR; ASC=f8ec3000");
+        }
+        let frame = self.aac_encoder.as_mut().unwrap().encode(pcm)?;
+        if !frame.is_empty() {
+            self.send_audio_frame(&frame, timestamp).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
     pub fn send_audio_frame(&mut self, sample: &[u8], timestamp: u32) -> Result<(), PushError> {
-        
+        let payload = facetime_aac::frame_payload(sample).map_err(|e|
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let ext = if self.is_u1 {
             let stats = &self.frame_handler.stats;
 
@@ -3858,7 +3886,7 @@ impl AudioSender {
                 }],
                 extensions_padding: 0,
             },
-            payload: sample.to_vec().into(),
+            payload: payload.into(),
         };
         self.is_first = false;
 
@@ -3902,6 +3930,9 @@ pub enum AVControlCommand {
     CallFailed,
 }
 
+#[path = "video_decode_progress.rs"]
+mod video_decode_progress;
+
 pub struct AVSession {
     pub link: Arc<GlobalLink>,
     pub state: DebugMutex<AVSessionState>,
@@ -3922,9 +3953,25 @@ pub struct AVSession {
 
     /// Lazily-created outgoing audio sender.
     pub audio_sender: tokio::sync::Mutex<Option<AudioSender>>,
+
+    // Packet arrival does not prove Android decoded a frame. Feedback from
+    // the actual output drain keeps recovery active while a decoder is stuck.
+    video_decode_progress: video_decode_progress::VideoDecodeProgress,
 }
 
 impl AVSession {
+    pub fn report_video_decoded(&self, keyframe: bool) {
+        self.video_decode_progress.record_output(keyframe);
+    }
+
+    pub fn video_decoder_is_recent(&self) -> bool {
+        self.video_decode_progress.is_recent()
+    }
+
+    pub fn rearm_video_decoder(&self) {
+        self.video_decode_progress.rearm();
+    }
+
     pub async fn new(
         relay_session: Arc<GlobalLink>, 
         av_config: AVConfig, 
@@ -3967,7 +4014,7 @@ impl AVSession {
                 u1_clean_streak: 0,
                 u1_failed_rung: None,
                 active_participants: HashSet::new(),
-                current_video_bitrate: BITRATE_TABLE.len() / 2,
+                current_video_bitrate: INITIAL_VIDEO_RUNG,
             }),
             av_config,
             session_id: group_id,
@@ -3981,6 +4028,7 @@ impl AVSession {
 
             video_sender: tokio::sync::Mutex::new(None),
             audio_sender: tokio::sync::Mutex::new(None),
+            video_decode_progress: Default::default(),
         });
 
         let avc_mat_id: [u8; 20] = rand::random();
@@ -4129,8 +4177,15 @@ impl AVSession {
                                     {
                                         let mut sender = session.video_sender.lock().await;
                                         if let Some(sender) = sender.as_mut() {
-                                            if let Err(e) = sender.resend_key_frame() {
-                                                warn!("Keyframe replay failed: {e}");
+                                            match sender.resend_key_frame() {
+                                                Ok(true) => {
+                                                    info!("FIR from {participant}: replayed cached IDR, requesting fresh encoder IDR");
+                                                    publish_encoder_control("requestKeyFrame", None);
+                                                }
+                                                Ok(false) => {
+                                                    info!("FIR from {participant}: within replay cooldown, not re-requesting");
+                                                }
+                                                Err(e) => warn!("Keyframe replay failed: {e}"),
                                             }
                                         }
                                     }
@@ -4139,6 +4194,10 @@ impl AVSession {
                                         (2u32, 1u8), // audio group
                                     ]))).await;
                                 }
+                            }
+                            AVControlCommand::SelectVideoBitrate(bps) => {
+                                info!("SelectVideoBitrate {bps} bps from U1 controller -> requesting encoder update");
+                                publish_encoder_control("setBitrate", Some(bps as u64));
                             }
                             _ => {}
                         }
@@ -4286,6 +4345,7 @@ impl AVSession {
 
             is_u1: group_stream.is_none(),
             last_worst: (0, 0),
+            aac_encoder: None,
         })
     }
 
@@ -5528,6 +5588,35 @@ pub fn publish_media_frame(envelope: FTMediaFrameEnvelope) {
     let _ = MEDIA_FRAMES.send(envelope);
 }
 
+/// Control events from the media engine to the local camera encoder
+/// (fresh-IDR request, target bitrate). Same lossy-broadcast contract as
+/// media frames: an absent consumer drops the event rather than block senders.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FTEncoderControlEnvelope {
+    /// "requestKeyFrame" | "setBitrate"
+    pub action: String,
+    /// Present for setBitrate: target bits per second.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bits_per_second: Option<u64>,
+}
+
+static ENCODER_CONTROL: LazyLock<broadcast::Sender<FTEncoderControlEnvelope>> = LazyLock::new(|| {
+    let (sender, _) = broadcast::channel(16);
+    sender
+});
+
+pub fn subscribe_encoder_controls() -> broadcast::Receiver<FTEncoderControlEnvelope> {
+    ENCODER_CONTROL.subscribe()
+}
+
+pub fn publish_encoder_control(action: &'static str, bits_per_second: Option<u64>) {
+    let _ = ENCODER_CONTROL.send(FTEncoderControlEnvelope {
+        action: action.to_string(),
+        bits_per_second,
+    });
+}
+
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -5686,7 +5775,7 @@ impl AVConfig {
                 cap_wifi: Some(6500),
             }),
             codec_support: Some(VcMediaNegotiationBlobV2CodecFeatures {
-                audio_features: Some(0x2),  // AAC-LC only (Samsung ELD broken for Apple)
+                audio_features: Some(0x2), // Preserve the earlier call negotiation capability.
                 video_features: Some(video_features.clone()),
             }),
             microphone_u1: Some(VcMediaNegotiationBlobV2MicrophoneSettingsU1 {
@@ -6485,4 +6574,3 @@ impl ControlKeySet {
         data
     }
 }
-
