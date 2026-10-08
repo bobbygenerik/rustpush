@@ -3608,6 +3608,16 @@ impl VideoSender {
             }
         }
 
+        // Large frames (IDRs are 40-120 packets with FEC) used to hit the socket
+        // back-to-back, overflowing the uplink/relay queue: live loss was
+        // concentrated in keyframe-sized frames while one-way delay stayed flat.
+        // In 1:1 calls send a small burst immediately and spread the rest over
+        // ~16ms. Group calls rely on bursts for bandwidth probes, so are unchanged.
+        const PACE_INITIAL_BURST: usize = 8;
+        const PACE_TICKS: usize = 16;
+        let pace_enabled = self.to_participant.is_some() && payloads.len() > PACE_INITIAL_BURST;
+        let pace_handle = if pace_enabled { tokio::runtime::Handle::try_current().ok() } else { None };
+        let mut deferred: Vec<GlobalLinkOutgoingPacket> = vec![];
         for (idx, payload) in payloads.into_iter().enumerate() {
             // info!("SEnding video payload {}", encode_hex(&payload));
 
@@ -3665,12 +3675,30 @@ impl VideoSender {
             // if (1560u16..1561).contains(&self.sequence_number) {
             if false {
                 warn!("Dropping packet {}", self.sequence_number);
+            } else if pace_handle.is_some() && idx >= PACE_INITIAL_BURST {
+                deferred.push(p);
             } else {
                 if let Err(e) = self.link.send(&p) {
                     warn!("Failed to send vidoe packet {e}!");
                 }
             }
 
+        }
+
+        if let (Some(handle), false) = (pace_handle, deferred.is_empty()) {
+            let link = self.link.clone();
+            let per_tick = deferred.len().div_ceil(PACE_TICKS).max(2);
+            handle.spawn(async move {
+                let mut iter = deferred.into_iter().peekable();
+                while iter.peek().is_some() {
+                    sleep(Duration::from_millis(1)).await;
+                    for p in iter.by_ref().take(per_tick) {
+                        if let Err(e) = link.send(&p) {
+                            warn!("Failed to send paced video packet {e}!");
+                        }
+                    }
+                }
+            });
         }
 
         self.frame_number = self.frame_number.wrapping_add(1);

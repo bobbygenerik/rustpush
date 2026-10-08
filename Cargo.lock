@@ -1017,8 +1017,6 @@ checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
 [[package]]
 name = "fdk-aac-sys"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "24516d2611506d5cb1833555adc75f6baf9fe2706b9c13e6fc33a6b22c51ca83"
 dependencies = [
  "cc",
 ]
@@ -3312,6 +3310,7 @@ dependencies = [
  "backon",
  "base64 0.21.7",
  "bitflags 2.9.1",
+ "cc",
  "chrono",
  "cloudkit-derive",
  "cloudkit-proto",
