@@ -1,3 +1,6 @@
+#[path = "avconference_quality.rs"]
+mod quality_feedback;
+
 use std::{collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque}, fmt::{Debug, Display}, io::Cursor, net::{IpAddr, SocketAddr, SocketAddrV4}, ops::{Add, Deref, Div, Mul}, sync::{Arc, LazyLock, RwLockWriteGuard, Weak, atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering}}, time::{Duration, SystemTime, UNIX_EPOCH}, usize};
 use quinn::crypto::rustls::QuicClientConfig;
 use h3::client;
@@ -4903,15 +4906,10 @@ impl AVSession {
                 let u1 = self.u1.load(Ordering::Relaxed);
 
                 if is_audio && u1 && !report.history.is_empty() {
-                    let (q13_sample_count, first_q13, latest_q13) = report.history.iter()
-                        .filter_map(|feedback| feedback.q13_one_way_delay)
-                        .fold((0usize, None, None), |(count, first, _), q13| {
-                            (count + 1, first.or(Some(q13)), Some(q13))
-                        });
-                    // Ignore small sample-to-sample jitter when deciding whether Q13 is rising.
-                    let q13_rising = first_q13.zip(latest_q13)
-                        .map(|(first, latest)| latest > first.saturating_add(128))
-                        .unwrap_or_default();
+                    let q13_slope = quality_feedback::q13_slope(report.history.iter()
+                        .filter_map(|f| Some((f.feedback_sequence, f.q13_one_way_delay?))));
+                    let q13_rising = q13_slope.is_some_and(|s| s >= quality_feedback::Q13_SLOPE_RISING);
+                    let latest_q13 = report.history.iter().filter_map(|f| f.q13_one_way_delay).last();
                     let latest_q13 = latest_q13.unwrap_or_default();
 
                     // AFRC replays the most recent loss entry when there is no new one. Collapse
@@ -5012,7 +5010,7 @@ impl AVSession {
                     // mid-collapse. Only a run of them is evidence the path is actually healthy.
                     let report_is_clean = loss <= U1_LOSS_IGNORE
                         && video_samples != 0
-                        && !(high_q13 && q13_rising && video_packets_lost > 0);
+                        && !q13_rising;
                     state.u1_clean_streak = if report_is_clean { state.u1_clean_streak + 1 } else { 0 };
 
                     // A rate that recently failed is not retried until the memory expires. A clean
@@ -5028,9 +5026,9 @@ impl AVSession {
                     let blocked_by_ceiling = failed_rung
                         .is_some_and(|rung| state.current_video_bitrate + 1 >= rung);
 
-                    let wants_upgrade = q13_sample_count >= 2
-                        && (!high_q13 || video_packets_lost == 0)
-                        && (!q13_rising || video_packets_lost == 0)
+                    // Rising delay blocks a step up even before loss arrives. Keep
+                    // the existing loss requirement for cuts to prevent delay-only collapse.
+                    let wants_upgrade = quality_feedback::q13_allows_upgrade(q13_slope)
                         && no_recent_packet_loss
                         && !blocked_by_ceiling
                         && state.u1_clean_streak >= U1_CLEAN_STREAK;
@@ -5065,7 +5063,7 @@ impl AVSession {
                     };
 
                     info!(
-                        "U1 send rate bucket {bucket} held_for={held_for:?}: rate={}kbps(rung {}) q13 first={first_q13:?} latest={latest_q13} rising={q13_rising}, video loss={video_packets_lost}/{video_packets_expected} ({video_loss_fraction:?}) damaged={damaged_video_frames}/{video_samples} sustained={sustained_packet_loss} no_recent_loss={no_recent_packet_loss}, clean_streak={}/{} failed_rung={failed_rung:?} bump_failures={}",
+                        "U1 send rate bucket {bucket} held_for={held_for:?}: rate={}kbps(rung {}) q13 slope={q13_slope:?} latest={latest_q13} rising={q13_rising}, video loss={video_packets_lost}/{video_packets_expected} ({video_loss_fraction:?}) damaged={damaged_video_frames}/{video_samples} sustained={sustained_packet_loss} no_recent_loss={no_recent_packet_loss}, clean_streak={}/{} failed_rung={failed_rung:?} bump_failures={}",
                         BITRATE_TABLE[state.current_video_bitrate],
                         state.current_video_bitrate,
                         state.u1_clean_streak,

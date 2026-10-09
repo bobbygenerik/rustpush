@@ -724,6 +724,7 @@ pub const SECURITYD_CONTAINER: CloudKitContainer = CloudKitContainer {
 pub struct KeychainClient<P: AnisetteProvider> {
     pub anisette: ArcAnisetteClient<P>,
     pub token_provider: Arc<TokenProvider<P>>,
+    // Lock PasswordManager state, then CloudKit container keys, then Keychain state.
     pub state: DebugRwLock<KeychainClientState>,
     pub config: Arc<dyn OSConfig>,
     pub update_state: Box<dyn Fn(&KeychainClientState) + Send + Sync>,
@@ -1399,13 +1400,18 @@ impl<P: AnisetteProvider> KeychainClient<P> {
             return Err(PushError::NotInClique)
         }
 
-        let state = self.state.read().await;
-        if state.keystore.0.is_empty() {
-            let shares = self.fetch_shares_for(state.user_identity.as_ref().unwrap()).await?;
-            drop(state);
+        // Release state before awaiting CloudKit, which can acquire state again.
+        let fetch = {
+            let state = self.state.read().await;
+            if state.keystore.0.is_empty() {
+                Some((state.user_identity.as_ref().unwrap().clone(), state.state.clone()))
+            } else {
+                None
+            }
+        };
+        if let Some((identity, peers)) = fetch {
+            let shares = self.fetch_shares_for(&identity, &peers).await?;
             self.store_keys(&shares).await?;
-        } else {
-            drop(state);
         }
 
         let security_container = self.get_security_container().await?;
@@ -1851,14 +1857,14 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         (self.update_state)(&state);
     }
 
-    pub async fn fetch_shares_for(&self, user: &KeychainUserIdentity<impl KeystoreDeriveKey>) -> Result<Vec<CuttlefishSerializedKey>, PushError> {
+    // Caller supplies a snapshot: do not acquire state while waiting on CloudKit.
+    pub async fn fetch_shares_for(&self, user: &KeychainUserIdentity<impl KeystoreDeriveKey>, peers: &HashMap<String, EncodedPeer>) -> Result<Vec<CuttlefishSerializedKey>, PushError> {
         let response: CuttlefishFetchRecoverableTlkSharesResponse = self.invoke_cuttlefish("fetchRecoverableTLKShares", CuttlefishFetchRecoverableTlkSharesRequest {
             for_peer: Some(user.identifier.clone()),
         }).await?;
 
         let mut keys = vec![];
         let mut signature_error = None;
-        let state = self.state.read().await;
         for share in response.shares {
             info!("Entering on key {}", share.service());
             let Some(share_record) = &share.share else {
@@ -1868,8 +1874,8 @@ impl<P: AnisetteProvider> KeychainClient<P> {
             let record_fields = &share_record.inner.as_ref().unwrap().record_field;
             let item = CuttlefishTlkShare::from_record(record_fields);
 
-            let Some(sending_peer) = state.state.get(&item.sender) else {  
-                warn!("missing sender {} in state! {:?}", item.sender, state.state.keys().collect::<Vec<_>>());
+            let Some(sending_peer) = peers.get(&item.sender) else {
+                warn!("missing sender {} in state! {:?}", item.sender, peers.keys().collect::<Vec<_>>());
                 continue
             };
             if let Err(e) = sending_peer.verify_signature_dig(MessageDigest::sha256(), &item.data_for_signing(record_fields), &base64_decode(&item.signature)) {
@@ -1983,10 +1989,11 @@ impl<P: AnisetteProvider> KeychainClient<P> {
 
         info!("Self vouching as {} {:?}", other_identity.identifier, state.state.keys().collect::<Vec<_>>());
         let voucher = other_identity.vouch_for(my_identity.identifier.clone())?;
+        let peers = state.state.clone();
 
         drop(state);
 
-        let shares = self.fetch_shares_for(&other_identity).await?;
+        let shares = self.fetch_shares_for(&other_identity, &peers).await?;
         if shares.is_empty() {
             return Err(PushError::PeerNoShares)            
         }
@@ -2058,10 +2065,10 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         (self.update_state)(&state);
 
         if with_tlk_shares.is_empty() {
-            let state = state.downgrade();
-            // fetch tlk shares
-            let shares = self.fetch_shares_for(state.user_identity.as_ref().unwrap()).await?;
+            let identity = state.user_identity.as_ref().unwrap().clone();
+            let peers = state.state.clone();
             drop(state);
+            let shares = self.fetch_shares_for(&identity, &peers).await?;
             self.store_keys(&shares).await?;
         } else {
             drop(state);
@@ -2183,14 +2190,12 @@ impl<P: AnisetteProvider> KeychainClient<P> {
     }
 
     async fn get_escrow_headers(&self) -> Result<HeaderMap, PushError> {
-        let state_lock = self.state.read().await;
         let mut map = HeaderMap::new();
         map.insert("User-Agent", self.config.get_normal_ua("com.apple.sbd/638.100.48").parse().unwrap());
         map.insert("Accept-Language", "en-US,en;q=0.9".parse().unwrap());
         map.insert("x-apple-i-device-type", "1".parse().unwrap());
         map.insert("Accept", "*/*".parse().unwrap());
-        map.insert("X-Apple-I-Locale", "en_US".parse().unwrap());        
-        drop(state_lock);
+        map.insert("X-Apple-I-Locale", "en_US".parse().unwrap());
 
         let mut base_headers = self.anisette.lock().await.get_headers().await?.clone();
 
@@ -2205,9 +2210,13 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         let auth = self.token_provider.get_gsa_token("com.apple.gs.idms.pet").await.ok_or(PushError::TokenMissing)?;
         let email = self.token_provider.get_gsa_email().await.expect("no email!");
 
-        let state = self.state.read().await;
-        let resp = REQWEST.post(format!("{}/escrowproxy/api/{}", state.host, request.command.get_url()))
-            .headers(self.get_escrow_headers().await?)
+        let host = {
+            let state = self.state.read().await;
+            state.host.clone()
+        };
+        let headers = self.get_escrow_headers().await?;
+        let resp = REQWEST.post(format!("{}/escrowproxy/api/{}", host, request.command.get_url()))
+            .headers(headers)
             .header("Content-Type", "application/x-apple-plst")
             .basic_auth(&email, Some(&auth))
             .body(plist_to_string(&request)?)

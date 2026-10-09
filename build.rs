@@ -6,7 +6,7 @@ fn main() -> Result<()> {
         let mut build = cc::Build::new();
         // EVS and FDK-AAC both expose these reference math tables. Namespace
         // EVS at compile time so both codecs can coexist in the Android library.
-        for symbol in ["exp2_tab_long", "exp2w_tab_long", "exp2x_tab_long"] {
+        for symbol in ["exp2_tab_long", "exp2w_tab_long", "exp2x_tab_long", "t_qua_gain7b"] {
             build.define(symbol, Some(format!("obim_evs_{symbol}").as_str()));
         }
         build.include(root.join("lib_com")).include(root.join("lib_dec"))
