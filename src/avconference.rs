@@ -1,5 +1,11 @@
 #[path = "avconference_quality.rs"]
 mod quality_feedback;
+#[path = "avconference_feedback.rs"]
+mod audio_feedback;
+#[path = "avconference_control.rs"]
+mod control_retry;
+use control_retry::{ControlAction, ControlRetryQueue, RetryMode};
+use audio_feedback::{FTAudioControlData, ParticipantFeedbackState, CumulativeCounter12};
 
 use std::{collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque}, fmt::{Debug, Display}, io::Cursor, net::{IpAddr, SocketAddr, SocketAddrV4}, ops::{Add, Deref, Div, Mul}, sync::{Arc, LazyLock, RwLockWriteGuard, Weak, atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering}}, time::{Duration, SystemTime, UNIX_EPOCH}, usize};
 use quinn::crypto::rustls::QuicClientConfig;
@@ -649,6 +655,7 @@ pub struct AVSessionSSRC {
     features: HashMap<u8, EnabledAVFeatures>,
     mkms: Vec<QuickRelayMkmMaterial>,
     group_ssrcs: Vec<u32>, // stream-specific SSRCs
+    feedback: Arc<ParticipantFeedbackState>,
 
     // LOCAL state - make sure any added local state must be manually preserved
     // when importing a new AVC data.
@@ -795,6 +802,9 @@ impl AVSessionState {
         info!("added to Session ID!");
 
         let encryption_state = self.encryption_states.entry(p).or_default();
+        encryption_state.feedback.configure(audio_feedback::LOCAL_FEC_FEEDBACK_VERSION,
+            blob.face_time_settings.as_ref().and_then(|settings| settings.media_control_info_sub_version));
+        info!("Participant {p} FEC feedback mode {}", encryption_state.feedback.configuration() as u8);
         encryption_state.stream_groups = v2.stream_groups.into_iter().map(|mut i| {
             i.streams.sort_by_key(|s| s.stream_id());
             (i.stream_group(), StreamGroup {
@@ -830,6 +840,7 @@ impl AVSessionState {
                         Some((f.rtp_payload() as u8, negotiated))
                     }).collect(),
                 group_ssrcs: group.streams.iter().map(|i| i.rtp_ssrc()).collect(),
+                feedback: encryption_state.feedback.clone(),
                 srtp_contexts: HashMap::new(),
                 codec: None,
                 fec_data: BTreeMap::new(),
@@ -877,6 +888,12 @@ struct RedHeader {
     follow: bool,
     #[deku(bits = 7)]
     payload_type: u8,
+}
+
+fn missing_packet_range(previous: u16, current: u16) -> Option<(u16, u16)> {
+    let jump = current.wrapping_sub(previous);
+    // Preserve the existing immediate-NACK window; only fix sequence wrap.
+    (jump > 1 && jump < 256).then(|| (previous.wrapping_add(1), jump - 1))
 }
 
 fn range_to_pair(start: u16, count: u16) -> Vec<NackPair> {
@@ -980,6 +997,7 @@ pub struct ParticipantEncryptionState {
     has_sent_keys: bool,
     ctrl_enc_counter: u8,
     pub stream_groups: HashMap<u32, StreamGroup>,
+    feedback: Arc<ParticipantFeedbackState>,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -1224,6 +1242,9 @@ pub struct RecvStatTracker {
     initial_send_time: HashMap<u64, f64>,
     initial_recv_time: HashMap<u64, Instant>,
     audio_history: Vec<FTAudioControlData>,
+    audio_history_context: Option<(u64, u64)>, // participant, negotiation generation
+    video_receive_counter: CumulativeCounter12,
+    video_received_unwrapped: Option<u64>,
 
     /// Per-SSRC RR tracking: (highest_seq, total_received, last_sr_timestamp, last_sr_recv_time)
     ssrc_rr_state: HashMap<u32, SSRCRRState>,
@@ -1247,6 +1268,9 @@ impl RecvStatTracker {
             initial_recv_time: HashMap::new(),
             initial_send_time: HashMap::new(),
             audio_history: Vec::with_capacity(30),
+            audio_history_context: None,
+            video_receive_counter: CumulativeCounter12::default(),
+            video_received_unwrapped: None,
             ssrc_rr_state: HashMap::new(),
             our_ssrc: rand::random(),
             last_rr_send: None,
@@ -1316,7 +1340,20 @@ impl RecvStatTracker {
         Some(buf)
     }
 
-    fn track(&mut self, recv: &GlobalPacket, header: &Header, elapsed_packets: u16, callback: &tokio::sync::mpsc::Sender<AVInternalMessage>, ssrc: &AVSessionSSRC) -> Option<FTVideoControlData> {
+    fn track(&mut self, recv: &GlobalPacket, header: &Header, elapsed_packets: u16, callback: &tokio::sync::mpsc::Sender<AVInternalMessage>, ssrc: &AVSessionSSRC) -> Result<Option<FTVideoControlData>, ()> {
+        let payload = AVSessionPayload::from_id(header.payload_type as u32).ok_or(())?;
+        // Reject malformed video metadata before frame accounting. The caller
+        // must drop the packet, not mistake a failed FEC parse for plain video.
+        let video_data = if matches!(payload, AVSessionPayload::H265 | AVSessionPayload::H264) && !header.extensions.is_empty() {
+            Some(FTVideoControlData::from_ext(header.extension_profile, header.extensions[0].payload.to_vec()).ok_or(())?)
+        } else { None };
+        let feedback_configuration = ssrc.feedback.configuration();
+        if self.audio && self.audio_history_context != Some((ssrc.owner, feedback_configuration)) {
+            self.audio_history.clear();
+            self.audio_history_context = Some((ssrc.owner, feedback_configuration));
+            self.video_receive_counter = CumulativeCounter12::default();
+            self.video_received_unwrapped = None;
+        }
         self.stats.total_recv_bytes.fetch_add(recv.packet_size as u64, Ordering::Relaxed);
 
         // Update per-SSRC RR state
@@ -1380,8 +1417,6 @@ impl RecvStatTracker {
                 ..ProbeState::new(&recv, &header)
             });
         }
-        let payload = AVSessionPayload::from_id(header.payload_type as u32).unwrap();
-
         let result = if !header.extensions.is_empty() {
             let mut record_index = self.stats.records.read().unwrap();
             let stream_identifier = (ssrc.owner, ssrc.stream_index);
@@ -1393,45 +1428,42 @@ impl RecvStatTracker {
             }
             match payload {
                 AVSessionPayload::H265 | AVSessionPayload::H264 => {
-                    let data = FTVideoControlData::from_ext(header.extension_profile, header.extensions[0].payload.to_vec());
+                    let data = video_data.ok_or(())?;
                     if let FTVideoControlData { total_packets_per_frame: Some(packets), frame_sequence_number: Some(sequence) , .. } = data {
                         let slot = &record_index[&stream_identifier][sequence as usize & 0x7f];
 
-                        // this code is not thread-safe. Video must be decoded on the same thread.
-                        // if several threads swap this sequence at the same time, they can sub before the
-                        // reset finished, causing false loss. Also, this only works with one video sender, 
-                        // aka, U1 mode.
-                        if slot.frame.swap(sequence, Ordering::Relaxed) != sequence {
-                            // reset slot
-                            slot.start_time.store(duration_since_epoch().as_millis() as u64, Ordering::Relaxed);
-                            slot.total.store(packets as u8, Ordering::Relaxed);
-                            slot.lost.store(packets as u8 - 1, Ordering::Relaxed);
-                            slot.present_time.store(header.timestamp, Ordering::Relaxed);
-                        } else {
-                            let item = slot.lost.load(Ordering::Relaxed);
-                            if item > 0 {
-                                slot.lost.store(item - 1, Ordering::Relaxed);
-                            }
-                        }
+                        slot.observe(sequence, packets, header.timestamp, duration_since_epoch().as_millis() as u64);
                     }
                     // info!("Control data {data:?}");
                     Some(data)
                 },
                 AVSessionPayload::Aac | AVSessionPayload::Evs | AVSessionPayload::Red => {
-                    let data = FTAudioControlData::from_ext(header.extension_profile, header.extensions[0].payload.to_vec());
-                    // info!("Audio data {data:?}");
-                    if let Some(time) = data.current_send_timestamp {
-                        self.stats.last_feedback.store(time, Ordering::Relaxed);
-                        self.stats.last_feedback_time.store(duration_since_epoch().as_millis() as u64, Ordering::Relaxed);
-                    }
+                    // Bad/unsupported feedback must not abort this audio packet's accounting
+                    // or prevent its payload from reaching the decoder.
+                    if let Some(data) = FTAudioControlData::from_ext_with_feedback_version(
+                        header.extension_profile, &header.extensions[0].payload, feedback_configuration as u8) {
+                        // info!("Audio data {data:?}");
+                        if let Some(time) = data.current_send_timestamp {
+                            self.stats.last_feedback.store(time, Ordering::Relaxed);
+                            self.stats.last_feedback_time.store(duration_since_epoch().as_millis() as u64, Ordering::Relaxed);
+                        }
 
-                    let change_time = self.stats.frame_change_time.load(Ordering::Relaxed);
-                    if change_time == 0 {
-                        self.audio_history.push(data);
-                    } else if data.feedback_sequence.wrapping_sub(change_time.wrapping_add(1)) < 0x8000 {
-                        if self.stats.frame_change_time.compare_exchange(change_time, 0, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
-                            self.audio_history.clear();
+                        let cumulative_in_order = if let Some(count) = data.video_received_packets {
+                            if let Some(unwrapped) = self.video_receive_counter.observe(count) {
+                                self.video_received_unwrapped = Some(unwrapped);
+                                true
+                            } else { false }
+                        } else { true };
+                        let change_time = self.stats.frame_change_time.load(Ordering::Relaxed);
+                        if !cumulative_in_order {
+                            // Preserve timing/accounting and audio delivery; do not reuse old counters.
+                        } else if change_time == 0 {
                             self.audio_history.push(data);
+                        } else if data.feedback_sequence.wrapping_sub(change_time.wrapping_add(1)) < 0x8000 {
+                            if self.stats.frame_change_time.compare_exchange(change_time, 0, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                                self.audio_history.clear();
+                                self.audio_history.push(data);
+                            }
                         }
                     }
                     None
@@ -1459,6 +1491,8 @@ impl RecvStatTracker {
                 last_15_sec: self.get_historical_report(15),
                 bandwidth_estimate: average,
                 history: self.audio_history.clone(),
+                feedback_context: self.audio_history_context,
+                video_received_unwrapped: self.video_received_unwrapped,
             };
 
             self.audio_history.clear();
@@ -1512,7 +1546,7 @@ impl RecvStatTracker {
             });
         }
 
-        result
+        Ok(result)
     }
 }
 
@@ -1523,6 +1557,8 @@ pub struct IncomingReport {
     last_15_sec: RecvTimeReport,
     bandwidth_estimate: usize,
     history: Vec<FTAudioControlData>,
+    feedback_context: Option<(u64, u64)>,
+    video_received_unwrapped: Option<u64>, // diagnostics, not a frame-loss ratio
 }
 
 #[derive(Default)]
@@ -1558,8 +1594,24 @@ struct IncomingFrameRecord {
     frame: AtomicU16,
     start_time: AtomicU64,
     present_time: AtomicU32,
-    total: AtomicU8,
-    lost: AtomicU8,
+    total: AtomicU16,
+    lost: AtomicU16,
+}
+
+impl IncomingFrameRecord {
+    // Called only by the single media receive thread, not concurrently. U1
+    // frames retain full wire counts until feedback is packed for emission.
+    fn observe(&self, sequence: u16, packets: u16, timestamp: u32, now_ms: u64) {
+        if self.frame.swap(sequence, Ordering::Relaxed) != sequence || self.start_time.load(Ordering::Relaxed) == 0 {
+            self.start_time.store(now_ms, Ordering::Relaxed);
+            self.total.store(packets, Ordering::Relaxed);
+            self.lost.store(packets.saturating_sub(1), Ordering::Relaxed);
+            self.present_time.store(timestamp, Ordering::Relaxed);
+        } else {
+            let lost = self.lost.load(Ordering::Relaxed);
+            self.lost.store(lost.saturating_sub(1), Ordering::Relaxed);
+        }
+    }
 }
 
 pub trait TimingTarget: Send + Sync {
@@ -1740,14 +1792,14 @@ impl IncomingFrameHandler {
                     // info!("Header {:?} {} {}", header, recv.packet_id, duration_since_epoch().as_secs_f64());
                     let tracked_packets = if let Some(prev_seq) = ssrc_seq.get_mut(&header.ssrc) {
                         let jump = header.sequence_number.wrapping_sub(*prev_seq);
-                        if jump > 1 && jump < 256 {
+                        if let Some((first_missing, missing_count)) = missing_packet_range(*prev_seq, header.sequence_number) {
                             // we dropped packets
                             let nack: BytesMut = TransportLayerNack {
                                 sender_ssrc: *rtcp_sender.entry(header.ssrc).or_insert_with(|| rand::random()),
                                 media_ssrc: header.ssrc,
-                                nacks: range_to_pair(*prev_seq + 1, jump - 1)
+                                nacks: range_to_pair(first_missing, missing_count)
                             }.marshal().unwrap();
-                            warn!("Sending NACK for {} packets at {}, idx {:?} {}", jump - 1, *prev_seq + 1, header, encode_hex(&recv.data));
+                            warn!("Sending NACK for {} packets at {}, idx {:?} {}", missing_count, first_missing, header, encode_hex(&recv.data));
                             if let Err(e) = control.try_send(AVInternalMessage::RtcpOutgoing(participant, nack)) {
                                 warn!("Failed to queue nack {e}");
                             }
@@ -1755,9 +1807,9 @@ impl IncomingFrameHandler {
 
                         if jump > 1 && jump < 1500 {
                             if audio {
-                                stats.audio_burst_loss.fetch_max((jump as u8 - 1).min(15), Ordering::Relaxed);
+                                stats.audio_burst_loss.fetch_max(audio_feedback::burst_loss_for_jump(jump), Ordering::Relaxed);
                             } else {
-                                stats.video_burst_loss.fetch_max((jump as u8 - 1).min(15), Ordering::Relaxed);
+                                stats.video_burst_loss.fetch_max(audio_feedback::burst_loss_for_jump(jump), Ordering::Relaxed);
                             }
                         }
 
@@ -1771,7 +1823,6 @@ impl IncomingFrameHandler {
                     };
 
                     
-                    let video_meta = stat_tracker.track(&recv, &header, tracked_packets, &control, &ssrc);
                     
                     let context = ssrc.srtp_contexts.entry(header.ssrc).or_default().get_context_for_mki(mki, || {
                         let mkm = ssrc.mkms.iter().find(|i| &i.mki[..mki.len()] == mki).unwrap();
@@ -1792,6 +1843,19 @@ impl IncomingFrameHandler {
                         }
                     };
                     let unmarshalled = rtc_rtp::Packet::unmarshal(&mut result).unwrap();
+                    // Feedback and receive accounting must not trust an unauthenticated extension.
+                    let video_meta = match stat_tracker.track(&recv, &header, tracked_packets, &control, &ssrc) {
+                        Ok(data) => data,
+                        Err(()) => {
+                            warn!("Dropping malformed video control extension for SSRC {}", header.ssrc);
+                            continue
+                        }
+                    };
+                    if !is_group && matches!(payload, AVSessionPayload::H264 | AVSessionPayload::H265) {
+                        // Count authenticated RTP arrivals, including FEC parity; recovered
+                        // synthetic packets do not add another transport arrival.
+                        ssrc.feedback.record_video_packet();
+                    }
 
                     if ssrc.fec_data.len() > 5 {
                         ssrc.fec_data.pop_first();
@@ -1849,32 +1913,28 @@ impl IncomingFrameHandler {
                             bytes = &bytes[len..];
                         }
                     } else if let Some(fec) = video_meta.as_ref().and_then(|v| v.fec_header.as_ref()) {
+                        let Some(position) = fec.packet_index() else { continue };
                         let group = ssrc.fec_data.entry(header.timestamp).or_default()
                             .entry(fec.group_id).or_insert_with(|| {
-                                let position = (if fec.is_data {
-                                    fec.position
-                                } else {
-                                    7
-                                } - fec.start_position) / fec.symbols_per_packet;
-                                let first_seq = header.sequence_number.wrapping_sub(position as u16);
+                                let first_seq = header.sequence_number.wrapping_sub(position);
                                 FECData::new(fec.symbols_per_packet, fec.start_position, first_seq)
                             });
-                        group.ingest(fec, &unmarshalled.payload);
-                        if !fec.is_data {
-                            for missing in group.missing_idx() {
-                                let seq = group.start_seq.wrapping_add(missing);
-                                let Some(data) = group.recover(missing) else { break };
-                                packets.push(Packet {
-                                    header: Header {
-                                        sequence_number: seq,
-                                        marker: fec.last_group && group.last_idx() == missing,
-                                        ..header.clone()
-                                    },
-                                    payload: data.into(),
-                                })
-                            }
-                        } else {
+                        let Some(recovered) = group.ingest_and_recover(fec, &unmarshalled.payload) else {
+                            warn!("Inconsistent FEC group metadata; dropping packet");
+                            continue
+                        };
+                        if fec.is_data {
                             packets.push(unmarshalled);
+                        }
+                        for (missing, data) in recovered {
+                            packets.push(Packet {
+                                header: Header {
+                                    sequence_number: group.start_seq.wrapping_add(missing),
+                                    marker: fec.last_group && group.last_idx() == missing,
+                                    ..header.clone()
+                                },
+                                payload: data.into(),
+                            })
                         }
                     } else {
                         packets.push(unmarshalled);
@@ -2469,130 +2529,6 @@ impl VCControlData {
     }
 }
 
-#[derive(Clone, Debug, Default)]
-struct FTAudioControlData {
-    version: u8,
-    rate_bucket: u8,
-    // last seen time_counter
-    feedback_sequence: u16,
-    // remote receive estimate in kilobits
-    total_kb_recv: u16,
-    audio_burst_loss: u8,
-    audio_received_packets: u16,
-    // if flags & 0x01
-    queuing_delay: Option<u16>,
-    // 1024/s clock
-    current_send_timestamp: Option<u16>,
-    q13_one_way_delay: Option<u16>,
-    // if flags & 0x04
-    video_burst_loss: Option<u8>,
-    video_frame_size: Option<u8>,
-    video_packet_loss: Option<u8>,
-    bandwidth_estimate: Option<u16>,
-    // if flags & 0x08
-    ect: Option<u16>,
-    ce: Option<u16>,
-    // if flags & 0x02
-    // | feedback/history index| secondary-only| primary count| total count | ( each byte)
-    // feedback/history index advances modulo 120.
-    // total count is the number of unique packets counted in the interval.
-    // primary count counts packets received on the primary path.
-    // secondary-only count tracks packets initially received only on the secondary path; it is adjusted if a corresponding primary copy later arrives.
-    connection_stats_blob: Option<[u8; 4]>,
-}
-
-impl FTAudioControlData {
-    fn delay_ms(&self) -> Option<u32> {
-        self.q13_one_way_delay.map(|i| i as u32 * 125 / 1024)
-    }
-
-    fn from_ext(profile: u16, mut payload: Vec<u8>) -> Self {
-        let marker = profile >> 8;
-        let feedback_sequence = u16::from_be_bytes(payload.drain(..2).collect::<Vec<_>>().try_into().unwrap());
-        let total_kb_recv = u16::from_be_bytes(payload.drain(..2).collect::<Vec<_>>().try_into().unwrap());
-        let packed_audio_receive_stats = u16::from_be_bytes(payload.drain(..2).collect::<Vec<_>>().try_into().unwrap());
-        let queuing_delay = if (marker & 0x01) != 0 {
-            Some(u16::from_be_bytes(payload.drain(..2).collect::<Vec<_>>().try_into().unwrap()))
-        } else { None };
-        let current_send_timestamp = if (marker & 0x01) != 0 {
-            Some(u16::from_be_bytes(payload.drain(..2).collect::<Vec<_>>().try_into().unwrap()))
-        } else { None };
-        let q13_one_way_delay = if (marker & 0x01) != 0 {
-            Some(u16::from_be_bytes(payload.drain(..2).collect::<Vec<_>>().try_into().unwrap()))
-        } else { None };
-        let packed_video_receive_stats = if (marker & 0x04) != 0 {
-            Some(u16::from_be_bytes(payload.drain(..2).collect::<Vec<_>>().try_into().unwrap()))
-        } else { None };
-        let bandwidth_estimate = if (marker & 0x04) != 0 {
-            Some(u16::from_be_bytes(payload.drain(..2).collect::<Vec<_>>().try_into().unwrap()))
-        } else { None };
-        let ect = if (marker & 0x08) != 0 {
-            Some(u16::from_be_bytes(payload.drain(..2).collect::<Vec<_>>().try_into().unwrap()))
-        } else { None };
-        let ce = if (marker & 0x08) != 0 {
-            Some(u16::from_be_bytes(payload.drain(..2).collect::<Vec<_>>().try_into().unwrap()))
-        } else { None };
-        let connection_stats_blob = if (marker & 0x02) != 0 {
-            Some(payload.drain(..4).collect::<Vec<_>>().try_into().unwrap())
-        } else { None };
-        Self {
-            version: (profile >> 14) as u8,
-            rate_bucket: profile as u8,
-            feedback_sequence,
-            total_kb_recv,
-            audio_burst_loss: (packed_audio_receive_stats >> 12) as u8,
-            audio_received_packets: packed_audio_receive_stats & 0x0fff,
-            queuing_delay,
-            current_send_timestamp,
-            q13_one_way_delay,
-            video_burst_loss: packed_video_receive_stats.map(|stats| (stats >> 12) as u8),
-            video_frame_size: packed_video_receive_stats.map(|stats| ((stats >> 6) & 0x3f) as u8),
-            video_packet_loss: packed_video_receive_stats.map(|stats| (stats & 0x3f) as u8),
-            bandwidth_estimate,
-            ect,
-            ce,
-            connection_stats_blob,
-        }
-    }
-
-    fn to_ext(&self) -> (u16, Vec<u8>) {
-        let packed_audio_receive_stats = ((self.audio_burst_loss as u16 & 0x0f) << 12)
-            | self.audio_received_packets & 0x0fff;
-        let packed_video_receive_stats = self.video_burst_loss.map(|burst_loss| {
-            ((burst_loss as u16 & 0x0f) << 12)
-                | ((self.video_frame_size.unwrap_or_default() as u16 & 0x3f) << 6)
-                | self.video_packet_loss.unwrap_or_default() as u16 & 0x3f
-        });
-        let result = (self.version as u16) << 14
-            | if self.queuing_delay.is_some() { 0x0100 } else { 0 }
-            | if self.connection_stats_blob.is_some() { 0x0200 } else { 0 }
-            | if packed_video_receive_stats.is_some() { 0x0400 } else { 0 }
-            | if self.ect.is_some() { 0x0800 } else { 0 }
-            | self.rate_bucket as u16;
-        let body = [
-            self.feedback_sequence.to_be_bytes().to_vec(),
-            self.total_kb_recv.to_be_bytes().to_vec(),
-            packed_audio_receive_stats.to_be_bytes().to_vec(),
-            self.queuing_delay.map(|i| i.to_be_bytes().to_vec()).unwrap_or_default(),
-            self.current_send_timestamp.map(|i| i.to_be_bytes().to_vec()).unwrap_or_default(),
-            self.q13_one_way_delay.map(|i| i.to_be_bytes().to_vec()).unwrap_or_default(),
-            packed_video_receive_stats.map(|i| i.to_be_bytes().to_vec()).unwrap_or_default(),
-            self.bandwidth_estimate.map(|i| i.to_be_bytes().to_vec()).unwrap_or_default(),
-            self.ect.map(|i| i.to_be_bytes().to_vec()).unwrap_or_default(),
-            self.ce.map(|i| i.to_be_bytes().to_vec()).unwrap_or_default(),
-            self.connection_stats_blob.map(|i| i.to_vec()).unwrap_or_default(),
-        ].concat();
-        (result, body)
-    }
-}
-
-#[test]
-fn test_audio_ctrl() {
-    let data = decode_hex("0000000000000000f44000000000000000000000").unwrap();
-    let ext = FTAudioControlData::from_ext(0x8d00, data.clone());
-    assert_eq!(ext.to_ext(), (0x8d00, data));
-}
-
 // source is 0 (normal), 1 (screen), 2, 3, (reserved)
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -2871,6 +2807,9 @@ struct FECData {
     size: FECGroup,
     start: u8,
     start_seq: u16,
+    version: Option<u8>,
+    legacy_sizes: Option<FECLegacyParitySubheader>,
+    known_sizes: [Option<u16>; 8],
 }
 
 impl FECData {
@@ -2880,6 +2819,9 @@ impl FECData {
             size: FECGroup::new(symbols_per_packet),
             start,
             start_seq,
+            version: None,
+            legacy_sizes: None,
+            known_sizes: [None; 8],
         }
     }
 
@@ -2888,21 +2830,71 @@ impl FECData {
     }
 
     fn recover(&mut self, idx: u16) -> Option<Vec<u8>> {
+        if self.data.symbols_per_packet == 0 || self.start >= 8 || idx > self.last_idx() {
+            return None
+        }
         let position = self.start + idx as u8 * self.data.symbols_per_packet;
+        let size = if self.version == Some(0) {
+            let sizes = self.legacy_sizes.as_ref()?;
+            *sizes.payload_sizes.get(idx as usize)?
+        } else {
+            let size = self.size.recover(position)?;
+            u16::from_le_bytes(size.get(..2)?.try_into().ok()?)
+        };
+        if size as usize > self.data.rows.len() * self.data.symbols_per_packet as usize / 2 {
+            return None
+        }
         let mut data = self.data.recover(position)?;
-        let size = self.size.recover(position)?;
-        let size = u16::from_le_bytes(size[..2].try_into().unwrap());
-        data.resize(size as usize, 0);
+        data.truncate(size as usize);
         Some(data)
     }
 
-    fn ingest(&mut self, header: &FECHeader, data: &[u8]) {
+    fn ingest(&mut self, header: &FECHeader, data: &[u8]) -> bool {
+        if header.packet_index().is_none() || header.symbols_per_packet != self.data.symbols_per_packet
+            || header.start_position != self.start || self.version.is_some_and(|v| v != header.version)
+            || (header.version == 0 && header.payload_size as usize != data.len()) {
+            return false
+        }
+        if let Some(sizes) = header.legacy_parity {
+            if self.legacy_sizes.is_some_and(|previous| previous != sizes) {
+                return false
+            }
+            for (known, size) in self.known_sizes.iter().zip(&sizes.payload_sizes)
+                .take(sizes.packet_count as usize) {
+                if known.is_some_and(|known| known != *size) { return false }
+            }
+            self.legacy_sizes = Some(sizes);
+        }
+        if header.version == 0 && header.is_data {
+            let index = header.packet_index().unwrap() as usize;
+            if self.legacy_sizes.is_some_and(|sizes| sizes.payload_sizes[index] != header.payload_size)
+                || self.known_sizes[index].is_some_and(|size| size != header.payload_size) {
+                return false
+            }
+            self.known_sizes[index] = Some(header.payload_size);
+        }
+        self.version = Some(header.version);
         self.data.ingest(header, &data);
-        if let Some(parity) = &header.parity {
+        if header.version == 0 {
+            // V0 transmits original packet sizes in its parity subheader.
+        } else if let Some(parity) = &header.parity {
             self.size.ingest(header, &parity.redundant_bits_for_payload_size.to_le_bytes());
         } else {
             self.size.ingest(header, &(data.len() as u16).to_le_bytes());
         }
+        true
+    }
+
+    fn ingest_and_recover(&mut self, header: &FECHeader, data: &[u8]) -> Option<Vec<(u16, Vec<u8>)>> {
+        if !self.ingest(header, data) { return None }
+        let mut recovered = vec![];
+        // Parity can precede surviving data. Every accepted packet can finish
+        // the equations; repaired rows keep later events from re-emitting it.
+        for missing in self.missing_idx() {
+            let Some(data) = self.recover(missing) else { break };
+            recovered.push((missing, data));
+        }
+        Some(recovered)
     }
 
     fn missing_idx(&self) -> Vec<u16> {
@@ -2922,14 +2914,24 @@ impl FECData {
 
     fn get_parity<'t>(&'t mut self) -> impl Iterator<Item = (u8, u16, Vec<u8>)> + use<'t> {
         self.data.compute_parity();
-        self.size.compute_parity();
+        if self.version != Some(0) {
+            self.size.compute_parity();
+        }
 
-        (8..15)
+        (8..=15 - self.data.symbols_per_packet)
             .step_by(self.data.symbols_per_packet as usize)
             .map(|row| (row - 8, 
-                    u16::from_le_bytes(self.size.get_data(row).try_into().unwrap()), 
+                    if self.version == Some(0) { 0 } else {
+                        u16::from_le_bytes(self.size.get_data(row).try_into().unwrap())
+                    },
                     self.data.get_data(row)))
     }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FECLegacyParitySubheader {
+    pub packet_count: u8,
+    pub payload_sizes: [u16; 8],
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -2949,15 +2951,49 @@ pub struct FECHeader {
     pub start_position: u8,
     pub fec_percentage: u16,
     pub parity: Option<FECParitySubheader>,
+    pub payload_size: u16,
+    pub legacy_parity: Option<FECLegacyParitySubheader>,
 }
 
 impl FECHeader {
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != 4 && bytes.len() != 8 {
-            return None
+        let common = u32::from_be_bytes(bytes.get(..4)?.try_into().ok()?);
+        let version = (common >> 30) as u8;
+        if version == 0 {
+            let is_data = common & 0x00800000 != 0;
+            let legacy_parity = if is_data {
+                if bytes.len() != 4 { return None }
+                None
+            } else {
+                let count = u16::from_be_bytes(bytes.get(4..6)?.try_into().ok()?) as usize;
+                if count > 8 { return None }
+                let length = 6 + count * 2;
+                // Native V0 packs to a 32-bit boundary; its reader only needs
+                // the count and sizes. Padding is not another size or probe.
+                if bytes.len() < length || bytes.len() > ((length + 3) & !3) { return None }
+                let mut sizes = FECLegacyParitySubheader {
+                    packet_count: count as u8,
+                    ..Default::default()
+                };
+                for (index, size) in sizes.payload_sizes[..count].iter_mut().enumerate() {
+                    *size = u16::from_be_bytes(bytes.get(6 + index * 2..8 + index * 2)?.try_into().ok()?);
+                }
+                Some(sizes)
+            };
+            return Some(Self {
+                version,
+                symbols_per_packet: ((common >> 27) & 0x7) as u8,
+                position: ((common >> 24) & 0x7) as u8,
+                is_data,
+                group_id: ((common >> 16) & 0x7f) as u8,
+                last_group: common & 0x00008000 != 0,
+                start_position: ((common >> 11) & 0xf) as u8,
+                payload_size: (common & 0x7ff) as u16,
+                legacy_parity,
+                ..Default::default()
+            })
         }
-
-        let common = u32::from_be_bytes(bytes[..4].try_into().ok()?);
+        if version != 1 || (bytes.len() != 4 && bytes.len() != 8) { return None }
         let parity = if bytes.len() == 8 {
             Some(FECParitySubheader {
                 redundant_bits_for_payload_size: u16::from_be_bytes(bytes[4..6].try_into().ok()?),
@@ -2968,7 +3004,7 @@ impl FECHeader {
         };
 
         Some(Self {
-            version: (common >> 30) as u8,
+            version,
             symbols_per_packet: ((common >> 27) & 0x7) as u8,
             position: ((common >> 23) & 0xf) as u8,
             is_data: common & 0x00400000 != 0,
@@ -2977,10 +3013,30 @@ impl FECHeader {
             start_position: ((common >> 10) & 0xf) as u8,
             fec_percentage: (common & 0x3ff) as u16,
             parity,
+            ..Default::default()
         })
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
+        if self.version == 0 {
+            let common = ((self.symbols_per_packet as u32 & 0x7) << 27)
+                | ((self.position as u32 & 0x7) << 24)
+                | ((self.is_data as u32) << 23)
+                | ((self.group_id as u32 & 0x7f) << 16)
+                | ((self.last_group as u32) << 15)
+                | ((self.start_position as u32 & 0xf) << 11)
+                | (self.payload_size as u32 & 0x7ff);
+            let mut result = common.to_be_bytes().to_vec();
+            if let Some(parity) = self.legacy_parity {
+                let count = parity.packet_count.min(8) as usize;
+                result.extend_from_slice(&(count as u16).to_be_bytes());
+                for size in &parity.payload_sizes[..count] {
+                    result.extend_from_slice(&size.to_be_bytes());
+                }
+                result.resize((result.len() + 3) & !3, 0);
+            }
+            return result
+        }
         let common = ((self.version as u32 & 0x3) << 30)
             | ((self.symbols_per_packet as u32 & 0x7) << 27)
             | ((self.position as u32 & 0xf) << 23)
@@ -2996,6 +3052,36 @@ impl FECHeader {
         }
         result
     }
+
+    // Offset from the group's first data RTP sequence. Preserve the current
+    // transport convention: every parity packet reuses the final data sequence.
+    fn packet_index(&self) -> Option<u16> {
+        let stride = self.symbols_per_packet;
+        // The native 8/data-count layout produces 1, 2 or 4 symbols for
+        // protected multi-packet groups. Other strides cannot represent the
+        // fixed two-byte V1 size block in this recovery implementation.
+        if !matches!(stride, 1 | 2 | 4) || self.start_position >= 8 { return None }
+        let remaining = 8 - self.start_position;
+        if remaining % stride != 0 { return None }
+        let data_packets = remaining / stride;
+        match self.version {
+            0 if self.parity.is_none() && self.is_data == self.legacy_parity.is_none() => {
+                if self.legacy_parity.is_some_and(|p| p.packet_count != data_packets) { return None }
+            },
+            1 if self.legacy_parity.is_none() && self.is_data == self.parity.is_none() => {},
+            _ => return None,
+        }
+        let offset = if self.is_data {
+            self.position.checked_sub(self.start_position)?
+        } else { self.position };
+        let limit = if self.is_data { 8 } else { 7 };
+        if self.position.checked_add(stride)? > limit || offset % stride != 0 { return None }
+        Some(if self.is_data { (offset / stride) as u16 } else { (data_packets - 1) as u16 })
+    }
+}
+
+fn fec_rtp_sequence(next: u16, is_data: bool) -> u16 {
+    next.wrapping_sub(if is_data { 0 } else { 1 })
 }
 
 // VCMediaControlInfoFaceTimeVideo
@@ -3012,29 +3098,38 @@ struct FTVideoControlData {
 }
 
 impl FTVideoControlData {
-    fn from_ext(profile: u16, mut payload: Vec<u8>) -> Self {
+    fn from_ext(profile: u16, payload: Vec<u8>) -> Option<Self> {
+        fn take<const N: usize>(payload: &mut &[u8]) -> Option<[u8; N]> {
+            let value = payload.get(..N)?.try_into().ok()?;
+            *payload = &payload[N..];
+            Some(value)
+        }
+        let mut payload = payload.as_slice();
         let version = (profile >> 14) as u8;
-        Self {
+        Some(Self {
             version,
             camera_status: FTVideoCameraStatus::decode((profile >> 8) as u8 & 0x3f),
             ltr_bits: (profile >> 4) as u8 & 0xf,
             ltr_timestamp: if (profile & 0x2) != 0 {
-                Some(u32::from_be_bytes(payload.drain(..4).collect::<Vec<_>>().try_into().unwrap()))
+                Some(u32::from_be_bytes(take(&mut payload)?))
             } else { None },
             total_packets_per_frame: if (profile & 0x1) != 0 && version == 2 {
-                Some(u16::from_be_bytes(payload.drain(..2).collect::<Vec<_>>().try_into().unwrap()))
+                Some(u16::from_be_bytes(take(&mut payload)?))
             } else { None },
             frame_sequence_number: if (profile & 0x1) != 0 && version == 2 {
-                Some(u16::from_be_bytes(payload.drain(..2).collect::<Vec<_>>().try_into().unwrap()))
+                Some(u16::from_be_bytes(take(&mut payload)?))
             } else { None },
             fec_header: if (profile & 0x4) != 0 {
-                let header = payload.drain(..payload.len() - if profile & 0x8 != 0 { 4 } else { 0 }).collect::<Vec<_>>();
-                Some(FECHeader::from_bytes(&header).unwrap())
+                let length = payload.len().checked_sub(if profile & 0x8 != 0 { 4 } else { 0 })?;
+                let header = FECHeader::from_bytes(payload.get(..length)?)?;
+                header.packet_index()?;
+                payload = &payload[length..];
+                Some(header)
             } else { None },
             probe: if (profile & 0x8) != 0 {
-                Some(u32::from_be_bytes(payload.drain(..4).collect::<Vec<_>>().try_into().unwrap()))
+                Some(u32::from_be_bytes(take(&mut payload)?))
             } else { None },
-        }
+        })
     }
 
     fn to_ext(&self) -> (u16, Vec<u8>) {
@@ -3070,6 +3165,7 @@ fn test_fec_header() {
         start_position: 3,
         fec_percentage: 100,
         parity: None,
+        ..Default::default()
     });
     assert_eq!(header.to_bytes(), data);
 
@@ -3088,6 +3184,7 @@ fn test_fec_header() {
             redundant_bits_for_payload_size: 0x081b,
             parity_sequence_number: 0x02d6,
         }),
+        ..Default::default()
     });
     assert_eq!(header.to_bytes(), data);
 }
@@ -3163,55 +3260,68 @@ struct PendingControlMessage {
 }
 
 enum SendControl {
-    Send (PendingControlMessage),
-    Ack (u64, u64),
+    Send(PendingControlMessage),
+    Ack(u64, u64),
+    FlushParticipant(u64),
+    FlushAll,
 }
 
 fn manage_control(link: Weak<GlobalLink>) -> tokio::sync::mpsc::Sender<SendControl> {
     let (control_send, mut control_recv) = tokio::sync::mpsc::channel(1024);
     tokio::spawn(async move {
-        let mut pending_messages: BTreeMap<Instant, PendingControlMessage> = BTreeMap::new();
+        let epoch = Instant::now();
+        let mut pending_messages = ControlRetryQueue::<Vec<u8>>::default();
         loop {
-            let far_future = Instant::now() + Duration::from_secs(1 * 60 * 60);
+            let deadline = pending_messages.next_deadline().map(|elapsed| epoch + elapsed);
             select! {
+                // Process queued ACK/flush before a simultaneously-ready resend.
+                biased;
                 recv = control_recv.recv() => {
-                    let Some(i) = recv else { break };
-                    match i {
-                        SendControl::Send(i) => {
-                            info!("Control Sending message! {i:?}");
-                            let Some(link) = link.upgrade() else {
-                                break;
-                            };
-                            if let Err(e) = link.send_control(i.participant as i64, &i.data) {
+                    let Some(command) = recv else { break };
+                    match command {
+                        SendControl::Send(item) => {
+                            if !pending_messages.insert(item.participant, item.transaction,
+                                item.data.clone(), epoch.elapsed(), None, RetryMode::Normal) {
+                                warn!("Duplicate control transaction {} for {}", item.transaction, item.participant);
+                                continue
+                            }
+                            let Some(link) = link.upgrade() else { break };
+                            if let Err(e) = link.send_control(item.participant as i64, &item.data) {
                                 warn!("Control send error {e}");
                             }
-                            info!("Control sent message!");
-                            pending_messages.insert(Instant::now() + Duration::from_millis(500), i);
                         },
-                        SendControl::Ack(a, b) => {
-                            let bef = pending_messages.len();
-                            pending_messages.retain(|_k, v| v.transaction != a || v.participant != b);
-                            if bef != pending_messages.len() {
-                                info!("Control Acknolwedeged message!");
-                            }
-                            continue;
+                        SendControl::Ack(transaction, participant) => {
+                            pending_messages.ack(participant, transaction);
+                        },
+                        SendControl::FlushParticipant(participant) => {
+                            pending_messages.flush_participant(participant);
+                        },
+                        SendControl::FlushAll => { pending_messages.flush(); },
+                    }
+                },
+                _ = async {
+                    match deadline {
+                        Some(deadline) => sleep_until(deadline).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    let Some(link) = link.upgrade() else { break };
+                    for action in pending_messages.poll(epoch.elapsed()) {
+                        match action {
+                            ControlAction::Send { participant, payload, .. } => {
+                                if let Err(e) = link.send_control(participant as i64, &payload) {
+                                    warn!("Control resend error {e}");
+                                }
+                            },
+                            ControlAction::Retired { participant, transaction, reason } => {
+                                warn!("Retired control transaction {transaction} for {participant}: {reason:?}");
+                            },
                         }
                     }
                 },
-                _ = sleep_until(pending_messages.keys().next().copied().unwrap_or(far_future)) => {
-                    if pending_messages.is_empty() { continue };
-                    let next = pending_messages.pop_first().unwrap().1;
-                    info!("Control Resending message with {next:?}");
-                    let Some(link) = link.upgrade() else {
-                        break;
-                    };
-                    if let Err(e) = link.send_control(next.participant as i64, &next.data) {
-                        warn!("Control resend error {e}");
-                    }
-                    pending_messages.insert(Instant::now() + Duration::from_millis(500), next);
-                },
             }
         }
+        pending_messages.flush();
         info!("CLEANUP: Control loop torn down!");
     });
     control_send
@@ -3330,6 +3440,7 @@ pub struct VideoSender {
     link: Arc<GlobalLink>,
     packet_buffer: Arc<std::sync::Mutex<AVChannelHistory>>,
     pub camera_source: FTVideoCameraStatus,
+    feedback: Arc<ParticipantFeedbackState>,
 }
 
 // RTP uses serial-number ordering, not unsigned max: a legitimate wrap must
@@ -3543,7 +3654,8 @@ impl VideoSender {
             ..Default::default()
         };
 
-        if payloads_len > 3 && self.to_participant.is_some() {
+        if payloads_len > 3 && self.to_participant.is_some()
+            && payloads.iter().all(|packet| packet.1.len() <= 0x7ff) {
             let symbols_per_packet: u8 = match payloads_len {
                 2 => 4,
                 3 | 4 => 2,
@@ -3561,13 +3673,17 @@ impl VideoSender {
                 };
                 let group_len = group.len();
                 let last_group = chunk_idx + 1 == nchunks;
+                let mut legacy_sizes = FECLegacyParitySubheader {
+                    packet_count: group_len as u8,
+                    ..Default::default()
+                };
+                for (size, packet) in legacy_sizes.payload_sizes.iter_mut().zip(&group) {
+                    *size = packet.1.len() as u16;
+                }
                 for (idx, mut packet) in group.into_iter().enumerate() {
                     let header = FECHeader {
-                        // FEC header version 0: Apple's 1:1 receiver rejects
-                        // version-1 headers ("FECHeader_UnpackHeaderFromBuffer:
-                        // FEC Header version mismatch expected 0, but got 1")
-                        // and drops the packet. The version-1 test vectors
-                        // below were captured on group-call traffic.
+                        // Native V0 common fields and explicit payload sizes;
+                        // V1's loss percentage/redundant-size fields are separate.
                         version: 0,
                         symbols_per_packet,
                         position: start + idx as u8 * symbols_per_packet,
@@ -3575,11 +3691,12 @@ impl VideoSender {
                         group_id: chunk_idx as u8,
                         last_group,
                         start_position: start,
-                        fec_percentage: 100 * parity_packets as u16 / group_len as u16,
-                        parity: None,
+                        payload_size: packet.1.len() as u16,
+                        ..Default::default()
                     };
 
-                    fec.ingest(&header, &packet.1);
+                    let accepted = fec.ingest(&header, &packet.1);
+                    debug_assert!(accepted);
                     packet.0 = Some(header);
                     payloads.push(packet);
                 }
@@ -3588,7 +3705,7 @@ impl VideoSender {
                     payloads_len = payloads.len();
                 }
                 
-                for (position, size_red, data) in fec.get_parity().take(parity_packets as usize) {
+                for (position, _, data) in fec.get_parity().take(parity_packets as usize) {
                     let header = FECHeader {
                         version: 0,
                         symbols_per_packet,
@@ -3597,11 +3714,9 @@ impl VideoSender {
                         group_id: chunk_idx as u8,
                         last_group,
                         start_position: start,
-                        fec_percentage: 100 * parity_packets as u16 / group_len as u16,
-                        parity: Some(FECParitySubheader {
-                            redundant_bits_for_payload_size: size_red,
-                            parity_sequence_number: self.fec_number,
-                        }),
+                        payload_size: data.len() as u16,
+                        legacy_parity: Some(legacy_sizes),
+                        ..Default::default()
                     };
 
                     self.fec_number = self.fec_number.wrapping_add(1);
@@ -3639,7 +3754,7 @@ impl VideoSender {
                     extension: true,
                     marker: idx == payloads_len - 1,
                     payload_type: 100,
-                    sequence_number: self.sequence_number - if !is_data { 1 /* we already incremented, undo that. */ } else { 0 },
+                    sequence_number: fec_rtp_sequence(self.sequence_number, is_data),
                     timestamp,
                     ssrc: self.ssrc,
                     csrc: vec![],
@@ -3681,8 +3796,9 @@ impl VideoSender {
             } else if pace_handle.is_some() && idx >= PACE_INITIAL_BURST {
                 deferred.push(p);
             } else {
-                if let Err(e) = self.link.send(&p) {
-                    warn!("Failed to send vidoe packet {e}!");
+                match self.link.send(&p) {
+                    Ok(()) => self.feedback.record_video_sent(),
+                    Err(e) => warn!("Failed to send video packet {e}!"),
                 }
             }
 
@@ -3690,14 +3806,16 @@ impl VideoSender {
 
         if let (Some(handle), false) = (pace_handle, deferred.is_empty()) {
             let link = self.link.clone();
+            let feedback = self.feedback.clone();
             let per_tick = deferred.len().div_ceil(PACE_TICKS).max(2);
             handle.spawn(async move {
                 let mut iter = deferred.into_iter().peekable();
                 while iter.peek().is_some() {
                     sleep(Duration::from_millis(1)).await;
                     for p in iter.by_ref().take(per_tick) {
-                        if let Err(e) = link.send(&p) {
-                            warn!("Failed to send paced video packet {e}!");
+                        match link.send(&p) {
+                            Ok(()) => feedback.record_video_sent(),
+                            Err(e) => warn!("Failed to send paced video packet {e}!"),
                         }
                     }
                 }
@@ -3790,7 +3908,8 @@ pub struct AudioSender {
     packet_buffer: Arc<std::sync::Mutex<AVChannelHistory>>,
 
     is_u1: bool,
-    last_worst: (u8, u8),
+    last_worst: (u16, u16),
+    feedback: Arc<ParticipantFeedbackState>,
     aac_encoder: Option<facetime_aac::FaceTimeAacEncoder>,
 }
 
@@ -3843,7 +3962,7 @@ impl AudioSender {
             if q13_timestamp.is_nan() {
                 q13_timestamp_int = u16::MAX;
             }
-            if worst.0 == 0 && stats.video_burst_loss.load(Ordering::Relaxed) == 0 {
+            if q13_timestamp_int != u16::MAX && worst.0 == 0 && stats.video_burst_loss.load(Ordering::Relaxed) == 0 {
                 // When there is zero packet loss on the wire, high Q13 delay is
                 // clock drift or scheduling jitter, NOT network bufferbloat.
                 // Clamping to <= 1200 (~146ms) prevents the Mac from falsely
@@ -3862,9 +3981,12 @@ impl AudioSender {
                 (queue_delay * 128 / 125).clamp(1, u16::MAX as u64)
             };
 
+            let feedback_version = self.feedback.configuration() as u8;
+            let packed_loss = audio_feedback::loss_stats_enabled(feedback_version);
+            let (video_frame_size, video_packet_loss) = audio_feedback::normalize_frame_loss(worst.1, worst.0);
             let extension = FTAudioControlData {
                 version: 2,
-                total_kb_recv: (stats.total_recv_bytes.load(Ordering::Relaxed) / 1000) as u16,
+                total_kbytes_recv: (stats.total_recv_bytes.load(Ordering::Relaxed) / 1000) as u16,
                 feedback_sequence: stats.last_feedback.load(Ordering::Relaxed),
                 current_send_timestamp: Some(current_send),
                 audio_burst_loss: stats.audio_burst_loss.swap(0, Ordering::Relaxed),
@@ -3872,8 +3994,9 @@ impl AudioSender {
                 queuing_delay: Some(queue_delay_1024 as u16),
                 q13_one_way_delay: Some(q13_timestamp_int),
                 video_burst_loss: Some(stats.video_burst_loss.swap(0, Ordering::Relaxed)),
-                video_packet_loss: Some(worst.0),
-                video_frame_size: Some(worst.1), // do not count htis anymore
+                video_packet_loss: packed_loss.then_some(video_packet_loss),
+                video_frame_size: packed_loss.then_some(video_frame_size),
+                video_received_packets: (!packed_loss).then(|| self.feedback.video_received()),
                 bandwidth_estimate: Some(0),
                 ect: Some(0),
                 ce: Some(0),
@@ -3889,7 +4012,7 @@ impl AudioSender {
 
             // let extension = FTAudioControlData {
             //     version: 2,
-            //     total_kb_recv: (stats.total_recv_bytes.load(Ordering::Relaxed) / 1000) as u16,
+            //     total_kbytes_recv: (stats.total_recv_bytes.load(Ordering::Relaxed) / 1000) as u16,
             //     feedback_sequence: stats.last_feedback.load(Ordering::Relaxed),
             //     current_send_timestamp: Some(((timestamp as u64 + 52676) * 16 / 375) as u16),
             //     audio_burst_loss: stats.audio_burst_loss.swap(0, Ordering::Relaxed),
@@ -3906,11 +4029,14 @@ impl AudioSender {
             // };
 
             // info!("Sending ext {extension:?}");
-            extension.to_ext()
+            extension.to_ext_with_feedback_version(feedback_version).ok_or_else(|| std::io::Error::new(
+                std::io::ErrorKind::InvalidData, "incomplete FaceTime audio feedback"))?
         } else {
             (0, vec![])
         };
 
+        let feedback_stamp = (self.is_u1 && ext.1.len() >= 10)
+            .then(|| u16::from_be_bytes([ext.1[8], ext.1[9]]));
         let packet = Packet {
             header: Header {
                 version: 2,
@@ -3954,6 +4080,7 @@ impl AudioSender {
             warn!("Dropping packet {}", self.sequence_number);
         } else {
             self.link.send(&p)?;
+            if let Some(stamp) = feedback_stamp { self.feedback.record_audio_sent(stamp); }
         }
         Ok(())
     }
@@ -4167,6 +4294,9 @@ impl AVSession {
                             }
                         }
                         drop(lock);
+                        for removed in old_participants.difference(&set) {
+                            let _ = session.outgoing_control.send(SendControl::FlushParticipant(*removed)).await;
+                        }
                         if old_participants.len() == 1 && set.len() > 1 {
                             if let Err(e) = session.initiate_u1_switch(false, old_participants.into_iter().next().unwrap()).await {
                                 warn!("Initiated U1 False failed {e}");
@@ -4339,7 +4469,7 @@ impl AVSession {
     }
 
     pub async fn create_audio_sender(&self, stream: Option<u32>, extra_streams: &[u32]) -> Result<AudioSender, PushError> {
-        let state = self.state.lock().await;
+        let mut state = self.state.lock().await;
 
         let group_stream = stream.map(|i| self.av_config.audio_streams.get(&i).unwrap());
         let ssrc = group_stream.map(|i| i.rtp_ssrc()).unwrap_or(self.av_config.audio_ssrc);
@@ -4364,6 +4494,9 @@ impl AVSession {
             None
         };
 
+        // Retain the same handle even if the sender predates the first AVC import.
+        let feedback = to_participant.map(|p| state.encryption_states.entry(p as u64)
+            .or_default().feedback.clone()).unwrap_or_default();
         let mut buffer = self.ssrc_packet_buffer.lock().unwrap();
         Ok(AudioSender {
             context: Context::new(
@@ -4388,12 +4521,13 @@ impl AVSession {
 
             is_u1: group_stream.is_none(),
             last_worst: (0, 0),
+            feedback,
             aac_encoder: None,
         })
     }
 
     pub async fn create_video_sender(&self, stream: Option<u32>, extra_streams: &[u32]) -> Result<VideoSender, PushError> {
-        let state = self.state.lock().await;
+        let mut state = self.state.lock().await;
 
         let group_stream = stream.map(|i| self.av_config.video_streams.get(&i).unwrap());
         let ssrc = group_stream.map(|i| i.rtp_ssrc()).unwrap_or(self.av_config.video_ssrc);
@@ -4428,6 +4562,9 @@ impl AVSession {
             None
         };
 
+        let feedback = to_participant.map(|p| state.encryption_states.entry(p as u64)
+            .or_default().feedback.clone()).unwrap_or_default();
+
         info!("Video send main ssrc {} extra {:?}", ssrc, extra_ssrcs);
 
         let (sequence_number, frame_number, probe_number, fec_number) = self.ssrc_packet_buffer.lock().unwrap().get(&ssrc)
@@ -4461,6 +4598,7 @@ impl AVSession {
             link: self.link.clone(),
             last_probe: None,
             camera_source: Default::default(),
+            feedback,
             sent_packets: 0,
             sent_octets: 0,
             last_sr_send: None,
@@ -4506,6 +4644,7 @@ impl AVSession {
 
     async fn call_failed(&self) {
         // WARNING: no guarantee any lock will be free at this point
+        let _ = self.outgoing_control.send(SendControl::FlushAll).await;
         let _ = self.control_sender.try_send(AVControlCommand::CallFailed);
     }
 
@@ -4761,11 +4900,11 @@ impl AVSession {
             &encrypted[..]
         ].concat();
         if let Some(track) = track_transaction {
-            let _ = self.outgoing_control.send(SendControl::Send(PendingControlMessage {
+            self.outgoing_control.send(SendControl::Send(PendingControlMessage {
                 transaction: track,
                 participant: to_participant,
                 data,
-            })).await;
+            })).await.map_err(|_| PushError::ResourceClosed)?;
         } else {
             self.link.send_control(to_participant as i64, &data)?;
         }
@@ -4811,7 +4950,15 @@ impl AVSession {
                             };
                             info!("Responding {} NACK;", nack.media_ssrc);
                             packet.probe_id = None; // retramsmitted packets are not part of a probe.
-                            let _ = self.link.send(&packet);
+                            if self.link.send(&packet).is_ok()
+                                && packet.packet.get(1).and_then(|byte| ChannelType::from_payload(byte & 0x7f))
+                                    .is_some_and(|kind| matches!(kind, ChannelType::H264 | ChannelType::H265)) {
+                                if let Some(participant) = packet.participant {
+                                    if let Some(peer) = self.state.lock().await.encryption_states.get(&(participant as u64)) {
+                                        peer.feedback.record_video_sent();
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -4890,7 +5037,7 @@ impl AVSession {
                     },
                     VcccMessageWrapper { acknowledgement: Some(ack), .. } => {
                         info!("Got ack {ack:?}");
-                        let _ = self.outgoing_control.try_send(SendControl::Ack(ack.transaction_id(), id as u64));
+                        let _ = self.outgoing_control.send(SendControl::Ack(ack.transaction_id(), id as u64)).await;
                     },
                     _ => {}
                 }
@@ -4906,17 +5053,36 @@ impl AVSession {
                 let u1 = self.u1.load(Ordering::Relaxed);
 
                 if is_audio && u1 && !report.history.is_empty() {
+                    let Some((participant, configuration)) = report.feedback_context else { return Ok(()) };
+                    let feedback = {
+                        let mut state = self.state.lock().await;
+                        let Some(peer) = state.encryption_states.get(&participant)
+                            .filter(|peer| peer.feedback.accepts_report(configuration)) else {
+                            state.u1_clean_streak = 0;
+                            return Ok(())
+                        };
+                        peer.feedback.clone()
+                    };
+                    let cumulative = (!audio_feedback::loss_stats_enabled(configuration as u8))
+                        .then(|| report.history.iter().filter_map(|entry| {
+                            feedback.observe_cumulative(entry.feedback_sequence, entry.video_received_packets?)
+                        }).last()).flatten();
+                    if !audio_feedback::loss_stats_enabled(configuration as u8) && cumulative.is_none() {
+                        self.state.lock().await.u1_clean_streak = 0;
+                        return Ok(())
+                    }
                     let q13_slope = quality_feedback::q13_slope(report.history.iter()
                         .filter_map(|f| Some((f.feedback_sequence, f.q13_one_way_delay?))));
                     let q13_rising = q13_slope.is_some_and(|s| s >= quality_feedback::Q13_SLOPE_RISING);
-                    let latest_q13 = report.history.iter().filter_map(|f| f.q13_one_way_delay).last();
-                    let latest_q13 = latest_q13.unwrap_or_default();
+                    let latest_q13 = quality_feedback::latest_q13(report.history.iter()
+                        .filter_map(|f| f.q13_one_way_delay));
 
                     // AFRC replays the most recent loss entry when there is no new one. Collapse
                     // consecutive identical entries so one damaged frame is not treated as
                     // sustained loss merely because it was repeated on several audio packets.
-                    let (video_packets_lost, video_packets_expected, damaged_video_frames, video_samples) = report.history.iter()
-                        .filter_map(|feedback| Some((feedback.video_packet_loss?, feedback.video_frame_size?)))
+                    let packed = report.history.iter()
+                        .filter_map(|feedback| feedback.packed_video_loss(configuration as u8))
+                        .map(|(size, loss)| (loss, size))
                         .filter(|(_, frame_size)| *frame_size != 0)
                         .scan(None, |previous, sample| {
                             let fresh = (*previous != Some(sample)).then_some(sample);
@@ -4932,6 +5098,9 @@ impl AVSession {
                                 samples + 1,
                             )
                         });
+                    let (video_packets_lost, video_packets_expected, damaged_video_frames, video_samples) =
+                        cumulative.map(|sample| (sample.lost, sample.expected, usize::from(sample.lost != 0), 1))
+                            .unwrap_or(packed);
                     let video_loss_fraction = (video_packets_expected != 0)
                         .then(|| video_packets_lost as f64 / video_packets_expected as f64);
                     let sustained_packet_loss = video_samples >= 2
@@ -4985,31 +5154,22 @@ impl AVSession {
                     // absolute threshold safe on other networks: a link that simply sits at a high
                     // one-way delay (cellular, satellite) reads high but not rising, so it does not
                     // trip. Only a link whose delay is climbing -- a queue actually filling -- does.
-                    let high_q13 = latest_q13 >= 2000;
-                    let q13_drop_tiers = if sustained_packet_loss {
-                        match latest_q13 {
-                            8000.. => 4,
-                            5000.. => 3,
-                            3000.. => 2,
-                            2000.. => 1,
-                            _ => 0,
-                        }
-                    } else if high_q13 && q13_rising && video_packets_lost > 0 {
-                        // Early warning only, and only if actual loss was observed on the wire.
-                        // Without loss, q13 represents link latency/jitter, not queue collapse,
-                        // and acting on it alone collapses video to 10kbps unrecoverably.
-                        1
-                    } else {
-                        0
-                    };
+                    let q13_drop_tiers = quality_feedback::q13_drop_tiers(
+                        latest_q13, q13_slope, sustained_packet_loss, video_packets_lost);
                     let drop_tiers = loss_drop_tiers.max(q13_drop_tiers);
 
                     let mut state = self.state.lock().await;
+                    if !state.encryption_states.get(&participant)
+                        .is_some_and(|peer| peer.feedback.accepts_report(configuration)) {
+                        state.u1_clean_streak = 0;
+                        return Ok(())
+                    }
 
                     // A single clean report means nothing -- the loss signal reads zero repeatedly
                     // mid-collapse. Only a run of them is evidence the path is actually healthy.
                     let report_is_clean = loss <= U1_LOSS_IGNORE
                         && video_samples != 0
+                        && latest_q13.is_some()
                         && !q13_rising;
                     state.u1_clean_streak = if report_is_clean { state.u1_clean_streak + 1 } else { 0 };
 
@@ -5028,7 +5188,8 @@ impl AVSession {
 
                     // Rising delay blocks a step up even before loss arrives. Keep
                     // the existing loss requirement for cuts to prevent delay-only collapse.
-                    let wants_upgrade = quality_feedback::q13_allows_upgrade(q13_slope)
+                    let wants_upgrade = latest_q13.is_some()
+                        && quality_feedback::q13_allows_upgrade(q13_slope)
                         && no_recent_packet_loss
                         && !blocked_by_ceiling
                         && state.u1_clean_streak >= U1_CLEAN_STREAK;
@@ -5063,7 +5224,7 @@ impl AVSession {
                     };
 
                     info!(
-                        "U1 send rate bucket {bucket} held_for={held_for:?}: rate={}kbps(rung {}) q13 slope={q13_slope:?} latest={latest_q13} rising={q13_rising}, video loss={video_packets_lost}/{video_packets_expected} ({video_loss_fraction:?}) damaged={damaged_video_frames}/{video_samples} sustained={sustained_packet_loss} no_recent_loss={no_recent_packet_loss}, clean_streak={}/{} failed_rung={failed_rung:?} bump_failures={}",
+                        "U1 send rate bucket {bucket} held_for={held_for:?}: rate={}kbps(rung {}) q13 slope={q13_slope:?} latest={latest_q13:?} rising={q13_rising}, video loss={video_packets_lost}/{video_packets_expected} ({video_loss_fraction:?}) damaged={damaged_video_frames}/{video_samples} sustained={sustained_packet_loss} no_recent_loss={no_recent_packet_loss}, clean_streak={}/{} failed_rung={failed_rung:?} bump_failures={}",
                         BITRATE_TABLE[state.current_video_bitrate],
                         state.current_video_bitrate,
                         state.u1_clean_streak,
@@ -6298,7 +6459,7 @@ impl AVConfig {
                 capabilities: Some(0),
                 switches: Some(201326586),
                 one_to_one_mode_supported: Some(true),
-                media_control_info_sub_version: Some(0),
+                media_control_info_sub_version: Some(audio_feedback::LOCAL_FEC_FEEDBACK_VERSION as u32),
                 link_probing_capability_version: Some(0),
             }),
             access_network_type: None,
