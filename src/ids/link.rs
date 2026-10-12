@@ -264,6 +264,10 @@ fn check_length_prefix(body: &[u8]) -> bool {
 }
 
 impl QRMessage {
+    pub(crate) fn is_retransmitted(&self) -> bool {
+        self.attr_retransmitted_packet.unwrap_or(false)
+    }
+
     fn save_good_packet(&self) {
         if self.attr_retransmitted_packet == Some(true) { return }
         let Some(channel) = self.channel_data else { return };

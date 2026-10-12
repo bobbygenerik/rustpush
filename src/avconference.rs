@@ -6,6 +6,8 @@ mod audio_feedback;
 mod control_retry;
 #[path = "video_receive_diagnostics.rs"]
 mod video_receive_diagnostics;
+#[path = "avconference_nack.rs"]
+mod video_nack;
 use control_retry::{ControlAction, ControlRetryQueue, RetryMode};
 use audio_feedback::{FTAudioControlData, ParticipantFeedbackState, CumulativeCounter12};
 
@@ -1697,7 +1699,43 @@ impl IncomingFrameHandler {
         let mut stat_tracker = RecvStatTracker::new(stats.clone(), audio);
         let diagnostic_epoch = Instant::now();
         let mut video_windows = HashMap::<(u32, u8), video_receive_diagnostics::VideoReceiveWindow>::new();
-        while let Ok(command) = channel.recv() {
+        let mut video_nacks = HashMap::<u32, (i64, video_nack::VideoNackGenerator)>::new();
+        let mut retry_enqueue_after = Duration::ZERO;
+        loop {
+            let now = diagnostic_epoch.elapsed();
+            if now >= retry_enqueue_after {
+                for (&media_ssrc, (participant, generator)) in &mut video_nacks {
+                    let due = generator.ready(now);
+                    if due.is_empty() { continue; }
+                    let nack = TransportLayerNack {
+                        sender_ssrc: *rtcp_sender.entry(media_ssrc).or_insert_with(|| rand::random()),
+                        media_ssrc,
+                        nacks: due.iter().map(|&sequence| NackPair { packet_id: sequence, lost_packets: 0 }).collect(),
+                    }.marshal().unwrap();
+                    match control.try_send(AVInternalMessage::RtcpOutgoing(*participant, nack)) {
+                        Ok(()) => {
+                            info!("FaceTime video NACK recovery ssrc={} requested={}", media_ssrc, due.len());
+                            generator.sent(&due, now);
+                        },
+                        Err(e) => {
+                            warn!("Failed to queue video nack {e}");
+                            // Local queue backpressure, not an on-wire retry policy.
+                            retry_enqueue_after = now + Duration::from_millis(10);
+                            break;
+                        },
+                    }
+                }
+            }
+            let deadline = video_nacks.values().filter_map(|(_, generator)| generator.next_deadline(now)).min();
+            let command = if let Some(deadline) = deadline {
+                match channel.recv_timeout(deadline.max(retry_enqueue_after).saturating_sub(diagnostic_epoch.elapsed())) {
+                    Ok(command) => command,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            } else {
+                match channel.recv() { Ok(command) => command, Err(_) => break }
+            };
             if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let packets = match command {
                     IncomingFrameCommand::Packet(header, packet) => vec![(header, packet)],
@@ -1734,6 +1772,11 @@ impl IncomingFrameHandler {
                         packets_process
                     },
                     IncomingFrameCommand::ParticipantStateNotEmpty(participant, state) => {
+                        if !state {
+                            video_nacks.retain(|_, (owner, _)| *owner as u64 != participant);
+                            ssrc_seq.retain(|id, _| master_ssrc_map.get(id).and_then(|(master, _)| ssrc_map.get(master))
+                                .is_some_and(|ssrc| ssrc.owner != participant));
+                        }
                         for ssrc in ssrc_map.values_mut() {
                             if ssrc.owner != participant { continue }
                             if !state {
@@ -1794,40 +1837,11 @@ impl IncomingFrameHandler {
                     if !ssrc.participant_active { continue }
 
                     // info!("Header {:?} {} {}", header, recv.packet_id, duration_since_epoch().as_secs_f64());
-                    let tracked_packets = if let Some(prev_seq) = ssrc_seq.get_mut(&header.ssrc) {
-                        let jump = header.sequence_number.wrapping_sub(*prev_seq);
-                        if let Some((first_missing, missing_count)) = missing_packet_range(*prev_seq, header.sequence_number) {
-                            // we dropped packets
-                            let nack: BytesMut = TransportLayerNack {
-                                sender_ssrc: *rtcp_sender.entry(header.ssrc).or_insert_with(|| rand::random()),
-                                media_ssrc: header.ssrc,
-                                nacks: range_to_pair(first_missing, missing_count)
-                            }.marshal().unwrap();
-                            warn!("Sending NACK for {} packets at {}, idx {:?} {}", missing_count, first_missing, header, encode_hex(&recv.data));
-                            if let Err(e) = control.try_send(AVInternalMessage::RtcpOutgoing(participant, nack)) {
-                                warn!("Failed to queue nack {e}");
-                            }
-                        }
+                    // Compute the prospective count without letting unauthenticated
+                    // packets advance sequence/recovery state.
+                    let jump = ssrc_seq.get(&header.ssrc).map(|previous| header.sequence_number.wrapping_sub(*previous));
+                    let tracked_packets = jump.map(|jump| if jump < 1500 { jump } else { 0 }).unwrap_or(1);
 
-                        if jump > 1 && jump < 1500 {
-                            if audio {
-                                stats.audio_burst_loss.fetch_max(audio_feedback::burst_loss_for_jump(jump), Ordering::Relaxed);
-                            } else {
-                                stats.video_burst_loss.fetch_max(audio_feedback::burst_loss_for_jump(jump), Ordering::Relaxed);
-                            }
-                        }
-
-                        if jump < 1500 { // larger than this we presume it is sending packets in the past (wrapped around)
-                            *prev_seq = header.sequence_number;
-                            jump
-                        } else { 0 /* backwards; don't count */ }
-                    } else {
-                        ssrc_seq.insert(header.ssrc, header.sequence_number);
-                        1
-                    };
-
-                    
-                    
                     let context = ssrc.srtp_contexts.entry(header.ssrc).or_default().get_context_for_mki(mki, || {
                         let mkm = ssrc.mkms.iter().find(|i| &i.mki[..mki.len()] == mki).unwrap();
                         let key = mkm.get_key(header.ssrc);
@@ -1855,6 +1869,40 @@ impl IncomingFrameHandler {
                             continue
                         }
                     };
+                    if let Some(jump) = jump {
+                        if audio {
+                            if let Some((first_missing, missing_count)) = ssrc_seq.get(&header.ssrc)
+                                .and_then(|previous| missing_packet_range(*previous, header.sequence_number)) {
+                                let nack = TransportLayerNack {
+                                    sender_ssrc: *rtcp_sender.entry(header.ssrc).or_insert_with(|| rand::random()),
+                                    media_ssrc: header.ssrc,
+                                    nacks: range_to_pair(first_missing, missing_count),
+                                }.marshal().unwrap();
+                                warn!("Sending audio NACK for {} packets at {} ssrc={}", missing_count, first_missing, header.ssrc);
+                                if let Err(e) = control.try_send(AVInternalMessage::RtcpOutgoing(participant, nack)) {
+                                    warn!("Failed to queue nack {e}");
+                                }
+                            }
+                        }
+                        if jump > 1 && jump < 1500 {
+                            if audio {
+                                stats.audio_burst_loss.fetch_max(audio_feedback::burst_loss_for_jump(jump), Ordering::Relaxed);
+                            } else {
+                                stats.video_burst_loss.fetch_max(audio_feedback::burst_loss_for_jump(jump), Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    if jump.is_none_or(|jump| jump < 1500) {
+                        ssrc_seq.insert(header.ssrc, header.sequence_number);
+                    }
+                    if matches!(payload, AVSessionPayload::H264 | AVSessionPayload::H265) {
+                        let (_, generator) = video_nacks.entry(header.ssrc)
+                            .and_modify(|(owner, generator)| {
+                                if *owner != participant { *generator = Default::default(); *owner = participant; }
+                            }).or_insert_with(|| (participant, Default::default()));
+                        generator.observe(header.sequence_number, diagnostic_epoch.elapsed(),
+                            recv.original.as_ref().is_some_and(|header| header.is_retransmitted()));
+                    }
                     if matches!(payload, AVSessionPayload::H264 | AVSessionPayload::H265) {
                         let parity = video_meta.as_ref().and_then(|v| v.fec_header.as_ref())
                             .is_some_and(|fec| !fec.is_data);
@@ -1942,6 +1990,9 @@ impl IncomingFrameHandler {
                             packets.push(unmarshalled);
                         }
                         for (missing, data) in recovered {
+                            if let Some((_, generator)) = video_nacks.get_mut(&header.ssrc) {
+                                generator.fulfill(group.start_seq.wrapping_add(missing), diagnostic_epoch.elapsed(), false);
+                            }
                             packets.push(Packet {
                                 header: Header {
                                     sequence_number: group.start_seq.wrapping_add(missing),
