@@ -4,6 +4,8 @@ mod quality_feedback;
 mod audio_feedback;
 #[path = "avconference_control.rs"]
 mod control_retry;
+#[path = "video_receive_diagnostics.rs"]
+mod video_receive_diagnostics;
 use control_retry::{ControlAction, ControlRetryQueue, RetryMode};
 use audio_feedback::{FTAudioControlData, ParticipantFeedbackState, CumulativeCounter12};
 
@@ -1693,6 +1695,8 @@ impl IncomingFrameHandler {
         // ssrc to probe_id to probe state
         let mut counter: u32 = 0;
         let mut stat_tracker = RecvStatTracker::new(stats.clone(), audio);
+        let diagnostic_epoch = Instant::now();
+        let mut video_windows = HashMap::<(u32, u8), video_receive_diagnostics::VideoReceiveWindow>::new();
         while let Ok(command) = channel.recv() {
             if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let packets = match command {
@@ -1851,6 +1855,17 @@ impl IncomingFrameHandler {
                             continue
                         }
                     };
+                    if matches!(payload, AVSessionPayload::H264 | AVSessionPayload::H265) {
+                        let parity = video_meta.as_ref().and_then(|v| v.fec_header.as_ref())
+                            .is_some_and(|fec| !fec.is_data);
+                        let window = video_windows.entry((header.ssrc, header.payload_type)).or_default();
+                        if let Some(report) = window.packet(diagnostic_epoch.elapsed(), header.timestamp,
+                            video_meta.as_ref().and_then(|v| v.frame_sequence_number),
+                            parity, unmarshalled.payload.len()) {
+                            info!("FaceTime RX stages ssrc={} pt={} group={} stream_group={} {:?}",
+                                header.ssrc, header.payload_type, is_group, ssrc.stream_index, report);
+                        }
+                    }
                     if !is_group && matches!(payload, AVSessionPayload::H264 | AVSessionPayload::H265) {
                         // Count authenticated RTP arrivals, including FEC parity; recovered
                         // synthetic packets do not add another transport arrival.
@@ -2001,11 +2016,18 @@ impl IncomingFrameHandler {
                                     ChannelType::Evs | ChannelType::Aac => None,
                                 }
                             } else { ssrc.features.get(&payload_type) };
+                            let before_footer = data.len();
+                            let footer_control = features.and_then(|_| data.last().copied());
                             if let Some(features) = features {
                                 let (decoded, meta) = features.parse_frame(&data);
                                 data = decoded;
                                 frame_meta = meta;
                                 // info!("sample {}", encode_hex(&data));
+                            }
+                            if matches!(channel_type, ChannelType::H264 | ChannelType::H265) {
+                                video_windows.entry((header_ssrc, payload_type)).or_default().frame(
+                                    data.len(), sample.prev_dropped_packets.saturating_sub(sample.prev_padding_packets),
+                                    before_footer.saturating_sub(data.len()), footer_control);
                             }
 
                             // info!("Handling packetd");
