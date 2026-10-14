@@ -802,14 +802,16 @@ impl FTClient {
                         let conn = conn_for_fir.clone();
                         let target = msg.participant;
                         let fallback_stream_id = msg.stream_id;
+                        let receive_target = msg.keyframe_target;
                         rt_handle.spawn(async move {
-                            // Prefer the exact stream_id/stream_group_id the peer used
-                            // when THEY asked us for keyframes: those describe their
-                            // receive layout, which is what our request must target.
-                            // Fall back to locally computed IDs only if unseen yet.
-                            let cached = crate::avconference::PEER_FIR_PARAMS.lock().ok()
-                                .and_then(|m| m.get(&target).copied());
-                            let (stream_id, stream_group_id) = if let Some(params) = cached {
+                            // Native recovery follows the receiving stream/group.
+                            // Peer requests address the opposite direction; retain
+                            // that heuristic only when receive metadata is unknown.
+                            let cached = receive_target.is_none().then(|| {
+                                crate::avconference::PEER_FIR_PARAMS.lock().ok()
+                                    .and_then(|m| m.get(&target).copied())
+                            }).flatten();
+                            let (stream_id, stream_group_id) = if let Some(params) = receive_target.or(cached) {
                                 params
                             } else {
                                 let state = conn.state.lock().await;
@@ -826,11 +828,14 @@ impl FTClient {
                                     (fallback_stream_id, 0)
                                 }
                             };
-                            info!("Sending FIR to {target}: stream_id={stream_id} stream_group_id={stream_group_id} (cached={}, decoded_recently={decoded_recently})", cached.is_some());
+                            let fir_type = conn.outgoing_video_fir_type(2);
+                            let target_source = if receive_target.is_some() { "receivedStream" }
+                                else if cached.is_some() { "legacyPeerRequest" } else { "legacyConfig" };
+                            info!("Sending FIR to {target}: stream_id={stream_id} stream_group_id={stream_group_id} fir_type={fir_type} target_source={target_source} decoded_recently={decoded_recently}");
                             match conn.send_control_message(target, VCControlData::GenerateKeyFrame(VCGenerateKeyFrame {
                                 stream_id,
                                 stream_group_id,
-                                fir_type: 2,
+                                fir_type,
                             })).await {
                                 Ok(_) => info!("Requested keyframe (FIR) from participant {target} stream_id={stream_id}"),
                                 Err(e) => warn!("Keyframe request to participant {target} failed: {e}"),

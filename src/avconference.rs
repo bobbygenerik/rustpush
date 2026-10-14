@@ -8,6 +8,8 @@ mod control_retry;
 mod video_receive_diagnostics;
 #[path = "avconference_nack.rs"]
 mod video_nack;
+#[path = "avconference_audio_offer.rs"]
+mod audio_offer;
 use control_retry::{ControlAction, ControlRetryQueue, RetryMode};
 use audio_feedback::{FTAudioControlData, ParticipantFeedbackState, CumulativeCounter12};
 
@@ -48,6 +50,9 @@ pub mod avconferencep {
 
 #[path = "facetime_aac.rs"]
 mod facetime_aac;
+
+#[path = "avconference_fir_target.rs"]
+mod fir_target;
 
 struct AudioDepacketizer;
 
@@ -659,6 +664,7 @@ pub struct AVSessionSSRC {
     features: HashMap<u8, EnabledAVFeatures>,
     mkms: Vec<QuickRelayMkmMaterial>,
     group_ssrcs: Vec<u32>, // stream-specific SSRCs
+    group_stream_ids: HashMap<u32, u32>, // transport SSRC -> negotiated logical stream ID
     feedback: Arc<ParticipantFeedbackState>,
 
     // LOCAL state - make sure any added local state must be manually preserved
@@ -806,6 +812,8 @@ impl AVSessionState {
         info!("added to Session ID!");
 
         let encryption_state = self.encryption_states.entry(p).or_default();
+        encryption_state.audio_offer.configure(v2.microphone_u1.as_ref()
+            .map(|settings| settings.payloads));
         encryption_state.feedback.configure(audio_feedback::LOCAL_FEC_FEEDBACK_VERSION,
             blob.face_time_settings.as_ref().and_then(|settings| settings.media_control_info_sub_version));
         info!("Participant {p} FEC feedback mode {}", encryption_state.feedback.configuration() as u8);
@@ -844,6 +852,7 @@ impl AVSessionState {
                         Some((f.rtp_payload() as u8, negotiated))
                     }).collect(),
                 group_ssrcs: group.streams.iter().map(|i| i.rtp_ssrc()).collect(),
+                group_stream_ids: group.streams.iter().map(|i| (i.rtp_ssrc(), get_stream_id(i))).collect(),
                 feedback: encryption_state.feedback.clone(),
                 srtp_contexts: HashMap::new(),
                 codec: None,
@@ -1002,6 +1011,7 @@ pub struct ParticipantEncryptionState {
     ctrl_enc_counter: u8,
     pub stream_groups: HashMap<u32, StreamGroup>,
     feedback: Arc<ParticipantFeedbackState>,
+    audio_offer: Arc<audio_offer::RemoteAudioOffer>,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -2044,6 +2054,11 @@ impl IncomingFrameHandler {
                                 incoming_handler.read().unwrap().handle(ChannelMessage {
                                     participant: ssrc.owner,
                                     stream_id: if is_group { header_ssrc & 0xffff } else { 0 },
+                                    keyframe_target: if matches!(channel_type, ChannelType::H264 | ChannelType::H265) {
+                                        fir_target::received_target(is_group, ssrc.stream_index,
+                                            if is_group { header_ssrc & 0xffff } else { 0 },
+                                            ssrc.group_stream_ids.get(&header_ssrc).copied())
+                                    } else { None },
                                     r#type: channel_type,
                                     timestamp: header.timestamp,
                                     prev_dropped: 0,
@@ -2086,6 +2101,11 @@ impl IncomingFrameHandler {
                                 participant: ssrc.owner,
                                 // maybe this if isn't nessesary, it's possible if not likely stream ID sent in u1 mode is ssrc & 0xffff.
                                 stream_id: if is_group { header_ssrc & 0xffff } else { 0 },
+                                keyframe_target: if matches!(channel_type, ChannelType::H264 | ChannelType::H265) {
+                                    fir_target::received_target(is_group, ssrc.stream_index,
+                                        if is_group { header_ssrc & 0xffff } else { 0 },
+                                        ssrc.group_stream_ids.get(&header_ssrc).copied())
+                                } else { None },
                                 r#type: channel_type,
                                 timestamp: sample.packet_timestamp,
                                 prev_dropped: sample.prev_dropped_packets.saturating_sub(sample.prev_padding_packets),
@@ -2484,9 +2504,9 @@ pub struct VCDeviceState {
 }
 
 /// Last FIR parameters each peer used when asking US for a keyframe.
-/// Their stream_id/stream_group_id describe THEIR receive layout, so these
-/// are the correct values to echo back when we request a keyframe from them
-/// (our locally computed IDs do not match Apple's client expectations).
+/// Retained compatibility fallback when incoming stream metadata is unavailable.
+/// These requests address our transmitter; they do not establish the peer's
+/// transmit IDs. Prefer the target carried by the received video stream.
 pub static PEER_FIR_PARAMS: std::sync::LazyLock<
     std::sync::Mutex<HashMap<u64, (u32, u32)>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
@@ -3492,12 +3512,11 @@ pub struct VideoSender {
 
     /// Latest raw parameter sets (Annex-B) seen in a Configuration frame.
     config_raw: Option<Vec<u8>>,
-    /// Latest IRAP (IDR/CRA/BLA) sample, kept so inbound FIRs can be answered
-    /// with an actual keyframe - the camera encoder cannot be commanded from
-    /// Rust, and a peer that missed the initial IDR stays black forever.
+    /// Latest IRAP (IDR/CRA/BLA) sample used by the existing replay fallback.
+    /// Fresh encoder requests travel independently through the control bridge.
     last_key_frame: Option<Vec<u8>>,
     last_timestamp: Option<u32>,
-    last_key_replay: Option<Instant>,
+    last_key_request: Option<Instant>,
     /// RTCP Sender Report accounting: without periodic SRs the peer cannot
     /// map our RTP timestamps to its playout clock and discards every frame
     /// as "too old" (observed as a constant ~19s playout delta on Apple
@@ -3929,15 +3948,18 @@ impl VideoSender {
     /// Re-send the most recent keyframe (with parameter sets prepended) so a
     /// peer that answered our stream late - or lost the initial IDR - can
     /// start decoding. Called when an inbound FIR asks for a keyframe.
-    /// Returns `Ok(true)` when the peer should additionally get a fresh
-    /// encoder IDR (replay sent, or nothing cached to replay), `Ok(false)`
-    /// when throttled by the 1s replay window.
-    pub fn resend_key_frame(&mut self) -> Result<bool, PushError> {
-        if let Some(last) = self.last_key_replay {
+    /// Request fresh encoder output before attempting the optional cached replay:
+    /// a failed replay must not prevent the encoder from repairing its chain.
+    /// The existing 1s request budget is local policy, not verified Apple timing.
+    /// Returns false only when that budget suppresses the request.
+    pub fn resend_key_frame(&mut self, request_fresh: impl FnOnce()) -> Result<bool, PushError> {
+        if let Some(last) = self.last_key_request {
             if last.elapsed() < Duration::from_secs(1) {
                 return Ok(false)
             }
         }
+        self.last_key_request = Some(Instant::now());
+        request_fresh();
         let Some(mut nal) = self.last_key_frame.clone() else {
             warn!("FIR received but no keyframe cached yet");
             return Ok(true)
@@ -3950,7 +3972,6 @@ impl VideoSender {
         } else if let Some(raw) = &self.config_raw {
             nal.splice(0..0, raw.clone());
         }
-        self.last_key_replay = Some(Instant::now());
         info!("Resending cached keyframe in response to FIR ({}B)", nal.len());
         // Continue on the same 24 kHz clock, including through u32 wrap.
         let ts = self.last_timestamp.unwrap_or(0).wrapping_add(24 * 33);
@@ -3984,11 +4005,15 @@ pub struct AudioSender {
     last_worst: (u16, u16),
     feedback: Arc<ParticipantFeedbackState>,
     aac_encoder: Option<facetime_aac::FaceTimeAacEncoder>,
+    audio_offer: Option<Arc<audio_offer::RemoteAudioOffer>>,
 }
 
 impl AudioSender {
     /// PCM input is encoded to the negotiated 480-sample AAC-ELD format.
     pub fn send_audio_pcm(&mut self, pcm: &[u8], timestamp: u32) -> Result<(), String> {
+        if let Some(offer) = &self.audio_offer {
+            offer.ensure_aac_supported().map_err(|error| error.to_string())?;
+        }
         if self.aac_encoder.is_none() {
             self.aac_encoder = Some(facetime_aac::FaceTimeAacEncoder::new()?);
             info!("FaceTime AAC encoder: ELD 24kHz mono 480 samples no-SBR; ASC=f8ec3000");
@@ -4001,6 +4026,9 @@ impl AudioSender {
     }
 
     pub fn send_audio_frame(&mut self, sample: &[u8], timestamp: u32) -> Result<(), PushError> {
+        if let Some(offer) = &self.audio_offer {
+            offer.ensure_aac_supported()?;
+        }
         let payload = facetime_aac::frame_payload(sample).map_err(|e|
             std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let ext = if self.is_u1 {
@@ -4215,6 +4243,10 @@ impl AVSession {
         self.video_decode_progress.rearm();
     }
 
+    pub fn outgoing_video_fir_type(&self, requested: u32) -> u32 {
+        self.video_decode_progress.request_type(requested, self.u1.load(Ordering::Relaxed))
+    }
+
     pub async fn new(
         relay_session: Arc<GlobalLink>, 
         av_config: AVConfig, 
@@ -4417,21 +4449,19 @@ impl AVSession {
                                     }
                                     // Respond to FIR with our stream group state
                                     drop(state);
-                                    // The camera encoder cannot be commanded from
-                                    // Rust; replay our latest keyframe so a peer
-                                    // that missed the initial IDR can start decoding.
+                                    // Request fresh encoder output through the existing
+                                    // bridge independently of the optional replay result.
                                     {
                                         let mut sender = session.video_sender.lock().await;
                                         if let Some(sender) = sender.as_mut() {
-                                            match sender.resend_key_frame() {
+                                            match sender.resend_key_frame(|| publish_encoder_control("requestKeyFrame", None)) {
                                                 Ok(true) => {
-                                                    info!("FIR from {participant}: replayed cached IDR, requesting fresh encoder IDR");
-                                                    publish_encoder_control("requestKeyFrame", None);
+                                                    info!("FIR from {participant}: requested fresh encoder IDR; cached replay attempted if available");
                                                 }
                                                 Ok(false) => {
-                                                    info!("FIR from {participant}: within replay cooldown, not re-requesting");
+                                                    info!("FIR from {participant}: within local request budget, not re-requesting");
                                                 }
-                                                Err(e) => warn!("Keyframe replay failed: {e}"),
+                                                Err(e) => warn!("Keyframe replay failed after requesting fresh encoder output: {e}"),
                                             }
                                         }
                                     }
@@ -4568,6 +4598,11 @@ impl AVSession {
         };
 
         // Retain the same handle even if the sender predates the first AVC import.
+        let audio_offer = to_participant.map(|p| state.encryption_states.entry(p as u64)
+            .or_default().audio_offer.clone());
+        if let Some(offer) = &audio_offer {
+            offer.ensure_aac_supported()?;
+        }
         let feedback = to_participant.map(|p| state.encryption_states.entry(p as u64)
             .or_default().feedback.clone()).unwrap_or_default();
         let mut buffer = self.ssrc_packet_buffer.lock().unwrap();
@@ -4596,6 +4631,7 @@ impl AVSession {
             last_worst: (0, 0),
             feedback,
             aac_encoder: None,
+            audio_offer,
         })
     }
 
@@ -4679,7 +4715,7 @@ impl AVSession {
             config_raw: None,
             last_key_frame: None,
             last_timestamp: None,
-            last_key_replay: None,
+            last_key_request: None,
         })
     }
 
@@ -5814,6 +5850,9 @@ impl ChannelType {
 pub struct ChannelMessage {
     pub participant: u64,
     pub stream_id: u32,
+    /// Logical stream ID and native group ID for recovery, independent of
+    /// the existing display/reference-chain stream identifier above.
+    pub keyframe_target: Option<(u32, u32)>,
     pub r#type: ChannelType,
     pub frame: ChannelFrame,
     pub prev_dropped: u16,

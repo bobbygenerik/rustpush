@@ -1,14 +1,18 @@
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// Decoder output, rather than receipt of compressed packets, proves recovery.
 #[derive(Default)]
 pub(super) struct VideoDecodeProgress {
     state: Mutex<(Option<Instant>, bool)>,
+    // Distinct from recency: loss rearms recovery but is not stream startup.
+    has_output: AtomicBool,
 }
 
 impl VideoDecodeProgress {
     pub(super) fn record_output(&self, keyframe: bool) {
+        self.has_output.store(true, Ordering::Relaxed);
         let mut state = self.state.lock().unwrap();
         // Concealment output from an old damaged chain cannot finish recovery.
         if state.1 && !keyframe { return; }
@@ -24,6 +28,14 @@ impl VideoDecodeProgress {
 
     pub(super) fn rearm(&self) {
         *self.state.lock().unwrap() = (None, true);
+    }
+
+    pub(super) fn request_type(&self, requested: u32, one_to_one: bool) -> u32 {
+        // iOS27 VCVideoStream coerces requests to type4 while
+        // _lastDecodedVideoFrameTime is zero. Our output state is per session,
+        // so apply this only to 1:1 startup; group/stream resets need per-stream
+        // decoder ownership before they can use the same native rule.
+        if one_to_one && !self.has_output.load(Ordering::Relaxed) { 4 } else { requested }
     }
 }
 
@@ -55,5 +67,36 @@ mod tests {
         assert!(!progress.is_recent());
         progress.record_output(true);
         assert!(progress.is_recent());
+    }
+
+    #[test]
+    fn one_to_one_startup_requests_native_type_four() {
+        let progress = VideoDecodeProgress::default();
+        assert_eq!(progress.request_type(2, true), 4);
+        progress.record_output(true);
+        assert_eq!(progress.request_type(2, true), 2);
+    }
+
+    #[test]
+    fn rearmed_recovery_keeps_requested_type_after_output() {
+        let progress = VideoDecodeProgress::default();
+        progress.record_output(true);
+        progress.rearm();
+        assert!(!progress.is_recent());
+        assert_eq!(progress.request_type(2, true), 2);
+    }
+
+    #[test]
+    fn concealed_output_ends_startup_without_completing_recovery() {
+        let progress = VideoDecodeProgress::default();
+        progress.rearm();
+        progress.record_output(false);
+        assert!(!progress.is_recent());
+        assert_eq!(progress.request_type(2, true), 2);
+    }
+
+    #[test]
+    fn group_requests_preserve_existing_type() {
+        assert_eq!(VideoDecodeProgress::default().request_type(2, false), 2);
     }
 }
