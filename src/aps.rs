@@ -637,6 +637,13 @@ pub enum APSMessage {
     Pong,
 }
 
+fn matching_ack(message: APSMessage, message_id: i32) -> Option<u8> {
+    match message {
+        APSMessage::Ack { for_id, status, .. } if for_id == message_id => Some(status),
+        _ => None,
+    }
+}
+
 impl APSMessage {
     fn to_packed_raw(&self) -> APSPackedMessage {
         match self {
@@ -1472,6 +1479,8 @@ impl APSConnectionResource {
 
     pub async fn send_message(&self, topic: &str, data: impl Serialize, id: Option<i32>) -> Result<(), PushError> {
         let my_id = id.unwrap_or_else(|| new_aps_id());
+        // Subscribe before the socket write: an ACK can arrive immediately.
+        let acknowledgements = self.subscribe().await;
         self.send(APSMessage::Notification {
             id: my_id,
             topic: sha1(topic.as_bytes()),
@@ -1479,10 +1488,7 @@ impl APSConnectionResource {
             payload: plist::to_value(&data)?,
             channel: None,
         }).await?;
-        let status = self.wait_for_timeout(self.subscribe().await, |msg| {
-            let APSMessage::Ack { token: _token, for_id: _, status } = msg else { return None };
-            Some(status)
-        }).await?;
+        let status = self.wait_for_timeout(acknowledgements, |msg| matching_ack(msg, my_id)).await?;
         if status != 0 {
             Err(PushError::APSAckError(status))
         } else {

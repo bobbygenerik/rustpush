@@ -1,3 +1,5 @@
+#[path = "send_handoff.rs"]
+mod send_handoff;
 use std::{collections::{HashMap, HashSet}, fs, io::Cursor, path::PathBuf, sync::{Arc, Weak}, time::{Duration, SystemTime, UNIX_EPOCH}};
 
 use backon::{ConstantBuilder, ExponentialBuilder};
@@ -990,7 +992,7 @@ impl IdentityResource {
         let (sender, receiver) =
             tokio::sync::broadcast::channel(message_targets.len());
 
-        let mut progress = receiver.resubscribe();
+        let progress = receiver.resubscribe();
 
         let since_the_epoch = duration_since_epoch();
 
@@ -1004,36 +1006,12 @@ impl IdentityResource {
             sent_timestamp: since_the_epoch.as_millis() as u64,
         };
 
-        let mut job_spawned = tokio::spawn(job.send_targets(message_targets, 0));
-
-        let mut received = false;
-        let mut checked = false;
-        loop {
-            select! {
-                finished = &mut job_spawned => {
-                    finished.unwrap()?;
-                    checked = true;
-                    received = true; // for no confirm items
-                    break; // Done
-                },
-                _prog = progress.recv() => {
-                    received = true;
-                },
-                _time = tokio::time::sleep(Duration::from_millis(if received { 500 } else { 15000 })) => {
-                    break;
-                }
-            }
-        }
-
-        if !received {
-            debug!("Not received");
-            job_spawned.abort();
-            return Err(PushError::SendTimedOut)
-        }
+        let job_spawned = tokio::spawn(job.send_targets(message_targets, 0));
+        let handle = send_handoff::handoff(job_spawned, progress).await?;
 
         Ok(SendJob {
             process: receiver,
-            handle: if checked { None } else { Some(job_spawned) },
+            handle,
         })
     }
 }
@@ -1114,6 +1092,38 @@ pub enum SendResult {
 pub struct SendJob {
     pub process: tokio::sync::broadcast::Receiver<(DeliveryHandle, SendResult)>,
     pub handle: Option<JoinHandle<Result<(), PushError>>>,
+}
+
+impl SendJob {
+    /// A participant's accepted device wins over its other device errors.
+    /// A successful self-copy must not hide rejection by the recipient.
+    pub fn status_error(&mut self, worker_error: Option<PushError>, sender: &str) -> Option<PushError> {
+        let mut outcomes = HashMap::<String, (bool, Option<PushError>)>::new();
+        loop {
+            match self.process.try_recv() {
+                Ok((target, status)) => {
+                    let (accepted, error) = outcomes.entry(target.participant).or_default();
+                    match status {
+                        SendResult::Sent => *accepted = true,
+                        SendResult::APSError(status) if error.is_none() => *error = Some(PushError::SendErr(status)),
+                        SendResult::TimedOut if error.is_none() => *error = Some(PushError::SendTimedOut),
+                        _ => {},
+                    }
+                },
+                // Missing local status records cannot establish rejection.
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => return None,
+                Err(_) => break,
+            }
+        }
+        let has_peer = outcomes.keys().any(|participant| participant != sender);
+        let mut any_accepted = false;
+        for (participant, (accepted, error)) in outcomes {
+            if has_peer && participant == sender { continue; }
+            any_accepted |= accepted;
+            if !accepted && error.is_some() { return error; }
+        }
+        if any_accepted { None } else { worker_error }
+    }
 }
 
 struct InnerSendJob {
