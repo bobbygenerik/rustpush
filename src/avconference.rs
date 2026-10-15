@@ -2,6 +2,8 @@
 mod quality_feedback;
 #[path = "avconference_feedback.rs"]
 mod audio_feedback;
+#[path = "avconference_receive_clock.rs"]
+mod receive_clock;
 #[path = "avconference_control.rs"]
 mod control_retry;
 #[path = "video_receive_diagnostics.rs"]
@@ -846,13 +848,18 @@ impl AVSessionState {
                 mkms: encryption_state.mkm.clone(),
                 features: u1.encode_decode_features.iter()
                     .filter_map(|f| {
-                        let features = EnabledAVFeatures::from_bytes(&f.encode_decode_features()[..2]);
+                        let Some(features) = EnabledAVFeatures::from_negotiated_bytes(f.encode_decode_features()) else {
+                            warn!("Ignoring incomplete AV feature mask for payload {} ({} bytes)",
+                                f.rtp_payload(), f.encode_decode_features().len());
+                            return None;
+                        };
                         let negotiated = if f.rtp_payload() == 100 { &config.supported_features } else { &config.h264_supported }.negotiate(&features);
                         info!("SSRC features {} payload {} features {} negotiated {}", u1.rtp_ssrc(), f.rtp_payload(), features, negotiated);
                         Some((f.rtp_payload() as u8, negotiated))
                     }).collect(),
                 group_ssrcs: group.streams.iter().map(|i| i.rtp_ssrc()).collect(),
-                group_stream_ids: group.streams.iter().map(|i| (i.rtp_ssrc(), get_stream_id(i))).collect(),
+                group_stream_ids: fir_target::negotiated_stream_ids(
+                    group.streams.iter().map(|i| (i.rtp_ssrc(), i.stream_id))),
                 feedback: encryption_state.feedback.clone(),
                 srtp_contexts: HashMap::new(),
                 codec: None,
@@ -1253,8 +1260,7 @@ pub struct RecvStatTracker {
     last_bucket: u64,
     last_report: Option<Instant>,
 
-    initial_send_time: HashMap<u64, f64>,
-    initial_recv_time: HashMap<u64, Instant>,
+    audio_clocks: HashMap<(u64, u32), (Instant, receive_clock::ReceiveClock)>,
     audio_history: Vec<FTAudioControlData>,
     audio_history_context: Option<(u64, u64)>, // participant, negotiation generation
     video_receive_counter: CumulativeCounter12,
@@ -1279,8 +1285,7 @@ impl RecvStatTracker {
             last_bucket: 0,
             last_report: None,
 
-            initial_recv_time: HashMap::new(),
-            initial_send_time: HashMap::new(),
+            audio_clocks: HashMap::new(),
             audio_history: Vec::with_capacity(30),
             audio_history_context: None,
             video_receive_counter: CumulativeCounter12::default(),
@@ -1516,15 +1521,11 @@ impl RecvStatTracker {
         }
 
         
-        if payload.is_audio() {
-            let initial_recv_time = self.initial_recv_time.entry(ssrc.owner).or_insert(recv.time_parsed);
-        
-            let send_time = (header.timestamp as u64 * 125 / 3) as f64 / 1_000_000.0; // micros to s
-            let initial_send_time = self.initial_send_time.entry(ssrc.owner).or_insert(send_time);
-            let recv_elapsed = recv.time_parsed.duration_since(*initial_recv_time).as_secs_f64();
-            let send_elapsed = send_time - *initial_send_time;
-
-            let lag = recv_elapsed - send_elapsed;
+        if let Some(lag) = payload.is_audio().then(|| {
+            let (origin, clock) = self.audio_clocks.entry((ssrc.owner, header.ssrc))
+                .or_insert_with(|| (recv.time_parsed, Default::default()));
+            clock.lag(header.timestamp, recv.time_parsed.saturating_duration_since(*origin))
+        }).flatten() {
             
             let mut short_lag = 0.0;
             self.stats.short_q13_lag.update(
@@ -1551,9 +1552,9 @@ impl RecvStatTracker {
                 } else if short_lag < long_lag {
                     long_lag = short_lag;
                 } else if short_lag - long_lag > 0.25 {
-                    // Pull long_lag up when clock drift or app sleep/backgrounding causes it to fall behind
-                    // short_lag by more than 250ms (~2048 in Q13). A real network queue does not buffer for
-                    // >250ms without packet drops.
+                    // Retained local baseline cap; Apple's full spike/reset
+                    // ownership is still being mapped. Zero packet loss alone
+                    // does not establish that a delay measurement is false.
                     long_lag = short_lag - 0.25;
                 }
                 long_lag.to_bits()
@@ -2085,7 +2086,10 @@ impl IncomingFrameHandler {
                             let before_footer = data.len();
                             let footer_control = features.and_then(|_| data.last().copied());
                             if let Some(features) = features {
-                                let (decoded, meta) = features.parse_frame(&data);
+                                let Some((decoded, meta)) = features.parse_frame(&data) else {
+                                    warn!("Discarding truncated AV feature trailer for SSRC {header_ssrc}");
+                                    continue;
+                                };
                                 data = decoded;
                                 frame_meta = meta;
                                 // info!("sample {}", encode_hex(&data));
@@ -4056,20 +4060,9 @@ impl AudioSender {
 
             self.last_worst = worst;
 
-            let q13_timestamp = (f64::from_bits(stats.short_q13_lag.load(Ordering::Relaxed)) - 
-                f64::from_bits(stats.long_q13_lag.load(Ordering::Relaxed))).max(0.0) * 8192.0;
-            
-            let mut q13_timestamp_int = q13_timestamp as u16;
-            if q13_timestamp.is_nan() {
-                q13_timestamp_int = u16::MAX;
-            }
-            if q13_timestamp_int != u16::MAX && worst.0 == 0 && stats.video_burst_loss.load(Ordering::Relaxed) == 0 {
-                // When there is zero packet loss on the wire, high Q13 delay is
-                // clock drift or scheduling jitter, NOT network bufferbloat.
-                // Clamping to <= 1200 (~146ms) prevents the Mac from falsely
-                // displaying "Connection is unstable" and throttling its video.
-                q13_timestamp_int = q13_timestamp_int.min(1200);
-            }
+            let q13_timestamp_int = receive_clock::pack_q13_delay(
+                f64::from_bits(stats.short_q13_lag.load(Ordering::Relaxed)) -
+                f64::from_bits(stats.long_q13_lag.load(Ordering::Relaxed)));
 
             let current_send = ((timestamp as u64 + 52676) * 16 / 375) as u16;
             stats.outgoing_send_time.store(current_send, Ordering::Relaxed);
@@ -6666,8 +6659,76 @@ static GROUP_H264_FEATURES: LazyLock<EnabledAVFeatures> = LazyLock::new(|| Enabl
 #[test]
 fn test_feature() {
     let data = decode_hex("00000ca20201e08837e83a7daac2e2044e97601b1f62e26ae7ec3cf6f5f1a82ba858dc1ed760fd571b9cf6b36a5b344825a63740385a9d4035305ba83ea2d249d5a275dc00a81dc9a80546996ee933f978c4d2a788adc8dbeb9382db8771faf84f15e3647258a18715ea9702f09ac6097352eccb1df5bd3faab3808756be818dab8511b0807d6dbc6d8b6c79ca7c74543218dcc40425e64eff689a3dc55644544b27766f11711fabe2c4da1a8dab962fcab3faecdb238ab623b7a84f8f44fe0d5dee601c80f33448a7ce012f0107176f02f590d672df1e4088cb27d361f0612a90cecc58a32ec7a39929ef46d9dddc2b134bd4896a7c11a73485ca5b1e87e997219cc19dd25587ddcb5ab13c651e0a681e34e163b607570b2a68efe1c3c5754f6a646396c6653432c7722f04cef1e93012dd674d27912b9ab4efde9c75d8024c4e8cda8f6e6cd830ae420fb8491a35022115bbd326c8c474eae16b9b89a42c2e5330566e641f81ee881517b38316614bf3a63fab1d920a81ae05cd9fab8b92d0bc68a80882aa5aac92fe377e78f61c51f7b61cb3fa7da5bdedc841d6300f8ef92be3d06b5f36e78fded4441f38d69c063399105978301fcc4ea925c3d51d10766e4fc104cb51f9e01c7cf16febc8c6a8b999a2b1cc959d7e950f53cc3fc6fbc610ce19e6c8f169bc1ae7f1e82de31fc1d64616ee378dc30d33aaf896a86da35a56e653c74d14a7ccdb1f374df8162f6ff052b20b3ee4fcbc0855c5a62f741214750b74788800905be559e8e60cfd6cb39c36be7bee11fd0a712934c54080bbaed348d3ab77dafb054b514070441e68048cd355e7fc00485226c684bade35a2e4b4d0fe7d706bbec52adcec0dd1c4facc2a3a5ba35cf50501cb056093dfe215d358edd8890e66c619cdac5ea6136620c07a02394898a98186df7484d0d7d5bb7aceb1b87b1e2e2005b9e35b002e21270bd0a78fd1bd6a36dc689df38e5b6896cf0dd209051396f8b740c11f7dbcce8e3f1abeefc45ec4c70a80eed4d402d393ce5c0f09c32f230cfc2ff46deb0b290c0b1834a9d620d3a4fd95ba73d03be606b6a0d9abad604227e0de66c7b7fea9a2ce0d1927a595addf74c23053d65160c76607d7b7261c3d087d77766f2883152bd84ec90c64665961648768d3e0c7a5fab9b2d8b671c6efb3736e46b03a1f19ced2820a80f5023742112dfb5f06a209a761549901417b4ed3351ecd05e2cb48a758bdbc8f2dad03a347447304de0e0f55408e8a7ed6cf43e9f2b482b58ee6c36d5faff17a5562162720ceebf1cc4d80d4da03cb690c4f2f60f67cf8f720101e72d85ac99f05fc5e3a3a8a85d63b12966d7461468fc97ae76a69061a30589fcbbaab01172478633e913afe628c677bd6e5e2363725d7ab072b50ebde5a8788e8dcc360a1bd4f5e0199a6270bce34d0d2e05f3a792785d6e20ebfe2357abeeae478643c0bce7bdd0b828dad987727aee6206bf07ce85c069e2e68a998abb623469ba11e63b14fdce78652a8f1e26e9f7829166991cb98ed9040c9664242b2c1e915eb8a6a77ac90a84fd997aeba6473a70e8d78ac2b3f9cf2f89accb3cdf9b2271f33888b569274e8e5adbe622b11e4b60ee32c590573965514e9da4edfa0d74cdf0e67561ac85792b13a14463fb9d6dc0a8a4d8c53286ad3580b9aab9476eaf36eef0d5af13aadf5a5639601bc01581a055b193bd74df5979b95d556a67a4354dace8053b7228153a5d6aa6c617e0850c35c0dec22857a53655dd976581057f995441623c0f112827f059d1bf23fce82418efe65f8765bb2e9d8e6cad093d6c4b84c4109c909ded318b298bfdfafb08d9bebe740d9f73d5057b4d1c07e559fcbc325ed2a49be622b6afc61beb9bc58f98d47bcd2743fbcf762a050dbca5a1a04dea0cb78f4219867b6fb8dab694aa085b4fd501dce77c87af2a6195b4a7a68f4726226f2f90775492ff757f7b8f77b902bcb49727d3e66b50b3831a95205d92ff367f974d595ac27fee09ab4874accc2b6ad6e2b60a16b825540ee9bf1cb01f97d5078ea282ee9623feee5be9d5de51eb82d4944567bac0387b9491cce1073170483b057ddc44c377bf93bf1fe005f2e9885ae802c4124869b1baad4fde64d7ce0809e8381e6901cd033263aaf65dbf59417dfc7ed762c4e9bc006cbfd01ee2f1c368e14251e4c5b839006d0a7fe59fc53aa38529b3cd9c155abf8d686822e1399a33de62ecbfd4f64ddad3b64961dbda3b4c95d49d02ee3b5de1ba5ea0d70c0cb505763cae5e15c9119431d6b72b6da0072e70b17e0065b923dda10146f4b4fda9f9a362e77551b45c04a30b5b93d1fb23fe7855e163575014e34c81a31408e98140b850bace9d7dfe8941f3df47b8b4a61ca45e3c4147964fe8f9e88c2550d9cd045d80697d484dc4b426b56c618633044846a46346cdc79811b805b021de32378d45a50b58c583f0ef7405b333b6ed3a557c67a8591702d01912d5c344a128f578d21a457272759c2bb321b2ec4634f0da29064b3cc37713cc45e05b3995b3e930553e1f30b1459f10425c9346031c36a8f4c20709c78e9aaf2d392535edc9519a5e1c6514fe547b8426f27b44755a151b9202ef137ab77351e8e5b45009024a3a9f34d598ac3a89ae0d35b0a4757f6d571fe123bce91aec2fa338fb3cff503c6689399cfc1034cf369cfb5450c8ee06574490f38af76b178ae2198f16fc5bb629a674e9d3af827cd2145ee8789ff620d4ec40df3634a7eb4b7e222712f7c252e8ffbb62e4353ba64ff89c728d1eafc2a5f6b38f0c59d6217dcd5ecbf09f9e90e7a367323ab306a1ccb5249e3cfff49296b510f84bfa0f2b4b886040cd20efee4bed729d6f8b075af7db63136765268f76d5034abc305a01a7d9110b08f25799ddb7fdd8ae765e856f6d9b2e67a879ff5da51f589de4c354f627506029684b966a0bf24f95f97bb61101741100b2489fe07b170b370ef7a406adbe5936acfdd526583c80aabff0a766d03a1b2971411c0bf98fd09018ebdff52ca6b680727c32333560a1e1797f3a2af5fdcc0511d037b53dad92ffbe6cf885dc4dc117186be87e6a602a7f4f4d44749e24e639b63e89531b389c186aa196a5b96a77ca78399dbfb9cdf13ce242d04b5ccc54c945630f25eddbfd72b9263a08dfeaeaf1ab2afa076849836ee056723d83f44e1dab8f20cf1cd8ef8d3f71a8a536f4364418eb9c4f1405f01ce1905481a5ab7753384d34867bfae694231bf77f70bd537c2f19a28362fdfcba206754d58fdc33e7720ac36fe6663d38a79ba8673bda11ce9efd58d9c47c53e22df675f09f8e8e446e1367e8145feb2e64f7ba0ed7a319ec65dfb6b43d433e2cf556155e4378a6afd0e287197806116fc73ec5ffb96f7a0ff75d2ede18e6f05ce4529c0622944aa002c76c3f1a599b9ea95d00cac03cc7b6c62d10be4a49cbc80810b0fce72c4e28a57d14a9cb1dd90379bc178eedb8b3facaa5188c7b0a8c218d1e6fee249eaf6eab00cff4a11b64d653241ee5f773fa6e149c2cd0e5d020104601a1d5bc9fc4c1db33b79244f40c3e309eab0b4278f6ae3eff0fc2d32c8813aedf047b36b8174efff350ce5a6d3f5af2f4eda87af5ebc6cb0daefe829671b9d3191d29b64281e0a56d68b871e752c01a0348f5e3886f44eef1d0780d11531a70898dbe77caadcd657f8eb33fbde981437cc61a31086b5a9c506f55e22078b17870edc232c8f16ed3db2671adf22e9dfe7cc0ba73ce3c4e347695a3deffb49b3c9b099259711f6cc2b7df55c3225a2cb7a1e5720c81664d49e295e5983f6d54108bb6aee424ab3c3e6872ef9899da1bd22a9db19d67558039a8a19602851d0e5cb135507260b133e738f14e95b461461f94786a3c5f6ae1a62f3822d4d40b46097903667773db5d703943ad19b01e7c2333a06837a79fdacecfd19bfd0e79ecb1c6bead93ee4082498f5ad95684589bb304c4bf5449ccc5bd7ede2cec5bcd3e8c2c9479ae9128403e0bc6cf6a8fa9609b86f2a0d59ef47990fda4528ca56a0274b847afb687771f263eda57682a568c2650d77cbb6bfe740e245b9b7bc4e6ee9b437c8d64ac71ad65ce2397cd7dd0bc3e4690066ea5e8d352c937b8062a72273ed9a45d0dc39b1cad94f2a9239520c04a081513fecbc752ba8ddf74d3c746e535da461dece10ba34d0d193d7e0d414bac31c4e2af059ef558b5fca3f957ecda3fd85dfb2f34e0af608f9f27201d92076294f1ce32467590a13c19b8abb1d14c4dcee79dbfbb08576b676d833028842176be3553d1048217fd7d820611fafacb3ffade9c7ee52a8d5e75b5d7a889a23eb89639182e39db30a806908b7cfc925d72b977088835051a8c348917eb634c1dc79d98a1cb59d1400de0945ed380ba618ec0fc68985c7a9563eb76b78d2c2611997043b4058719340678a48a951454402bbcf93d29e18ed1fafa0a04ab1d6d82357216f09f6d66b8918a44fd244e1f0caf9145360c0fd837be2a6cdc4ddc935886d3a6b8ee72cf5bd0373e5b6704473467e205a5a00000300000300007e2781811b").unwrap();
-    let decode = GROUP_H265_FEATURES.parse_frame(&data);
+    let decode = GROUP_H265_FEATURES.parse_frame(&data).expect("valid feature trailer fixture");
     panic!("result {} {:?}", encode_hex(&decode.0), decode.1);
+}
+
+#[cfg(test)]
+mod negotiated_feature_tests {
+    use super::*;
+
+    #[test]
+    fn absent_optional_mask_remains_unknown() {
+        assert!(EnabledAVFeatures::from_negotiated_bytes(&[]).is_none());
+    }
+
+    #[test]
+    fn one_byte_mask_is_rejected_without_panicking() {
+        assert!(EnabledAVFeatures::from_negotiated_bytes(&[1]).is_none());
+    }
+
+    #[test]
+    fn explicit_zero_mask_is_known_and_keeps_trailer_parsing() {
+        let features = EnabledAVFeatures::from_negotiated_bytes(&[0, 0]).unwrap();
+        assert!(features.0.is_empty());
+        assert_eq!(features.parse_frame(&[101, 0]).unwrap().0, &[101]);
+    }
+
+    #[test]
+    fn full_masks_keep_prior_flags_and_ignore_trailing_extension_bytes() {
+        let prior = EnabledAVFeatures::from_bytes(&[5, 1]).to_bits();
+        assert_eq!(EnabledAVFeatures::from_negotiated_bytes(&[5, 1]).unwrap().to_bits(), prior);
+        assert_eq!(EnabledAVFeatures::from_negotiated_bytes(&[5, 1, 255, 255]).unwrap().to_bits(), prior);
+    }
+}
+
+#[cfg(test)]
+mod frame_feature_tests {
+    use super::*;
+
+    #[test]
+    fn truncated_control_or_extension_is_rejected() {
+        let features = EnabledAVFeatures::from_bits(&[true]);
+        for frame in [&[][..], &[1][..], &[128][..], &[128, 128][..], &[1, 1][..]] {
+            assert!(features.parse_frame(frame).is_none());
+        }
+    }
+
+    #[test]
+    fn valid_feature_bytes_preserve_payload_and_metadata() {
+        let features = EnabledAVFeatures::from_bits(&[true]);
+        let (payload, metadata) = features.parse_frame(&[38, 1, 128, 165, 90, 1]).unwrap();
+        assert_eq!(payload, &[38, 1, 128]);
+        assert_eq!(metadata.get("RVRA1").map(Vec::as_slice), Some(&[165, 90][..]));
+    }
+
+    #[test]
+    fn escaped_feature_zeros_are_not_mistaken_for_payload() {
+        let features = EnabledAVFeatures::from_bits(&[true]);
+        let (payload, metadata) = features.parse_frame(&[38, 1, 128, 0, 0, 3, 1]).unwrap();
+        assert_eq!(payload, &[38, 1, 128]);
+        assert_eq!(metadata.get("RVRA1").map(Vec::as_slice), Some(&[0, 0][..]));
+    }
+
+    #[test]
+    fn short_valid_payload_and_empty_feature_set_are_supported() {
+        let no_features = EnabledAVFeatures::from_bits(&[]);
+        assert_eq!(no_features.parse_frame(&[101, 0]).unwrap().0, &[101]);
+        let features = EnabledAVFeatures::from_bits(&[true]);
+        let (payload, metadata) = features.parse_frame(&[101, 165, 90, 1]).unwrap();
+        assert_eq!(payload, &[101]);
+        assert_eq!(metadata.get("RVRA1").map(Vec::as_slice), Some(&[165, 90][..]));
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -6680,6 +6741,12 @@ impl Display for EnabledAVFeatures {
 }
 
 impl EnabledAVFeatures {
+    fn from_negotiated_bytes(features: &[u8]) -> Option<Self> {
+        // Unknown configuration must not imply an empty feature set: that
+        // would still enable trailer parsing. Keep the existing two-byte mask.
+        features.get(..2).map(Self::from_bytes)
+    }
+
     fn from_str(features: &str) -> Self {
         let mut result = [false; FEATURES.len()];
         for feature in features.split(";") {
@@ -6757,30 +6824,30 @@ impl EnabledAVFeatures {
         }
     }
 
-    fn parse_frame<'a>(&self, decode: &'a [u8]) -> (&'a [u8], HashMap::<&'static str, Vec<u8>>) {
-        let ctrl = *decode.last().unwrap() as usize;
+    fn parse_frame<'a>(&self, decode: &'a [u8]) -> Option<(&'a [u8], HashMap::<&'static str, Vec<u8>>)> {
+        let ctrl = *decode.last()? as usize;
 
         let frame_features = self.0.iter().filter(|i| i.feature != "MLS").enumerate().take(7).filter(|(idx, feature)| 
             ((ctrl >> idx) & 1) == 1).map(|i| *i.1).collect::<Vec<_>>();
 
         let total_len = frame_features.iter().fold(0, |a, c| a + c.size);
 
-        let mut idx = decode.len() - 2;
+        let mut idx = decode.len().checked_sub(2)?;
 
         if ctrl & 0x80 != 0 {
             // extension bytes, seems to always return 0
             while decode[idx] & 0x80 != 0 {
-                idx -= 1;
+                idx = idx.checked_sub(1)?;
             }
-            idx -= 1;
+            idx = idx.checked_sub(1)?;
         }
 
         let mut output = vec![];
         while output.len() < total_len {
-            if &decode[idx - 2..=idx] != &[0, 0, 3] {
+            if idx < 2 || &decode[idx - 2..=idx] != &[0, 0, 3] {
                 output.insert(0, decode[idx]);
             }
-            idx -= 1;
+            idx = idx.checked_sub(1)?;
         }
 
         let mut result = HashMap::<&'static str, Vec<u8>>::new();
@@ -6796,7 +6863,7 @@ impl EnabledAVFeatures {
         //     encode_hex(&output),
         // );
 
-        (&decode[..=idx], result)
+        Some((&decode[..=idx], result))
     }
 }
 
