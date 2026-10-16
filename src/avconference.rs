@@ -8,6 +8,8 @@ mod receive_clock;
 mod control_retry;
 #[path = "video_receive_diagnostics.rs"]
 mod video_receive_diagnostics;
+#[path = "video_receive_timing.rs"]
+mod video_receive_timing;
 #[path = "avconference_nack.rs"]
 mod video_nack;
 #[path = "avconference_audio_offer.rs"]
@@ -149,12 +151,14 @@ impl AVSessionCodec {
                 200,          // max_late in sequence numbers
                 H265Packet::default(),
                 24_000,     // RTP video clock
-            ).with_max_time_delay(Duration::from_millis(300))),
+            ).with_max_time_delay(Duration::from_millis(300))
+                .with_immediate_partition_release()),
             123 => Self::H264(SampleBuilder::new(
                 200,
                 H264Packet::default(),
                 24_000,
-            ).with_max_time_delay(Duration::from_millis(300))),
+            ).with_max_time_delay(Duration::from_millis(300))
+                .with_immediate_partition_release()),
             104 => Self::Aac(SampleBuilder::new(
                 5,
                 AudioDepacketizer,
@@ -1709,6 +1713,8 @@ impl IncomingFrameHandler {
         let mut counter: u32 = 0;
         let mut stat_tracker = RecvStatTracker::new(stats.clone(), audio);
         let diagnostic_epoch = Instant::now();
+        let diagnostic_unix_us = duration_since_epoch().as_micros() as u64;
+        let mut video_timing = HashMap::<(u32, u8), video_receive_timing::VideoReceiveTiming>::new();
         let mut video_windows = HashMap::<(u32, u8), video_receive_diagnostics::VideoReceiveWindow>::new();
         let mut video_nacks = HashMap::<u32, (i64, video_nack::VideoNackGenerator)>::new();
         let mut retry_enqueue_after = Duration::ZERO;
@@ -1917,6 +1923,8 @@ impl IncomingFrameHandler {
                     if matches!(payload, AVSessionPayload::H264 | AVSessionPayload::H265) {
                         let parity = video_meta.as_ref().and_then(|v| v.fec_header.as_ref())
                             .is_some_and(|fec| !fec.is_data);
+                        video_timing.entry((header.ssrc, header.payload_type)).or_default()
+                            .packet(header.timestamp, recv.time_parsed.into_std(), Instant::now().into_std(), parity);
                         let window = video_windows.entry((header.ssrc, header.payload_type)).or_default();
                         if let Some(report) = window.packet(diagnostic_epoch.elapsed(), header.timestamp,
                             video_meta.as_ref().and_then(|v| v.frame_sequence_number),
@@ -2062,6 +2070,7 @@ impl IncomingFrameHandler {
                                     } else { None },
                                     r#type: channel_type,
                                     timestamp: header.timestamp,
+                                    receive_timing: None,
                                     prev_dropped: 0,
                                     metadata: HashMap::new(),
                                     camera_meta: video_meta.as_ref().map(|i| i.camera_status),
@@ -2100,7 +2109,23 @@ impl IncomingFrameHandler {
                                     before_footer.saturating_sub(data.len()), footer_control);
                             }
 
-                            // info!("Handling packetd");
+                            let receive_timing = if matches!(channel_type, ChannelType::H264 | ChannelType::H265) {
+                                video_timing.get_mut(&(header_ssrc, payload_type))
+                                    .and_then(|tracker| tracker.complete(sample.packet_timestamp))
+                                    .map(|arrival| {
+                                        let unix = |at| video_receive_timing::unix_us(at, diagnostic_epoch.into_std(), diagnostic_unix_us);
+                                        FTReceiveTiming {
+                                            first_arrival_us: unix(arrival.first),
+                                            last_arrival_us: unix(arrival.last),
+                                            first_primary_us: arrival.first_primary.map(unix),
+                                            last_primary_us: arrival.last_primary.map(unix),
+                                            assembled_us: unix(Instant::now().into_std()),
+                                            max_dispatch_us: arrival.max_dispatch_us,
+                                            primary_packets: arrival.primary_packets,
+                                            parity_packets: arrival.parity_packets,
+                                        }
+                                    })
+                            } else { None };
                             incoming_handler.read().unwrap().handle(ChannelMessage {
                                 participant: ssrc.owner,
                                 // maybe this if isn't nessesary, it's possible if not likely stream ID sent in u1 mode is ssrc & 0xffff.
@@ -2112,6 +2137,7 @@ impl IncomingFrameHandler {
                                 } else { None },
                                 r#type: channel_type,
                                 timestamp: sample.packet_timestamp,
+                                receive_timing,
                                 prev_dropped: sample.prev_dropped_packets.saturating_sub(sample.prev_padding_packets),
                                 metadata: frame_meta,
                                 camera_meta: video_meta.as_ref().map(|i| i.camera_status),
@@ -5852,6 +5878,21 @@ pub struct ChannelMessage {
     pub metadata: HashMap::<&'static str, Vec<u8>>,
     pub camera_meta: Option<FTVideoCameraStatus>,
     pub timestamp: u32,
+    pub receive_timing: Option<FTReceiveTiming>,
+}
+
+/// App-local timing metadata, never serialized into Apple/hosted-service packets.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FTReceiveTiming {
+    pub first_arrival_us: u64,
+    pub last_arrival_us: u64,
+    pub first_primary_us: Option<u64>,
+    pub last_primary_us: Option<u64>,
+    pub assembled_us: u64,
+    pub max_dispatch_us: u64,
+    pub primary_packets: u32,
+    pub parity_packets: u32,
 }
 
 const MEDIA_FRAME_CAPACITY: usize = 4096;
@@ -5869,6 +5910,8 @@ pub struct FTMediaFrameEnvelope {
     pub width: Option<i32>,
     pub height: Option<i32>,
     pub camera_orientation: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receive_timing: Option<FTReceiveTiming>,
     #[serde(serialize_with = "serialize_frame_b64")]
     pub frame: Vec<u8>,
 }
