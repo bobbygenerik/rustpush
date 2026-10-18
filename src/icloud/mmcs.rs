@@ -41,27 +41,42 @@ pub struct MMCSConfig {
 }
 
 async fn send_mmcs_req(client: &Client, config: &MMCSConfig, url: &str, method: &str, auth: &str, dsid: &str, body: &[u8]) -> Result<Response, PushError> {
-    let cloudkit_headers: HeaderMap = config.cloudkit_headers.iter().map(|(a, b)| (HeaderName::from_str(a).unwrap(), b.parse().unwrap())).collect();
+    let mut last_err = None;
+    for attempt in 1..=3u32 {
+        let cloudkit_headers: HeaderMap = config.cloudkit_headers.iter().map(|(a, b)| (HeaderName::from_str(a).unwrap(), b.parse().unwrap())).collect();
+        let req = client.post(format!("{}/{}", url, method))
+            .header("x-apple-mmcs-dataclass", config.dataclass)
+            .header("x-apple-mmcs-auth", auth)
+            .header("Accept", "application/vnd.com.apple.me.ubchunk+protobuf")
+            .header("x-apple-request-uuid", Uuid::new_v4().to_string().to_uppercase())
+            .header("x-apple-mme-dsid", dsid)
+            .header("x-mme-client-info", &config.mme_client_info)
+            .header("Accept-Language", "en-us")
+            .header("Content-Type", "application/vnd.com.apple.me.ubchunk+protobuf")
+            .header("User-Agent", &config.user_agent)
+            .header("x-apple-mmcs-proto-version", "5.0")
+            .header("x-apple-mmcs-plist-version", "v1.0")
+            .header("Accept-Encoding", "gzip, deflate")
+            .header("Proxy-Connection", "keep-alive")
+            .header("Connection", "keep-alive")
+            .header("x-apple-mmcs-plist-sha256", "fvj0Y/Ybu1pq0r4NxXw3eP51exujUkEAd7LllbkTdK8=")
+            .headers(cloudkit_headers)
+            .body(body.to_owned());
 
-    Ok(client.post(format!("{}/{}", url, method))
-        .header("x-apple-mmcs-dataclass", config.dataclass)
-        .header("x-apple-mmcs-auth", auth)
-        .header("Accept", "application/vnd.com.apple.me.ubchunk+protobuf")
-        .header("x-apple-request-uuid", Uuid::new_v4().to_string().to_uppercase())
-        .header("x-apple-mme-dsid", dsid)
-        .header("x-mme-client-info", &config.mme_client_info)
-        .header("Accept-Language", "en-us")
-        .header("Content-Type", "application/vnd.com.apple.me.ubchunk+protobuf")
-        .header("User-Agent", &config.user_agent)
-        .header("x-apple-mmcs-proto-version", "5.0")
-        .header("x-apple-mmcs-plist-version", "v1.0")
-        .header("Accept-Encoding", "gzip, deflate")
-        .header("Proxy-Connection", "keep-alive")
-        .header("Connection", "keep-alive")
-        .header("x-apple-mmcs-plist-sha256", "fvj0Y/Ybu1pq0r4NxXw3eP51exujUkEAd7LllbkTdK8=")
-        .headers(cloudkit_headers)
-        .body(body.to_owned())
-        .send().await?)
+        match req.send().await {
+            Ok(resp) if resp.status().is_server_error() && attempt < 3 => {
+                warn!("MMCS {} HTTP {} on attempt {}/3, retrying...", method, resp.status(), attempt);
+            }
+            Ok(resp) => return Ok(resp),
+            Err(err) if attempt < 3 => {
+                warn!("MMCS {} network error on attempt {}/3: {}, retrying...", method, attempt, err);
+                last_err = Some(err);
+            }
+            Err(err) => return Err(err.into()),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(400 * attempt as u64)).await;
+    }
+    Err(last_err.unwrap().into())
 }
 
 // build confirm request, mostly a bunch of analytics I don't care to track accurately
@@ -249,14 +264,12 @@ pub async fn prepare_put_v2(mut reader: impl ReadContainer + Send + Sync, bounda
 struct MMCSPutContainer {
     target: UploadTarget,
     hasher: Hasher,
-    sender: Option<flume::Sender<Result<Vec<u8>, PushError>>>,
-    finalize: Option<JoinHandle<Result<Response, PushError>>>,
     length: usize,
     transfer_progress: usize,
     finish_binary: Option<Vec<u8>>,
     dsid: String,
     confirm_url: String,
-    buffer: Option<Vec<u8>>,
+    buffer: Vec<u8>,
     user_agent: String,
 }
 
@@ -265,14 +278,12 @@ impl MMCSPutContainer {
         MMCSPutContainer {
             target,
             hasher: Hasher::new(MessageDigest::md5()).unwrap(),
-            sender: None,
-            finalize: None,
             length,
             transfer_progress: 0,
             finish_binary,
             dsid,
             confirm_url,
-            buffer: None,
+            buffer: Vec::with_capacity(length + 512),
             user_agent
         }
     }
@@ -281,23 +292,25 @@ impl MMCSPutContainer {
         self.target.chunks.iter().map(|chunk| index[&encode_hex(&chunk_id_to_id(chunk))].clone()).collect()
     }
 
-    // opens an HTTP stream if not already open
-    async fn ensure_stream(&mut self) {
-        if self.sender.is_none() {
-            let (sender, receiver) = flume::bounded(0);
-            self.sender = Some(sender);
-            let body: Body = Body::wrap_stream(receiver.into_stream());
-            let request = self.target.request.clone().unwrap();
-            let user_agent = self.user_agent.clone();
-            let task = tokio::spawn(async move {
-                let response = transfer_mmcs_container(&REQWEST_NO_TIMEOUT, &request, Some(body), &user_agent).await?;
-                Ok::<_, PushError>(response)
-            });
-            self.finalize = Some(task);
-
+    async fn put_with_retry(&self, request: &HttpRequest, payload: Vec<u8>) -> Result<Response, PushError> {
+        let mut last_err = None;
+        for attempt in 1..=3u32 {
+            let body = Body::from(payload.clone());
+            match transfer_mmcs_container(&REQWEST_NO_TIMEOUT, request, Some(body), &self.user_agent).await {
+                Ok(resp) if resp.status().is_server_error() && attempt < 3 => {
+                    warn!("MMCS container PUT HTTP {} on attempt {}/3, retrying...", resp.status(), attempt);
+                }
+                Ok(resp) => return Ok(resp),
+                Err(err) if attempt < 3 => {
+                    warn!("MMCS container PUT error on attempt {}/3: {}, retrying...", attempt, err);
+                    last_err = Some(err);
+                }
+                Err(err) => return Err(err),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(400 * attempt as u64)).await;
         }
+        Err(last_err.unwrap())
     }
-
 }
 
 impl Container for MMCSPutContainer { }
@@ -305,14 +318,7 @@ impl Container for MMCSPutContainer { }
 #[async_trait]
 impl WriteContainer for MMCSPutContainer {
     async fn write(&mut self, data: &[u8]) -> Result<(), PushError> {
-        self.ensure_stream().await;
-
-        if let Some(data) = self.buffer.take() {
-            if let Err(err) = self.sender.as_ref().unwrap().send_async(Ok(data)).await {
-                err.into_inner()?;
-            }
-        }
-        self.buffer = Some(data.to_vec());
+        self.buffer.extend_from_slice(data);
         self.hasher.update(data).unwrap();
         self.transfer_progress += data.len();
         Ok(())
@@ -325,25 +331,23 @@ impl WriteContainer for MMCSPutContainer {
     // finalize the http stream
     async fn finalize(&mut self, config: &MMCSConfig) -> Result<Option<MMCSReceipt>, PushError> {
         let result = self.hasher.finish()?;
+        let request = self.target.request.clone().unwrap();
+        let raw_payload = std::mem::take(&mut self.buffer);
         
-        return Ok(if complete_req_at_edge(self.target.request.as_ref().unwrap()) {
+        return Ok(if complete_req_at_edge(&request) {
             debug!("MMCS complete at edge");
             let footer = mmcsp::PutFooter {
                 md5_sum: result.to_vec(),
                 confirm_data: self.finish_binary.clone()
             };
 
-            let mut buf: Vec<u8> = footer.encode_to_vec();
+            let buf: Vec<u8> = footer.encode_to_vec();
+            let mut full_payload = Vec::with_capacity(raw_payload.len() + 4 + buf.len());
+            full_payload.extend_from_slice(&raw_payload);
+            full_payload.extend_from_slice(&(buf.len() as u32).to_be_bytes());
+            full_payload.extend_from_slice(&buf);
 
-            let result = self.sender.take().unwrap().into_send_async(Ok([
-                self.buffer.take().unwrap(),
-                (buf.len() as u32).to_be_bytes().to_vec(),
-                buf
-            ].concat())).await;
-            if let Err(err) = result {
-                err.into_inner()?;
-            }
-            let reader = self.finalize.take().unwrap().await.unwrap()?;
+            let reader = self.put_with_retry(&request, full_payload).await?;
 
             if !reader.status().is_success() {
                 let status = reader.status().as_u16();
@@ -356,12 +360,13 @@ impl WriteContainer for MMCSPutContainer {
             None
         } else {
             debug!("MMCS complete normal");
-            if let Err(err) = self.sender.as_ref().unwrap().send_async(Ok(self.buffer.take().unwrap())).await {
-                err.into_inner()?;
+            let reader = self.put_with_retry(&request, raw_payload).await?;
+            if !reader.status().is_success() {
+                let status = reader.status().as_u16();
+                debug!("mmcs normal put failed {status} {}", encode_hex(&reader.bytes().await?));
+                return Err(PushError::MMCSUploadFailed(status));
             }
-            self.sender = None;
-            let reader = self.finalize.take().unwrap().await.unwrap()?;
-            let confirmed = confirm_for_resp(&reader, &get_container_url(&self.target.request.as_ref().unwrap()), &self.target.cl_auth_p2, Some(&result));
+            let confirmed = confirm_for_resp(&reader, &get_container_url(&request), &self.target.cl_auth_p2, Some(&result));
             reader.bytes().await?;
 
             let confirmation = mmcsp::ConfirmResponse {
@@ -927,7 +932,7 @@ impl DataCacher {
 struct MMCSGetContainer {
     container: ProtoContainer,
     cacher: DataCacher,
-    response: Option<Response>,
+    fetched: bool,
     confirm: Option<MMCSReceipt>,
     transfer_progress: usize,
     user_agent: String,
@@ -938,7 +943,7 @@ impl MMCSGetContainer {
         MMCSGetContainer {
             container,
             cacher: DataCacher::new(),
-            response: None,
+            fetched: false,
             confirm: None,
             transfer_progress: 0,
             user_agent
@@ -968,12 +973,42 @@ impl MMCSGetContainer {
     }
 
 
-    // opens an HTTP stream if not already open
+    // fetches the container bytes with retry if not already fetched
     async fn ensure_stream(&mut self) -> Result<(), PushError> {
-        if self.response.is_none() {
-            let response = transfer_mmcs_container(&REQWEST_NO_TIMEOUT, &self.container.request.as_ref().unwrap(), None, &self.user_agent).await?;
-            self.confirm = Some(MMCSReceipt::Get(confirm_for_resp(&response, &get_container_url(&self.container.request.as_ref().unwrap()), &self.container.cl_auth_p2, None)));
-            self.response = Some(response);
+        if !self.fetched {
+            let req = self.container.request.as_ref().unwrap();
+            let mut last_err = None;
+            for attempt in 1..=3u32 {
+                match transfer_mmcs_container(&REQWEST_NO_TIMEOUT, req, None, &self.user_agent).await {
+                    Ok(response) => {
+                        if response.status().is_server_error() && attempt < 3 {
+                            warn!("MMCS container GET HTTP {} on attempt {}/3, retrying...", response.status(), attempt);
+                        } else {
+                            let confirm = MMCSReceipt::Get(confirm_for_resp(&response, &get_container_url(req), &self.container.cl_auth_p2, None));
+                            match response.bytes().await {
+                                Ok(bytes) => {
+                                    self.cacher.data_avail(&bytes);
+                                    self.confirm = Some(confirm);
+                                    self.fetched = true;
+                                    return Ok(());
+                                }
+                                Err(err) if attempt < 3 => {
+                                    warn!("MMCS container GET stream error on attempt {}/3: {}, retrying...", attempt, err);
+                                    last_err = Some(err.into());
+                                }
+                                Err(err) => return Err(err.into()),
+                            }
+                        }
+                    }
+                    Err(err) if attempt < 3 => {
+                        warn!("MMCS container GET error on attempt {}/3: {}, retrying...", attempt, err);
+                        last_err = Some(err);
+                    }
+                    Err(err) => return Err(err),
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(400 * attempt as u64)).await;
+            }
+            return Err(last_err.unwrap());
         }
         Ok(())
     }
@@ -987,16 +1022,7 @@ impl ReadContainer for MMCSGetContainer {
     async fn read(&mut self, len: usize) -> Result<Vec<u8>, PushError> {
         self.ensure_stream().await?;
 
-        let mut received = self.cacher.read_exact(len);
-        while received.is_none() {
-            let Some(bytes) = self.response.as_mut().unwrap().chunk().await? else {
-                return Ok(self.cacher.read_all())
-            };
-            self.cacher.data_avail(&bytes);
-            received = self.cacher.read_exact(len);
-        }
-        
-        let read = received.unwrap();
+        let read = self.cacher.read_exact(len).unwrap_or_else(|| self.cacher.read_all());
         self.transfer_progress += read.len();
         Ok(read)
     }
