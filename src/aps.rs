@@ -1421,6 +1421,10 @@ impl APSConnectionResource {
         self.state.read().await.token.expect("Token not found; re-enter device details if persistent")
     }
 
+    pub async fn try_get_token(&self) -> Option<[u8; 32]> {
+        self.state.read().await.token
+    }
+
     pub async fn request_topics(&self, topics: &[&str]) -> APSInterestToken {
         let hard_list: Vec<String> = topics.iter().map(|i| i.to_string()).collect();
         self.topics.send((hard_list.clone(), true)).await.expect("Other end hung up topics??");

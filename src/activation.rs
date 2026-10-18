@@ -120,19 +120,41 @@ pub async fn activate(os_config: &dyn OSConfig) -> Result<KeyPairNew<RsaKey>, Pu
         activation_info: String,
     }
 
-    let request = REQWEST
-        .post(format!("https://albert.apple.com/deviceservices/deviceActivation?device={}", os_config.get_activation_device()))
-        .header("User-Agent", os_config.get_normal_ua("ApplePushService/4.0"))
+    let url = format!("https://albert.apple.com/deviceservices/deviceActivation?device={}", os_config.get_activation_device());
+    let ua = os_config.get_normal_ua("ApplePushService/4.0");
+    let resp = REQWEST
+        .post(&url)
+        .header("User-Agent", &ua)
         .form(&FormBody { activation_info: plist_to_string(&request)? })
-        .send().await?
-        .text().await?;
+        .send().await?;
 
-    let protocol = Regex::new(r"<Protocol>(.*)</Protocol>").unwrap();
-    let captures = protocol.captures(&request).ok_or(PushError::AlbertCertParseError)?;
+    let status = resp.status();
+    let body = resp.text().await?;
+
+    let protocol = Regex::new(r"(?s)<Protocol>(.*)</Protocol>").unwrap();
+    let captures = match protocol.captures(&body) {
+        Some(c) => c,
+        None => {
+            log::error!("Albert activation failed - HTTP status: {}, no <Protocol> found. Response body: {}", status, body);
+            return Err(PushError::AlbertCertParseError);
+        }
+    };
     
-    let parsed: Value = plist::from_bytes(captures[1].as_bytes())?;
+    let parsed: Value = match plist::from_bytes(captures[1].as_bytes()) {
+        Ok(p) => p,
+        Err(e) => {
+            log::error!("Albert activation plist parse error: {:?}. Raw captured XML: {}", e, &captures[1]);
+            return Err(PushError::AlbertCertParseError);
+        }
+    };
 
-    let certificate = get_nested_value(&parsed, &["device-activation", "activation-record", "DeviceCertificate"]).and_then(|v| v.as_data()).ok_or(PushError::AlbertCertParseError)?;
+    let certificate = match get_nested_value(&parsed, &["device-activation", "activation-record", "DeviceCertificate"]).and_then(|v| v.as_data()) {
+        Some(c) => c,
+        None => {
+            log::error!("Albert activation response missing DeviceCertificate. HTTP status: {}, Parsed plist: {:?}, Full XML: {}", status, parsed, body);
+            return Err(PushError::AlbertCertParseError);
+        }
+    };
 
     Ok(KeyPairNew {
         cert: X509::from_pem(certificate)?.to_der()?,
