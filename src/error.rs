@@ -47,6 +47,8 @@ pub enum PushError {
     StatusError(reqwest::StatusCode /* code */),
     #[error("Failed to parse Albert Cert")]
     AlbertCertParseError,
+    #[error("Apple rejected device activation ({0}).")]
+    ActivationRejected(String),
     #[cfg(feature = "macos-validation-data")]
     #[error("Absinthe error {0}")]
     AbsintheError(#[from] AbsintheError),
@@ -64,7 +66,7 @@ pub enum PushError {
     MMCSGetFailed(Option<String>),
     #[error("Failed to authenticate. Try logging in to account.apple.com to fix your Apple Account or create a new one: {1:?} {0}")]
     MobileMeError(String, Option<String>),
-    #[error("You need to add a trusted phone number to your Apple Account at account.apple.com. You may be unable to add your phone number. You can also create a new account at account.apple.com. If you get 'Your account cannot be created at this time,' you need to contact Apple Support. Do not mention OpenBubbles. For assistance, join our Discord from our website.")]
+    #[error("Apple rejected service-token sign-in (UNAUTHORIZED). The response does not specify why.")]
     UnauthorizedAccountError,
     #[error("Bad auth cert {0}")]
     AuthInvalid(IDSError),

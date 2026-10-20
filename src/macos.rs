@@ -46,7 +46,7 @@ impl OSConfig for MacOSConfig {
     fn build_activation_info(&self, csr: Vec<u8>) -> ActivationInfo {
         ActivationInfo {
             activation_randomness: Uuid::new_v4().to_string().to_uppercase(),
-            activation_state: "Unactivated",
+            activation_state: "Unactivated".to_string(),
             build_version: self.inner.os_build_num.clone(),
             device_cert_request: csr.into(),
             device_class: "MacOS".to_string(),

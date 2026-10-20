@@ -7,7 +7,7 @@ use hkdf::Hkdf;
 use icloud_auth::{AppleAccount, CircleSendMessage, GenerateVerificationTokenRequest, LoginState};
 use keystore::{KeystoreAccessRules, KeystoreDigest, KeystorePadding, KeystorePublicKey, KeystoreSignKey, RsaKey};
 use log::{debug, info, warn};
-use omnisette::{AnisetteClient, AnisetteProvider};
+use omnisette::{AnisetteClient, AnisetteProvider, account_delegate_info, account_uses_remote_compatibility};
 use openssl::{ec::EcKey, hash::MessageDigest, nid::Nid, pkey::{PKey, Private}, rsa::{Padding, Rsa}, sha::sha1, sign::Signer, x509::{X509Name, X509Req}};
 use plist::{Data, Dictionary, Value};
 use rasn::{AsnType, Decode, Encode};
@@ -24,31 +24,6 @@ use x509_cert::{attr::AttributeTypeAndValue, der::{EncodePem, asn1::{BitString, 
 use xml::{EventReader, reader::{self, ParserConfig2}};
 
 use crate::{APSConnection, APSConnectionResource, APSMessage, APSState, OSConfig, PushError, aps::{APSInterestToken, get_message}, ids::user::{IDSUser, IDSUserIdentity, IDSUserType}, keychain::{EncodedPeer, KeychainClient, PrivateUserIdentity}, util::{DebugMutex, IDS_BAG, KeyPair, KeyPairNew, PhoneNumberResponse, REQWEST, base64_decode, base64_encode, decode_hex, duration_since_epoch, encode_hex, get_bag, gzip, gzip_normal, plist_to_bin, plist_to_buf, plist_to_string, ungzip}};
-
-#[derive(Serialize)]
-#[serde(rename_all = "kebab-case")]
-struct AuthRequest {
-    apple_id: String,
-    client_id: String,
-    delegates: Value,
-    password: String
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct V2AuthRequest {
-    delegates: Value,
-    protocol_version: String,
-    user_info: V2AuthUserInfo,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "kebab-case")]
-struct V2AuthUserInfo {
-    client_id: String,
-    language: String,
-    timezone: String,
-}
 
 #[derive(Clone, Copy)]
 pub enum LoginDelegate {
@@ -222,7 +197,7 @@ pub struct IDSDelegateResponse {
 #[derive(Deserialize, Serialize)]
 pub struct MobileMeDelegateResponse {
     pub tokens: HashMap<String, String>,
-    #[serde(default)]
+    #[serde(default, alias = "com.apple.mobileme")]
     pub config: Dictionary,
 }
 
@@ -382,22 +357,13 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(account: &AppleAccount<T
 
     let username = persist.username.clone();
     
-    // let request = AuthRequest {
-    //     apple_id: username.to_string(),
-    //     client_id: Uuid::new_v4().to_string(),
-    //     delegates: Value::Dictionary(Dictionary::from_iter(delegates.iter().map(|d| d.delegate()))),
-    //     password: pet.to_string()
-    // };
-
-    let request = V2AuthRequest {
-        delegates: Value::Dictionary(Dictionary::from_iter(delegates.iter().map(|d| d.delegate()))),
-        protocol_version: "1.0".to_string(),
-        user_info: V2AuthUserInfo {
-            client_id: Uuid::new_v4().to_string().to_uppercase(),
-            language: "en-US".to_string(),
-            timezone: "America/New_York".to_string(),
-        }
-    };
+    let request = crate::delegate_request::prepare_delegate_request(
+        account_uses_remote_compatibility(&account.client_info), os_config.get_login_url(),
+        &username, &pet, &Uuid::new_v4().to_string().to_uppercase(),
+        Dictionary::from_iter(delegates.iter().map(|d| d.delegate())),
+    )?;
+    let api = if request.legacy { "iosbuddy/loginDelegates" } else { "signin/v2/login" };
+    info!("Apple service-token API: {api}");
 
     let validation_data = os_config.generate_validation_data().await?;
 
@@ -408,17 +374,26 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(account: &AppleAccount<T
         anisette_headers.insert("Cookie", HeaderValue::from_str(cookie).unwrap());
     }
 
-    let resp = REQWEST.post(os_config.get_login_url())
+    // PET authentication keeps the delegate's AOSKit application component;
+    // only its platform follows GrandSlam's compatibility context. The account's
+    // mme_client_info is Messages/AuthKit and is not a delegate description.
+    let delegate_info = account_delegate_info(&account.client_info,
+        &os_config.get_mme_clientinfo(&os_config.get_aoskit_version()));
+    // Insert after provider headers to retain a single, authoritative value.
+    anisette_headers.insert("X-Mme-Client-Info",
+        HeaderValue::from_str(&delegate_info).unwrap());
+
+    let resp = REQWEST.post(request.url)
             .header("Accept-Encoding", "gzip")
             .header("User-Agent", os_config.get_normal_ua("com.apple.iCloudHelper/282"))
-            .header("X-Mme-Client-Info", os_config.get_mme_clientinfo(&os_config.get_aoskit_version()))
             .header("X-Mme-Nas-Qualify", base64_encode(&validation_data))
             .header("X-Apple-ADSID", adsid)
             .headers(anisette_headers.clone())
             .basic_auth(username, Some(pet))
-            .body(plist_to_string(&request)?)
+            .body(plist_to_string(&request.body)?)
             .send()
             .await?;
+    let http_status = resp.status();
     let text = resp.text().await?;
 
     let parsed = plist::Value::from_reader(Cursor::new(text.as_str()))?;
@@ -427,6 +402,7 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(account: &AppleAccount<T
     if let Some(error) = parsed_dict.get("localizedError") {
         let error = error.as_string().unwrap();
         if error == "UNAUTHORIZED" {
+            warn!("Apple service-token API {api} rejected authentication (HTTP {http_status}, UNAUTHORIZED)");
             return Err(PushError::UnauthorizedAccountError);
         }
         return Err(PushError::MobileMeError(error.to_string(), parsed_dict.get("description").and_then(|d| d.as_string().map(|s| s.to_string()))));
@@ -458,8 +434,10 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(account: &AppleAccount<T
 
     let mut mme: Option<MobileMeDelegateResponse> = get_delegate(delegates, "com.apple.mobileme")?;
 
-    if let Some(mme) = &mut mme {
-        mme.config = get_delegate(delegates, "com.apple.mobileme")?.expect("No MME??");
+    if !request.legacy {
+        if let Some(mme) = &mut mme {
+            mme.config = get_delegate(delegates, "com.apple.mobileme")?.expect("No MME??");
+        }
     }
 
     Ok(DelegateResponses {

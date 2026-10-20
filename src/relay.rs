@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use plist::{Dictionary, Value};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use crate::{activation::ActivationInfo, util::{base64_decode, REQWEST}, DebugMeta, OSConfig, PushError, RegisterMeta};
+use crate::{activation::ActivationInfo, activation_context::prepare_relay_activation, util::{base64_decode, REQWEST}, ActivationContext, DebugMeta, OSConfig, PushError, RegisterMeta};
 
 #[derive(Deserialize)]
 pub struct DataResp {
@@ -73,7 +73,7 @@ impl OSConfig for RelayConfig {
     fn build_activation_info(&self, csr: Vec<u8>) -> ActivationInfo {
         ActivationInfo {
             activation_randomness: Uuid::new_v4().to_string().to_uppercase(),
-            activation_state: "Unactivated",
+            activation_state: "Unactivated".to_string(),
             build_version: self.version.software_build_id.clone(),
             device_cert_request: csr.into(),
             device_class: "MacOS".to_string(),
@@ -82,6 +82,21 @@ impl OSConfig for RelayConfig {
             serial_number: self.version.serial_number.clone(),
             unique_device_id: self.version.unique_device_id.clone().to_uppercase(),
         }
+    }
+
+    async fn prepare_activation(&self) -> Result<ActivationContext, PushError> {
+        let fallback = ActivationContext {
+            info: self.build_activation_info(Vec::new()),
+            device: self.get_activation_device(),
+            user_agent: self.get_normal_ua("ApplePushService/4.0"),
+        };
+        // Port the verified paid-hosted contract without changing legacy relays
+        // that do not advertise this new endpoint.
+        if self.host.trim_end_matches('/') != "https://hw.openbubbles.app" {
+            return Ok(fallback);
+        }
+        prepare_relay_activation(&REQWEST, &self.host, &self.code,
+            &self.beeper_token, fallback).await
     }
 
     fn get_udid(&self) -> String {

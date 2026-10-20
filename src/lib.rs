@@ -1,10 +1,12 @@
 
 mod activation;
+mod activation_context;
 mod aps;
 mod util;
 mod imessage;
 mod error;
 mod auth;
+mod delegate_request;
 mod ids;
 pub mod avconference;
 pub mod sharedstreams;
@@ -42,11 +44,12 @@ pub use icloud_auth::{PersistAccountData, FetchedToken, DefaultAnisetteProvider,
 
 pub use util::{DebugRwLock, DebugMutex};
 use activation::ActivationInfo;
+pub use activation_context::ActivationContext;
 pub use aps::{APSConnectionResource, APSConnection, APSMessage, APSState};
 use async_trait::async_trait;
 pub use auth::{ request_update_account, UpdateAccountFinish};
 pub use mmcs::{FileContainer, prepare_put};
-pub use omnisette::AnisetteProvider;
+pub use omnisette::{AnisetteProvider, account_login_info, restored_account_login_info};
 pub use imessage::messages::{TypingApp, SetTranscriptBackgroundMessage, UpdateProfileMessage, UpdateProfileSharingMessage, MessageInst, ShareProfileMessage, SharedPoster, ScheduleMode, PermanentDeleteMessage, OperatedChat, DeleteTarget, MoveToRecycleBinMessage, TextFormat, TextEffect, TextFlags, LinkMeta, LPLinkMetadata, LPSpecializationMetadata, ReactMessageType, ErrorMessage, Reaction, UnsendMessage, EditMessage, UpdateExtensionMessage, PartExtension, ReactMessage, ChangeParticipantMessage, LPImageMetadata, RichLinkImageAttachmentSubstitute, LPIconMetadata, AttachmentType, ExtensionApp, BalloonLayout, Balloon, ConversationData, Message, MessageType, Attachment, NormalMessage, RenameMessage, IconChangeMessage, MessageParts, MessagePart, MMCSFile, IndexedMessagePart};
 pub use imessage::aps_client::{IMClient, MADRID_SERVICE};
 use util::encode_hex;
@@ -83,6 +86,13 @@ pub struct DebugMeta {
 pub trait OSConfig: Sync + Send {
     fn build_activation_info(&self, csr: Vec<u8>) -> ActivationInfo;
     fn get_activation_device(&self) -> String;
+    async fn prepare_activation(&self) -> Result<ActivationContext, PushError> {
+        Ok(ActivationContext {
+            info: self.build_activation_info(Vec::new()),
+            device: self.get_activation_device(),
+            user_agent: self.get_normal_ua("ApplePushService/4.0"),
+        })
+    }
     async fn generate_validation_data(&self) -> Result<Vec<u8>, PushError>;
     fn get_protocol_version(&self) -> u32;
     fn get_register_meta(&self) -> RegisterMeta;

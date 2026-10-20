@@ -1,6 +1,24 @@
 use std::io::Result;
 
 fn main() -> Result<()> {
+    // Flutter profile builds use the Rust release profile. Refuse the old CI
+    // placeholders before they can ship in another apparently successful APK.
+    if std::env::var("PROFILE").unwrap_or_default() == "release" {
+        let legacy_cert = std::fs::read("certs/legacy-fairplay/fairplay.crt")?;
+        let legacy_key = std::fs::read("certs/legacy-fairplay/fairplay.pem")?;
+        for serial in (193..=201).chain(std::iter::once(208)) {
+            for (extension, legacy) in [("crt", &legacy_cert), ("pem", &legacy_key)] {
+                let path = format!("certs/fairplay/4056631661436364584235346952{serial}.{extension}");
+                println!("cargo:rerun-if-changed={path}");
+                let bytes = std::fs::read(&path)?;
+                if bytes.is_empty() || bytes == *legacy {
+                    return Err(std::io::Error::other(format!(
+                        "Invalid FairPlay signing material in {path}; run scripts/copy_fairplay_certs.sh from the app checkout"
+                    )));
+                }
+            }
+        }
+    }
     if std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default() != "wasm32" {
         let root = std::path::Path::new("third_party/evs-reference");
         let mut build = cc::Build::new();

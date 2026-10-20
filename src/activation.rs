@@ -14,7 +14,7 @@ use crate::{OSConfig, PushError, util::{KeyPair, KeyPairNew, REQWEST, get_nested
 #[serde(rename_all = "PascalCase")]
 pub struct ActivationInfo {
     pub activation_randomness: String,
-    pub activation_state: &'static str,
+    pub activation_state: String,
     pub build_version: String,
     pub device_cert_request: Data,
     pub device_class: String,
@@ -64,8 +64,55 @@ fn fairplay_sign(data: &[u8]) -> Result<(&'static [u8], Vec<u8>), PushError> {
     Ok((*cert, signer.sign_oneshot_to_vec(data)?))
 }
 
+fn extract_activation_certificate(body: &str) -> Result<Vec<u8>, PushError> {
+    // Albert can return HTTP 200 with an empty plist and an error in the
+    // surrounding activation document. Keep the actual rejection diagnostic.
+    let rejection = Regex::new(r"ErrorKey:\s*<SetFontStyle\b[^>]*>\s*([A-Z][A-Z0-9_]{0,127})\s*</SetFontStyle>").unwrap();
+    if let Some(captures) = rejection.captures(body) {
+        return Err(PushError::ActivationRejected(captures[1].to_owned()));
+    }
+    let protocol = Regex::new(r"(?s)<Protocol>(.*)</Protocol>").unwrap();
+    let captures = protocol.captures(body).ok_or(PushError::AlbertCertParseError)?;
+    let parsed: Value = plist::from_bytes(captures[1].as_bytes())
+        .map_err(|_| PushError::AlbertCertParseError)?;
+    get_nested_value(&parsed, &["device-activation", "activation-record", "DeviceCertificate"])
+        .and_then(|value| value.as_data()).map(|data| data.to_vec())
+        .ok_or(PushError::AlbertCertParseError)
+}
+
+#[cfg(test)]
+mod response_tests {
+    use super::*;
+
+    #[test]
+    fn apple_integrity_rejection_is_not_reported_as_a_parse_failure() {
+        let body = r#"<Document><Protocol><plist version="1.0"><dict/></plist></Protocol>
+            <TextView>ErrorKey: <SetFontStyle normalStyle="gray">DEVICE_INFO_INTEGRITY_FAILED</SetFontStyle></TextView>
+            </Document>"#;
+        let error = extract_activation_certificate(body).unwrap_err();
+        assert!(error.to_string().contains("DEVICE_INFO_INTEGRITY_FAILED"));
+        assert!(!matches!(error, PushError::AlbertCertParseError));
+    }
+
+    #[test]
+    fn multiline_success_keeps_certificate_bytes() {
+        let body = "<Protocol>\n<plist version=\"1.0\"><dict><key>device-activation</key><dict><key>activation-record</key><dict><key>DeviceCertificate</key><data>AQID</data></dict></dict></dict></plist>\n</Protocol>";
+        assert_eq!(extract_activation_certificate(body).unwrap(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn malformed_or_empty_protocol_is_still_a_parse_failure() {
+        for body in ["not an activation response", "<Protocol><plist><dict/></plist></Protocol>"] {
+            assert!(matches!(extract_activation_certificate(body), Err(PushError::AlbertCertParseError)));
+        }
+    }
+}
+
 pub async fn activate(os_config: &dyn OSConfig) -> Result<KeyPairNew<RsaKey>, PushError> {
-    let key = RsaKey::overwrite(&format!("activation:{}", os_config.get_serial_number()), 1024, KeystoreAccessRules {
+    // Hosted activation can supply an identity distinct from the relay's login
+    // identity. Resolve it before creating a key or constructing the signed CSR.
+    let mut context = os_config.prepare_activation().await?;
+    let key = RsaKey::overwrite(&format!("activation:{}", context.info.serial_number), 1024, KeystoreAccessRules {
         signature_padding: vec![KeystorePadding::PKCS1],
         digests: vec![KeystoreDigest::Sha1],
         can_sign: true,
@@ -102,8 +149,8 @@ pub async fn activate(os_config: &dyn OSConfig) -> Result<KeyPairNew<RsaKey>, Pu
     
     let csr = result.to_pem(LineEnding::LF).unwrap();
 
-    let activation = os_config.build_activation_info(csr.into_bytes());
-    let activation_bytes = plist_to_buf(&activation)?;
+    context.info.device_cert_request = csr.into_bytes().into();
+    let activation_bytes = plist_to_buf(&context.info)?;
 
     let (fair_play_cert_chain, fair_play_signature) = fairplay_sign(&activation_bytes)?;
     
@@ -120,44 +167,24 @@ pub async fn activate(os_config: &dyn OSConfig) -> Result<KeyPairNew<RsaKey>, Pu
         activation_info: String,
     }
 
-    let url = format!("https://albert.apple.com/deviceservices/deviceActivation?device={}", os_config.get_activation_device());
-    let ua = os_config.get_normal_ua("ApplePushService/4.0");
+    let mut url = reqwest::Url::parse("https://albert.apple.com/deviceservices/deviceActivation").unwrap();
+    url.query_pairs_mut().append_pair("device", &context.device);
     let resp = REQWEST
-        .post(&url)
-        .header("User-Agent", &ua)
+        .post(url)
+        .header("User-Agent", &context.user_agent)
         .form(&FormBody { activation_info: plist_to_string(&request)? })
         .send().await?;
 
     let status = resp.status();
     let body = resp.text().await?;
 
-    let protocol = Regex::new(r"(?s)<Protocol>(.*)</Protocol>").unwrap();
-    let captures = match protocol.captures(&body) {
-        Some(c) => c,
-        None => {
-            log::error!("Albert activation failed - HTTP status: {}, no <Protocol> found. Response body: {}", status, body);
-            return Err(PushError::AlbertCertParseError);
-        }
-    };
-    
-    let parsed: Value = match plist::from_bytes(captures[1].as_bytes()) {
-        Ok(p) => p,
-        Err(e) => {
-            log::error!("Albert activation plist parse error: {:?}. Raw captured XML: {}", e, &captures[1]);
-            return Err(PushError::AlbertCertParseError);
-        }
-    };
-
-    let certificate = match get_nested_value(&parsed, &["device-activation", "activation-record", "DeviceCertificate"]).and_then(|v| v.as_data()) {
-        Some(c) => c,
-        None => {
-            log::error!("Albert activation response missing DeviceCertificate. HTTP status: {}, Parsed plist: {:?}, Full XML: {}", status, parsed, body);
-            return Err(PushError::AlbertCertParseError);
-        }
-    };
+    let certificate = extract_activation_certificate(&body).map_err(|error| {
+        log::error!("Albert activation failed. HTTP status: {}, {}", status, error);
+        error
+    })?;
 
     Ok(KeyPairNew {
-        cert: X509::from_pem(certificate)?.to_der()?,
+        cert: X509::from_pem(&certificate)?.to_der()?,
         private: key
     })
 }
