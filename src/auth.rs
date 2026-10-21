@@ -365,8 +365,6 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(account: &AppleAccount<T
     let api = if request.legacy { "iosbuddy/loginDelegates" } else { "signin/v2/login" };
     info!("Apple service-token API: {api}");
 
-    let validation_data = os_config.generate_validation_data().await?;
-
     let base_headers = account.anisette.lock().await.get_headers().await?.clone();
     let mut anisette_headers: HeaderMap = base_headers.into_iter().map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap())).collect();
 
@@ -382,6 +380,10 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(account: &AppleAccount<T
     // Insert after provider headers to retain a single, authoritative value.
     anisette_headers.insert("X-Mme-Client-Info",
         HeaderValue::from_str(&delegate_info).unwrap());
+
+    // Fetch after any provider bootstrap/renewal so interactive waits or a
+    // restarted native worker cannot age the validation blob before sending.
+    let validation_data = os_config.generate_validation_data().await?;
 
     let resp = REQWEST.post(request.url)
             .header("Accept-Encoding", "gzip")

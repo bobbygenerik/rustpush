@@ -104,7 +104,7 @@ impl OSConfig for RelayConfig {
     }
 
     fn get_normal_ua(&self, item: &str) -> String {
-        let part = self.icloud_ua.split_once(char::is_whitespace).unwrap().0;
+        let part = self.icloud_ua.split_once(char::is_whitespace).unwrap().1;
         format!("{item} {part}")
     }
 
