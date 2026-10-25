@@ -2598,7 +2598,8 @@ impl DeviceOrientation {
 
 #[derive(Debug, Clone)]
 pub enum VCControlData {
-    // stream group to active index
+    // Numeric media-state message key to disabled/enabled/paused state.
+    // The wire key is not a native four-character streamGroupID or RTP SSRC.
     StreamGroupState(HashMap<u32, u8>),
     WindowState(VCWindowState),
     RateControl(VCRateControl),
@@ -2617,7 +2618,7 @@ impl VCControlData {
         let msg = match message.topic() {
             "VCSessionMessageTopicStreamGroupsState" => {
                 let state: HashMap<String, u8> = plist::from_bytes(message.payload()).ok()?;
-                Self::StreamGroupState(state.into_iter().map(|(a, v)| (a.parse().unwrap(), v)).collect())
+                Self::StreamGroupState(video_stream_group_state::parse_stream_group_states(state))
             },
             "VCWindowStateChange" => Self::WindowState(plist::from_bytes(message.payload()).ok()?),
             "VCSessionMessageTopicRateControlConfig" => Self::RateControl(plist::from_bytes(message.payload()).ok()?),
@@ -4222,6 +4223,14 @@ pub enum AVControlCommand {
 
 #[path = "video_decode_progress.rs"]
 mod video_decode_progress;
+#[path = "video_reference_chain.rs"]
+mod video_reference_chain;
+#[path = "video_receive_recovery.rs"]
+mod video_receive_recovery;
+#[path = "video_recovery_pacing.rs"]
+mod video_recovery_pacing;
+#[path = "video_stream_group_state.rs"]
+mod video_stream_group_state;
 
 pub struct AVSession {
     pub link: Arc<GlobalLink>,
@@ -4246,24 +4255,92 @@ pub struct AVSession {
 
     // Packet arrival does not prove Android decoded a frame. Feedback from
     // the actual output drain keeps recovery active while a decoder is stuck.
-    video_decode_progress: video_decode_progress::VideoDecodeProgress,
+    video_receive_recovery: video_receive_recovery::VideoReceiveRecovery,
+    video_recovery_pacing: video_recovery_pacing::VideoRecoveryPacing,
+    video_recovery_live: AtomicBool,
 }
 
 impl AVSession {
-    pub fn report_video_decoded(&self, keyframe: bool) {
-        self.video_decode_progress.record_output(keyframe);
+    pub fn receive_video_frame(&self, participant: u64, stream_id: u32,
+        timestamp: u32, configuration: bool, keyframe: bool, lost: u16) -> Option<u64> {
+        if !self.video_recovery_live.load(Ordering::Acquire) { return None; }
+        self.video_receive_recovery.receive((participant, stream_id), timestamp, configuration, keyframe, lost)
     }
 
-    pub fn video_decoder_is_recent(&self) -> bool {
-        self.video_decode_progress.is_recent()
+    pub fn report_video_decoded(&self, receipt: u64) -> bool {
+        if !self.video_recovery_live.load(Ordering::Acquire) { return false; }
+        let Some(frame) = self.video_receive_recovery.decoded(receipt) else { return false; };
+        debug!("Decoder output confirmed: participant={} stream={} timestamp={} receipt={receipt}",
+            frame.stream.0, frame.stream.1, frame.timestamp);
+        true
     }
 
-    pub fn rearm_video_decoder(&self) {
-        self.video_decode_progress.rearm();
+    pub fn report_video_dropped(&self, receipt: u64) -> bool {
+        if !self.video_recovery_live.load(Ordering::Acquire) { return false; }
+        self.video_receive_recovery.dropped(receipt)
     }
 
-    pub fn outgoing_video_fir_type(&self, requested: u32) -> u32 {
-        self.video_decode_progress.request_type(requested, self.u1.load(Ordering::Relaxed))
+    pub fn report_video_decoder_reset(&self, receipt: u64) -> bool {
+        if !self.video_recovery_live.load(Ordering::Acquire) { return false; }
+        self.video_receive_recovery.decoder_reset(receipt)
+    }
+
+    pub fn video_decoder_is_recent(&self, participant: u64, stream_id: u32) -> bool {
+        self.video_receive_recovery.decoder_is_recent((participant, stream_id))
+    }
+
+    pub fn outgoing_video_random_access_fir_type(&self, participant: u64, stream_id: u32) -> u32 {
+        self.video_receive_recovery.request_type((participant, stream_id), self.u1.load(Ordering::Relaxed))
+    }
+
+    pub fn stop_video_recovery(&self) {
+        self.video_recovery_live.store(false, Ordering::Release);
+        self.video_receive_recovery.retain_participants(&HashSet::new());
+        self.video_recovery_pacing.retain_participants(&HashSet::new());
+    }
+
+    pub fn reserve_video_recovery(&self, participant: u64, stream: u32, target: Option<(u32, u32)>) -> Option<u64> {
+        if !self.video_recovery_live.load(Ordering::Acquire) { return None; }
+        let incarnation = self.video_receive_recovery.stream_incarnation((participant, stream))?;
+        let admitted = match target {
+            Some((stream, group)) => self.video_recovery_pacing.allow_receiver_fir(participant, group, stream),
+            None => self.video_recovery_pacing.allow_fir(),
+        };
+        admitted.then_some(incarnation)
+    }
+
+    pub async fn request_video_recovery(&self, participant: u64, stream: u32, received: Option<(u32, u32)>, incarnation: u64) {
+        if !self.video_recovery_live.load(Ordering::Acquire)
+            || self.video_receive_recovery.stream_incarnation((participant, stream)) != Some(incarnation) { return; }
+        let cached = received.is_none().then(|| PEER_FIR_PARAMS.lock().ok()
+            .and_then(|m| m.get(&participant).copied())).flatten();
+        let target = {
+            let state = self.state.lock().await;
+            // Queued requests must not address a participant who has left.
+            if !state.active_participants.contains(&participant) { return; }
+            received.or(cached).unwrap_or_else(|| {
+                state.encryption_states.get(&participant)
+                    .and_then(|enc| enc.stream_groups.get(&1))
+                    .map(|group| (get_stream_id(group.current()),
+                        group.config.settings_u1.as_ref().map(|u| u.rtp_ssrc()).unwrap_or(0)))
+                    .unwrap_or((stream, 0))
+            })
+        };
+        // Output can recover while this task waits for session state. Recheck
+        // ownership and actual per-stream progress before requesting another IRAP.
+        if !self.video_recovery_live.load(Ordering::Acquire)
+            || self.video_receive_recovery.stream_incarnation((participant, stream)) != Some(incarnation)
+            || self.video_decoder_is_recent(participant, stream) { return; }
+        let fir_type = self.outgoing_video_random_access_fir_type(participant, stream);
+        let source = if received.is_some() { "receivedStream" }
+            else if cached.is_some() { "legacyPeerRequest" } else { "legacyConfig" };
+        info!("Sending FIR to {participant}: stream_id={} stream_group_id={} fir_type={fir_type} target_source={source}", target.0, target.1);
+        match self.send_control_message(participant, VCControlData::GenerateKeyFrame(VCGenerateKeyFrame {
+            stream_id: target.0, stream_group_id: target.1, fir_type,
+        })).await {
+            Ok(_) => info!("Requested keyframe (FIR) from participant {participant} stream_id={}", target.0),
+            Err(e) => warn!("Keyframe request to participant {participant} failed: {e}"),
+        }
     }
 
     pub async fn new(
@@ -4322,7 +4399,9 @@ impl AVSession {
 
             video_sender: tokio::sync::Mutex::new(None),
             audio_sender: tokio::sync::Mutex::new(None),
-            video_decode_progress: Default::default(),
+            video_receive_recovery: Default::default(),
+            video_recovery_pacing: Default::default(),
+            video_recovery_live: AtomicBool::new(true),
         });
 
         let avc_mat_id: [u8; 20] = rand::random();
@@ -4403,6 +4482,8 @@ impl AVSession {
                         let mut lock = session.state.lock().await;
                         let old_participants = lock.active_participants.clone();
                         if lock.active_participants != set {
+                            session.video_receive_recovery.retain_participants(&set);
+                            session.video_recovery_pacing.retain_participants(&set);
                             // remove removed participants
                             session.frame_handler.stats.records.write().unwrap().retain(|a, _| set.contains(&a.0));
                             session.frame_handler.stats.timing_targets.write().unwrap().retain(|a, _| set.contains(a));
@@ -5110,7 +5191,7 @@ impl AVSession {
                     return Ok(())
                 };
 
-                let ((msg, _), packet) = SFramePacket::from_bytes((&sframe.data[1..], 0)).unwrap();
+                let (authenticated_body, msg, packet) = parse_control_sframe(&sframe.data)?;
 
                 let Some(mkm) = mkms.get_mkm_for(&packet.key_id) else {
                     warn!("No MKM exact!");
@@ -5118,7 +5199,7 @@ impl AVSession {
                 };
 
                 let key = mkm.get_control(their, &self.av_config.session);
-                let decrypted = key.decrypt(&sframe.data[1..], packet, msg)?;
+                let decrypted = key.decrypt(authenticated_body, packet, msg)?;
                 info!("Control message   {:?}", encode_hex(&decrypted));
 
                 let decoded = VcccMessageWrapper::decode(&decrypted[..])?;
@@ -5908,6 +5989,9 @@ pub struct FTMediaFrameEnvelope {
     pub is_configuration: bool,
     pub timestamp: u32,
     pub width: Option<i32>,
+    /// App-local decoder ownership token; never part of RTP or hosted signaling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decode_receipt: Option<u64>,
     pub height: Option<i32>,
     pub camera_orientation: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6646,6 +6730,14 @@ pub struct SFramePacket {
     key_id: Vec<u8>,
     #[deku(bytes = "*ctr_len as usize + 1", endian = "big")]
     ctr: u64,
+}
+
+/// Keep malformed/truncated network input on handle_control's existing error
+/// path. Do not change which bytes participate in SFrame authentication.
+fn parse_control_sframe(data: &[u8]) -> Result<(&[u8], &[u8], SFramePacket), PushError> {
+    let authenticated_body = data.get(1..).ok_or(PushError::BadMsg)?;
+    let ((payload, _), packet) = SFramePacket::from_bytes((authenticated_body, 0))?;
+    Ok((authenticated_body, payload, packet))
 }
 
 #[test]

@@ -9,6 +9,15 @@ pub(super) struct VideoReferenceChain {
 }
 
 impl VideoReferenceChain {
+    pub(super) fn retain_participants(&mut self, active: &HashSet<u64>) {
+        self.waiting.retain(|(participant, _)| active.contains(participant));
+        self.started.retain(|(participant, _)| active.contains(participant));
+    }
+
+    pub(super) fn invalidate(&mut self, stream: (u64, u32)) {
+        self.waiting.insert(stream);
+    }
+
     pub(super) fn accept(&mut self, stream: (u64, u32), configuration: bool, keyframe: bool, lost: u16) -> bool {
         if configuration { return true; }
         if lost > 0 || !self.started.contains(&stream) { self.waiting.insert(stream); }

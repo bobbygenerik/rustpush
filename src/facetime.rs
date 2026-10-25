@@ -14,13 +14,10 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use uuid::Uuid;
 use aes_gcm::KeyInit;
-use crate::{avconference::{AVConfig, AVSession, ChannelFrame, ChannelMessage, ChannelType, FTMediaFrameEnvelope, IncomingFrameHandler, QuickRelayMkmMaterial, QuickRelayPreKey, QuickRelaySkmMaterial, VCControlData, VCGenerateKeyFrame, publish_media_frame}, ids::link::{GlobalLinkChange, GlobalLinkOutgoingPacket, QuickRelayAllocationsResponse, qrp::{self, IdsqrProtoMaterial}}, util::{bin_deserialize, bin_serialize, decode_hex}};
+use crate::{avconference::{AVConfig, AVSession, ChannelFrame, ChannelMessage, ChannelType, FTMediaFrameEnvelope, IncomingFrameHandler, QuickRelayMkmMaterial, QuickRelayPreKey, QuickRelaySkmMaterial, publish_media_frame}, ids::link::{GlobalLinkChange, GlobalLinkOutgoingPacket, QuickRelayAllocationsResponse, qrp::{self, IdsqrProtoMaterial}}, util::{bin_deserialize, bin_serialize, decode_hex}};
 use crate::{APSConnection, APSMessage, IdentityManager, MessageTarget, OSConfig, PushError, aps::{APSInterestToken, get_message}, ids::{IDSRecvMessage, identity_manager::{IDSQuickRelaySettings, IDSSendMessage, IdentityResource, Raw}, link::{GlobalLink, GlobalPacket, LinkType}, user::{IDSService, QueryOptions}}, util::{CompactECKey, DebugMutex, DebugRwLock, base64_decode, base64_encode, deflate, duration_since_epoch, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, inflate, plist_to_bin, proto_deserialize_opt, proto_serialize_opt}};
 
 // static HAS_JOINED: AtomicBool = AtomicBool::new(false);
-
-#[path = "video_reference_chain.rs"]
-mod video_reference_chain;
 
 pub mod facetimep {
     include!(concat!(env!("OUT_DIR"), "/facetimep.rs"));
@@ -679,15 +676,13 @@ impl FTClient {
         }
 
         let media_guid = session.group_id.clone();
-        let conn_for_fir: Arc<AVSession> = session.connection.as_ref().unwrap().clone();
+        let conn_for_fir = Arc::downgrade(session.connection.as_ref().unwrap());
         let rt_handle = tokio::runtime::Handle::current();
-        let fir_last_sent_ms = AtomicU64::new(0);
-        let fir_last_rearm_ms = AtomicU64::new(0);
         let fir_loss_log_count = AtomicU64::new(0);
-        let video_chain = std::sync::Mutex::new(video_reference_chain::VideoReferenceChain::default());
         #[cfg(not(target_arch = "wasm32"))]
         let evs_decoders = std::sync::Mutex::new(HashMap::new());
         media_handler.configure_handler(Box::new(move |msg: ChannelMessage| {
+            let Some(conn_for_fir) = conn_for_fir.upgrade() else { return; };
             let frame = match &msg.frame {
                 ChannelFrame::Sample(data) => data.clone(),
                 ChannelFrame::Configuration(config) => config.annex_b(),
@@ -710,8 +705,9 @@ impl FTClient {
                     }
                 };
             let configuration = matches!(msg.frame, ChannelFrame::Configuration(_));
-            let deliver = !is_video || video_chain.lock().unwrap().accept(
-                (msg.participant, msg.stream_id), configuration, is_keyframe, msg.prev_dropped);
+            let decode_receipt = is_video.then(|| conn_for_fir.receive_video_frame(
+                msg.participant, msg.stream_id, msg.timestamp, configuration, is_keyframe, msg.prev_dropped)).flatten();
+            let deliver = !is_video || decode_receipt.is_some();
             let mut frame = frame;
             let mut codec = format!("{:?}", msg.r#type).to_lowercase();
             #[cfg(not(target_arch = "wasm32"))]
@@ -735,6 +731,7 @@ impl FTClient {
                     codec,
                     is_configuration: matches!(msg.frame, ChannelFrame::Configuration(_)),
                     timestamp: msg.timestamp,
+                    decode_receipt,
                     width,
                     height,
                     camera_orientation: msg.camera_meta.map(|m| m.orientation as u8),
@@ -762,85 +759,20 @@ impl FTClient {
                             n + 1
                         );
                     }
-                    // Mid-call loss (prev_dropped = unrecovered packets/samples
-                    // lost before this frame) breaks our decode chain. The old
-                    // latch never re-requested after the first IDR, leaving the
-                    // view blocky until the peer's next natural keyframe; re-arm
-                    // the budget so the FIR path below asks for a fresh IDR.
-                    // Re-arm for each new damaged chain. Requests themselves
-                    // are limited to 500ms, so loss does not wait up to four
-                    // seconds behind a previously recovered chain.
-                    let now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(0);
-                    let last = fir_last_rearm_ms.load(Ordering::Relaxed);
-                    if now_ms.saturating_sub(last) > 250
-                        && fir_last_rearm_ms
-                            .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
-                            .is_ok()
-                    {
-                        info!(
-                            "Video loss prev_dropped={} - re-arming FIR budget",
-                            msg.prev_dropped
-                        );
-                        conn_for_fir.rearm_video_decoder();
-                    }
+                    // receive_video_frame has already invalidated older
+                    // receipts for this stream. Output from the damaged chain
+                    // must not complete a later loss recovery.
                 }
 
-                let decoded_recently = conn_for_fir.video_decoder_is_recent();
+                let decoded_recently = conn_for_fir.video_decoder_is_recent(msg.participant, msg.stream_id);
                 if !decoded_recently {
-                    let now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(0);
-                    let last = fir_last_sent_ms.load(Ordering::Relaxed);
-                    if now_ms.saturating_sub(last) > 500
-                        && fir_last_sent_ms
-                            .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
-                            .is_ok()
-                    {
+                    if let Some(incarnation) = conn_for_fir.reserve_video_recovery(msg.participant, msg.stream_id, msg.keyframe_target) {
                         let conn = conn_for_fir.clone();
                         let target = msg.participant;
                         let fallback_stream_id = msg.stream_id;
                         let receive_target = msg.keyframe_target;
                         rt_handle.spawn(async move {
-                            // Native recovery follows the receiving stream/group.
-                            // Peer requests address the opposite direction; retain
-                            // that heuristic only when receive metadata is unknown.
-                            let cached = receive_target.is_none().then(|| {
-                                crate::avconference::PEER_FIR_PARAMS.lock().ok()
-                                    .and_then(|m| m.get(&target).copied())
-                            }).flatten();
-                            let (stream_id, stream_group_id) = if let Some(params) = receive_target.or(cached) {
-                                params
-                            } else {
-                                let state = conn.state.lock().await;
-                                if let Some(enc) = state.encryption_states.get(&target) {
-                                    if let Some(video_group) = enc.stream_groups.get(&1) {
-                                        let sg_id = video_group.config.settings_u1.as_ref()
-                                            .map(|u| u.rtp_ssrc()).unwrap_or(0);
-                                        let s_id = crate::avconference::get_stream_id(video_group.current());
-                                        (s_id, sg_id)
-                                    } else {
-                                        (fallback_stream_id, 0)
-                                    }
-                                } else {
-                                    (fallback_stream_id, 0)
-                                }
-                            };
-                            let fir_type = conn.outgoing_video_fir_type(2);
-                            let target_source = if receive_target.is_some() { "receivedStream" }
-                                else if cached.is_some() { "legacyPeerRequest" } else { "legacyConfig" };
-                            info!("Sending FIR to {target}: stream_id={stream_id} stream_group_id={stream_group_id} fir_type={fir_type} target_source={target_source} decoded_recently={decoded_recently}");
-                            match conn.send_control_message(target, VCControlData::GenerateKeyFrame(VCGenerateKeyFrame {
-                                stream_id,
-                                stream_group_id,
-                                fir_type,
-                            })).await {
-                                Ok(_) => info!("Requested keyframe (FIR) from participant {target} stream_id={stream_id}"),
-                                Err(e) => warn!("Keyframe request to participant {target} failed: {e}"),
-                            }
+                            conn.request_video_recovery(target, fallback_stream_id, receive_target, incarnation).await;
                         });
                     }
                 }
@@ -1313,6 +1245,7 @@ impl FTClient {
         info!("Leaving now!");
 
         if let Some(session) = session.connection.take() {
+            session.stop_video_recovery();
             if let Err(e) = session.link.unalloc_bind().await {
                 warn!("Failed to unbind! {e}");
             }
