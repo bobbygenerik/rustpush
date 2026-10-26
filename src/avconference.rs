@@ -814,10 +814,13 @@ impl AVSessionState {
         let v2 = VcMediaNegotiationBlobV2::decode(avc.b2n.as_ref())?;
         info!("Got media blob {blob:?}");
         info!("Got v2 blob {v2:?}");
-        self.participant_session_ids.insert(p, avc.vc_session_participant_key_uuid.clone());
+        let previous_session = self.participant_session_ids.insert(p, avc.vc_session_participant_key_uuid.clone());
         info!("added to Session ID!");
 
         let encryption_state = self.encryption_states.entry(p).or_default();
+        if previous_session.as_ref().is_some_and(|id| id != &avc.vc_session_participant_key_uuid) {
+            encryption_state.remote_media = Default::default();
+        }
         encryption_state.audio_offer.configure(v2.microphone_u1.as_ref()
             .map(|settings| settings.payloads));
         encryption_state.feedback.configure(audio_feedback::LOCAL_FEC_FEEDBACK_VERSION,
@@ -1023,6 +1026,7 @@ pub struct ParticipantEncryptionState {
     pub stream_groups: HashMap<u32, StreamGroup>,
     feedback: Arc<ParticipantFeedbackState>,
     audio_offer: Arc<audio_offer::RemoteAudioOffer>,
+    remote_media: video_stream_group_state::RemoteMediaStates,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -2617,8 +2621,7 @@ impl VCControlData {
         }
         let msg = match message.topic() {
             "VCSessionMessageTopicStreamGroupsState" => {
-                let state: HashMap<String, u8> = plist::from_bytes(message.payload()).ok()?;
-                Self::StreamGroupState(video_stream_group_state::parse_stream_group_states(state))
+                Self::StreamGroupState(video_stream_group_state::parse_stream_group_state_payload(message.payload())?)
             },
             "VCWindowStateChange" => Self::WindowState(plist::from_bytes(message.payload()).ok()?),
             "VCSessionMessageTopicRateControlConfig" => Self::RateControl(plist::from_bytes(message.payload()).ok()?),
@@ -4227,10 +4230,14 @@ mod video_decode_progress;
 mod video_reference_chain;
 #[path = "video_receive_recovery.rs"]
 mod video_receive_recovery;
+#[path = "video_no_display.rs"]
+mod video_no_display;
 #[path = "video_recovery_pacing.rs"]
 mod video_recovery_pacing;
 #[path = "video_stream_group_state.rs"]
 mod video_stream_group_state;
+#[path = "facetime_rtcp.rs"]
+mod facetime_rtcp;
 
 pub struct AVSession {
     pub link: Arc<GlobalLink>,
@@ -4258,6 +4265,7 @@ pub struct AVSession {
     video_receive_recovery: video_receive_recovery::VideoReceiveRecovery,
     video_recovery_pacing: video_recovery_pacing::VideoRecoveryPacing,
     video_recovery_live: AtomicBool,
+    video_receiver_visible: AtomicBool,
 }
 
 impl AVSession {
@@ -4332,6 +4340,7 @@ impl AVSession {
             || self.video_receive_recovery.stream_incarnation((participant, stream)) != Some(incarnation)
             || self.video_decoder_is_recent(participant, stream) { return; }
         let fir_type = self.outgoing_video_random_access_fir_type(participant, stream);
+        self.video_receive_recovery.fir_sent((participant, stream));
         let source = if received.is_some() { "receivedStream" }
             else if cached.is_some() { "legacyPeerRequest" } else { "legacyConfig" };
         info!("Sending FIR to {participant}: stream_id={} stream_group_id={} fir_type={fir_type} target_source={source}", target.0, target.1);
@@ -4340,6 +4349,43 @@ impl AVSession {
         })).await {
             Ok(_) => info!("Requested keyframe (FIR) from participant {participant} stream_id={}", target.0),
             Err(e) => warn!("Keyframe request to participant {participant} failed: {e}"),
+        }
+    }
+
+    pub fn observe_video_receive_target(&self, participant: u64, stream: u32, target: Option<(u32, u32)>, source: Option<u8>) {
+        self.video_receive_recovery.observe_target((participant, stream), target, source);
+    }
+
+    pub fn set_video_receiver_visible(&self, visible: bool) {
+        self.video_receiver_visible.store(visible, Ordering::Release);
+        if !visible { self.video_receive_recovery.poll_no_display(None); }
+    }
+
+    fn expected_camera_participant(&self, state: &AVSessionState) -> Option<u64> {
+        if !self.video_recovery_live.load(Ordering::Acquire) || !self.u1.load(Ordering::Relaxed)
+            || !self.video_receiver_visible.load(Ordering::Acquire) || state.active_participants.len() != 1 { return None; }
+        state.active_participants.iter().copied().find(|id| state.encryption_states.get(id)
+            .is_some_and(|peer| peer.remote_media.camera == Some(video_stream_group_state::RemoteMediaState::Enabled)))
+    }
+
+    async fn request_no_display_recovery(&self, stream: (u64, u32), incarnation: u64, target: (u32, u32), ticket: u64) {
+        // Make admission, transaction allocation and FIR time one synchronous
+        // decision under session state. Pause/leave/output can invalidate a
+        // queued request before this point; no awaited send holds this lock.
+        let (message, transaction) = {
+            let mut state = self.state.lock().await;
+            if self.expected_camera_participant(&state) != Some(stream.0) { return; }
+            let Some(fir_type) = self.video_receive_recovery.dispatch_no_display(stream, incarnation, target, ticket) else { return; };
+            let next = state.outgoing_ctrl_counters.entry(stream.0).or_default();
+            *next += 1;
+            (VCControlData::GenerateKeyFrame(VCGenerateKeyFrame {
+                stream_id: target.0, stream_group_id: target.1, fir_type,
+            }), *next)
+        };
+        info!("FaceTime no-display repair participant={} stream={} message={message:?}", stream.0, stream.1);
+        let wrapper = VcccMessageWrapper { message: Some(message.encode_data(transaction)), ..Default::default() };
+        if let Err(error) = self.send_raw_control_message(stream.0, &wrapper.encode_to_vec(), Some(transaction)).await {
+            warn!("FaceTime no-display repair failed: {error}");
         }
     }
 
@@ -4402,6 +4448,7 @@ impl AVSession {
             video_receive_recovery: Default::default(),
             video_recovery_pacing: Default::default(),
             video_recovery_live: AtomicBool::new(true),
+            video_receiver_visible: AtomicBool::new(false),
         });
 
         let avc_mat_id: [u8; 20] = rand::random();
@@ -4482,8 +4529,14 @@ impl AVSession {
                         let mut lock = session.state.lock().await;
                         let old_participants = lock.active_participants.clone();
                         if lock.active_participants != set {
+                            session.video_receive_recovery.poll_no_display(None);
                             session.video_receive_recovery.retain_participants(&set);
                             session.video_recovery_pacing.retain_participants(&set);
+                            for removed in old_participants.difference(&set) {
+                                if let Some(peer) = lock.encryption_states.get_mut(removed) {
+                                    peer.remote_media = Default::default();
+                                }
+                            }
                             // remove removed participants
                             session.frame_handler.stats.records.write().unwrap().retain(|a, _| set.contains(&a.0));
                             session.frame_handler.stats.timing_targets.write().unwrap().retain(|a, _| set.contains(a));
@@ -4565,10 +4618,13 @@ impl AVSession {
                                             }
                                         }
                                     }
-                                    let _ = session.send_control_message(participant as u64, VCControlData::StreamGroupState(HashMap::from_iter([
-                                        (1u32, 1u8), // video group
-                                        (2u32, 1u8), // audio group
-                                    ]))).await;
+                                    // Camera state may change while encoder work
+                                    // is pending. Sample it after that await;
+                                    // the FIR itself cannot enable the camera.
+                                    let video_enabled = session.state.lock().await.video_enabled;
+                                    let _ = session.send_control_message(participant as u64,
+                                        VCControlData::StreamGroupState(
+                                            video_stream_group_state::fir_response_stream_states(video_enabled))).await;
                                 }
                             }
                             AVControlCommand::SelectVideoBitrate(bps) => {
@@ -4579,6 +4635,26 @@ impl AVSession {
                         }
                     } else {
                         break;
+                    }
+                }
+            }
+        });
+
+        let watchdog_session = Arc::downgrade(&new_session);
+        tokio::spawn(async move {
+            // Local polling cadence; native admission/grace/cooldown are5s.
+            let mut ticks = tokio::time::interval(Duration::from_millis(250));
+            loop {
+                ticks.tick().await;
+                let Some(session) = watchdog_session.upgrade() else { break; };
+                if !session.video_recovery_live.load(Ordering::Acquire) { break; }
+                let due = {
+                    let state = session.state.lock().await;
+                    session.video_receive_recovery.poll_no_display(session.expected_camera_participant(&state))
+                };
+                for (stream, incarnation, target, ticket) in due {
+                    if session.video_recovery_pacing.allow_receiver_fir(stream.0, target.1, target.0) {
+                        session.request_no_display_recovery(stream, incarnation, target, ticket).await;
                     }
                 }
             }
@@ -4602,6 +4678,7 @@ impl AVSession {
 
     async fn set_u1(&self, u1: bool) -> Result<bool, PushError> {
         if self.u1.swap(u1, Ordering::Relaxed) != u1 {
+            self.video_receive_recovery.poll_no_display(None);
             self.update_u1(u1).await?;
             Ok(true)
         } else {
@@ -4640,18 +4717,18 @@ impl AVSession {
         let send = |item| {
             self.send_control_message(item, VCControlData::StreamGroupState(HashMap::from_iter([
                 (136, 0),
-                (128, if video { 1 } else { 2 }),
+                (128, video_stream_group_state::advertised_camera_state(video)),
                 (10, 0),
                 (132, 0),
                 (11, 0),
                 (129, 1),
                 (133, 0),
-                (1, if video { 1 } else { 2 }),
+                (1, video_stream_group_state::advertised_camera_state(video)),
                 (2, 1),
                 (3, 0),
                 (134, 0),
                 (4, 0),
-                (5, if video { 1 } else { 2 }),
+                (5, video_stream_group_state::advertised_camera_state(video)),
                 (130, 0),
                 (6, 1),
                 (135, 0),
@@ -4821,7 +4898,11 @@ impl AVSession {
 
     pub async fn import_avc(&self, p: u64, avc_data: &[u8]) -> Result<(), PushError> {
         let mut state = self.state.lock().await;
+        let previous = state.participant_session_ids.get(&p).cloned();
         state.import_avc(p, avc_data)?;
+        if previous.is_some() && previous.as_ref() != state.participant_session_ids.get(&p) {
+            self.video_receive_recovery.forget_participant(p);
+        }
 
         self.frame_handler.handle_keys(state.get_media_config(p, &self.av_config), true);
         self.frame_handler.handle_keys(state.get_media_config(p, &self.av_config), false);
@@ -5148,8 +5229,21 @@ impl AVSession {
     async fn handle_control(&self, recv: AVInternalMessage) -> Result<(), PushError> {
         match recv {
             AVInternalMessage::Rtcp(rtcp) => {
-                let rtcp_packet = rtc_rtcp::packet::unmarshal(&mut &rtcp.data[..])?;
+                let rtcp_packet = facetime_rtcp::parse(&rtcp.data)?;
                 for packet in rtcp_packet {
+                    if let Some(raw) = packet.as_any().downcast_ref::<rtc_rtcp::raw_packet::RawPacket>() {
+                        let header = packet.header();
+                        if header.packet_type == rtc_rtcp::header::PacketType::PayloadSpecificFeedback
+                            && header.count == 15 {
+                            // Decode the native bounded layouts for diagnosis.
+                            // No encoder reference ACK or bitrate action is
+                            // fabricated from these opposite-direction reports.
+                            let media = raw.0.get(8..12).map(|s| u32::from_be_bytes(s.try_into().unwrap()));
+                            let feedback = facetime_rtcp::application_feedback(raw.0.as_ref())?;
+                            info!("FaceTime RTCP application feedback: bytes={} media_ssrc={media:?} feedback={feedback:?} unhandled=true", raw.0.len());
+                            continue;
+                        }
+                    }
                     info!("Got RTCP packet {:?} {:?}", rtcp.link, packet);
                     if let Some(nack) = packet.as_any().downcast_ref::<TransportLayerNack>() {
                         for missing_seq in nack.nacks.iter().copied().flatten() {
@@ -5219,6 +5313,19 @@ impl AVSession {
                         if let Some(item) = VCControlData::parse_data(&item) {
                             info!("Got control message {item:?}");
                             match item {
+                                VCControlData::StreamGroupState(states) => {
+                                    // Apply authenticated state before the optional
+                                    // control queue; a full queue must not silently
+                                    // lose a peer's pause/enable observation.
+                                    let mut state = self.state.lock().await;
+                                    if let Some(peer) = state.encryption_states.get_mut(&(id as u64)) {
+                                        peer.remote_media.update(&states);
+                                        if peer.remote_media.camera != Some(video_stream_group_state::RemoteMediaState::Enabled) {
+                                            self.video_receive_recovery.poll_no_display(None);
+                                        }
+                                        info!("FaceTime remote media state participant={id} {:?}", peer.remote_media);
+                                    }
+                                },
                                 VCControlData::FetchStreamGroupState => {
                                     self.send_stream_groups_state(Some(id as u64)).await?;
                                 },
