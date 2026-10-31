@@ -4,10 +4,11 @@ use rtc_shared::{error::{Error, Result}, marshal::Unmarshal};
 /// Receive-side diagnostics only. The timestamp is an RTP reference, not a
 /// decoder receipt or permission to acknowledge an encoder reference slot.
 /// iOS27 __VideoReceiver_ProcessVideoRTCPInternal / ProcessRtcpLTRAck.
+/// Type6 frameSize is a packet count (fecFeedback.sizeInPackets), not bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ApplicationFeedback {
     LtrAck { timestamp: u32 },
-    Loss { timestamp: u32, received_packets: u16, frame_size: u8, lost_packets: u8 },
+    Loss { timestamp: u32, received_packets: u16, frame_packet_count: u8, lost_packets: u8 },
     Unknown { identifier: Option<u32> },
 }
 
@@ -37,11 +38,103 @@ pub(super) fn application_feedback(packet: &[u8]) -> Result<ApplicationFeedback>
             Ok(if kind == 5 { ApplicationFeedback::LtrAck { timestamp } } else {
                 ApplicationFeedback::Loss { timestamp,
                     received_packets: u16::from_be_bytes(payload[4..6].try_into().unwrap()),
-                    frame_size: payload[6], lost_packets: payload[7] }
+                    frame_packet_count: payload[6], lost_packets: payload[7] }
             })
         }
         identifier => Ok(ApplicationFeedback::Unknown { identifier }),
     }
+}
+
+/// Wire serializer for iOS 27 PSFB AFB (PT=206, FMT=15) Type-5 LTR ACK and
+/// Type-6 FEC loss feedback (`__RTCPAddPSFBAlfbPacket` 0x205f6a9ec /
+/// `__VideoReceiver_SendRTCPResiliencyInfo` 0x205ffe5cc).
+#[allow(dead_code)]
+pub(super) fn encode_application_feedback(
+    sender_ssrc: u32,
+    media_ssrc: u32,
+    feedback: ApplicationFeedback,
+) -> Result<Vec<u8>> {
+    match feedback {
+        ApplicationFeedback::LtrAck { timestamp } => {
+            let mut buf = Vec::with_capacity(20);
+            buf.extend_from_slice(&[0x8f, 206, 0x00, 0x04]);
+            buf.extend_from_slice(&sender_ssrc.to_be_bytes());
+            buf.extend_from_slice(&media_ssrc.to_be_bytes());
+            buf.extend_from_slice(&5u32.to_be_bytes());
+            buf.extend_from_slice(&timestamp.to_be_bytes());
+            Ok(buf)
+        }
+        ApplicationFeedback::Loss {
+            timestamp,
+            received_packets,
+            frame_packet_count,
+            lost_packets,
+        } => {
+            let mut buf = Vec::with_capacity(24);
+            buf.extend_from_slice(&[0x8f, 206, 0x00, 0x05]);
+            buf.extend_from_slice(&sender_ssrc.to_be_bytes());
+            buf.extend_from_slice(&media_ssrc.to_be_bytes());
+            buf.extend_from_slice(&6u32.to_be_bytes());
+            buf.extend_from_slice(&timestamp.to_be_bytes());
+            buf.extend_from_slice(&received_packets.to_be_bytes());
+            buf.push(frame_packet_count);
+            buf.push(lost_packets);
+            Ok(buf)
+        }
+        ApplicationFeedback::Unknown { .. } => Err(Error::InvalidHeader),
+    }
+}
+
+/// Wire serializer for iOS 27 legacy RTCP LTR ACK (PT=192, FMT=0)
+/// (`__RTCPAddLTRAckPacket` 0x205f650a4). Serializes `sender_ssrc` only
+/// (no remote SSRC field) followed by 1..=16 big-endian u16 tokens with
+/// `0xffff` odd-count tail padding.
+#[allow(dead_code)]
+pub(super) fn encode_legacy_ltr_ack(sender_ssrc: u32, tokens: &[u16]) -> Result<Vec<u8>> {
+    if tokens.is_empty() || tokens.len() > 16 || tokens.contains(&0xffff) {
+        return Err(Error::InvalidHeader);
+    }
+    let dwords = 1 + tokens.len().div_ceil(2);
+    let mut buf = Vec::with_capacity((dwords + 1) * HEADER_LENGTH);
+    buf.push(0x80);
+    buf.push(192);
+    buf.extend_from_slice(&(dwords as u16).to_be_bytes());
+    buf.extend_from_slice(&sender_ssrc.to_be_bytes());
+    for &token in tokens {
+        buf.extend_from_slice(&token.to_be_bytes());
+    }
+    if tokens.len() % 2 == 1 {
+        buf.extend_from_slice(&0xffffu16.to_be_bytes());
+    }
+    Ok(buf)
+}
+
+/// Wire parser for iOS 27 legacy RTCP LTR ACK (PT=192, FMT=0)
+/// (`__VideoReceiver_ProcessRtcpLTRAck` 0x205ff1854). Returns `(sender_ssrc, tokens)`.
+#[allow(dead_code)]
+pub(super) fn parse_legacy_ltr_ack(packet: &[u8]) -> Result<(u32, Vec<u16>)> {
+    if packet.len() < 12 || packet[0] != 0x80 || packet[1] != 192 {
+        return Err(Error::InvalidHeader);
+    }
+    let length_words = usize::from(u16::from_be_bytes([packet[2], packet[3]]));
+    if length_words < 2 || length_words > 9 {
+        return Err(Error::InvalidHeader);
+    }
+    let total_bytes = (length_words + 1) * HEADER_LENGTH;
+    let body = packet.get(..total_bytes).ok_or(Error::PacketTooShort)?;
+    let sender_ssrc = u32::from_be_bytes(body[4..8].try_into().unwrap());
+    let mut tokens = Vec::with_capacity((length_words - 1) * 2);
+    for chunk in body[8..].chunks_exact(2) {
+        let token = u16::from_be_bytes([chunk[0], chunk[1]]);
+        if token == 0xffff {
+            break;
+        }
+        tokens.push(token);
+    }
+    if tokens.is_empty() {
+        return Err(Error::InvalidHeader);
+    }
+    Ok((sender_ssrc, tokens))
 }
 
 /// FaceTime accepts application feedback other than REMB. iOS27's

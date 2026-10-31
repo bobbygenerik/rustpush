@@ -31,7 +31,7 @@ use rtc_rtp::{Header, Packet, codec::{h264::H264Packet, h265::{H265Packet, HevcP
 use rtc_srtp::{cipher::new_cipher, context::Context, protection_profile::ProtectionProfile};
 use rustls::pki_types::{CertificateDer, Ipv4Addr, ServerName, UnixTime};
 use tokio::{select, sync::{Mutex, Notify, broadcast, mpsc}, time::{Instant, sleep, sleep_until}};
-use rtc_shared::{marshal::{Marshal, Unmarshal}, time::SystemInstant};
+use rtc_shared::{marshal::{Marshal, MarshalSize, Unmarshal}, time::SystemInstant};
 use crate::{facetime::{FTWireMessage, my_conv_participant}, ids::link::{GlobalLinkChange, GlobalLinkOutgoingPacket, QuickRelayAllocationsResponse, qrp::{self, IdsqrProtoMaterial}}, util::{bin_deserialize, bin_serialize, decode_hex}};
 use std::str::FromStr;
 use crate::{APSConnection, APSMessage, IdentityManager, MessageTarget, OSConfig, PushError, aps::{APSInterestToken, get_message}, ids::{IDSRecvMessage, identity_manager::{IDSQuickRelaySettings, IDSSendMessage, IdentityResource, Raw}, link::{GlobalLink, GlobalPacket, LinkType}, user::{IDSService, QueryOptions}}, util::{CompactECKey, DebugMutex, DebugRwLock, base64_decode, base64_encode, deflate, duration_since_epoch, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, inflate, plist_to_bin, proto_deserialize_opt, proto_serialize_opt}};
@@ -57,6 +57,19 @@ mod facetime_aac;
 
 #[path = "avconference_fir_target.rs"]
 mod fir_target;
+
+
+/// Existing SRTP MKI offsets, checked against the parsed RTP header boundary.
+/// This reads a candidate key index only; authentication remains in the cipher.
+fn received_srtp_mki(data: &[u8], header_len: usize, sequence: u16,
+    is_group: bool, tag_len: usize) -> Option<[u8; 2]> {
+    let trailer_len = if is_group { 6 } else {
+        tag_len.checked_add(if sequence & 0x7f == 0 { 6 } else { 2 })?
+    };
+    let start = data.len().checked_sub(trailer_len)?;
+    if start < header_len { return None; }
+    data.get(start..start.checked_add(2)?)?.try_into().ok()
+}
 
 struct AudioDepacketizer;
 
@@ -211,9 +224,13 @@ struct QTAtom {
 }
 
 impl QTAtom {
-    fn parse(data: &[u8]) -> Vec<u8> {
-        let (_, description) = Self::from_bytes((data, 0)).unwrap();
-        description.data
+    fn parse(data: &[u8]) -> Option<(&[u8], &[u8])> {
+        let size = u32::from_be_bytes(data.get(..4)?.try_into().ok()?) as usize;
+        // Preserve the existing four-byte zero terminator. Other atoms include
+        // a size and four-byte type; never read beyond the containing slice.
+        if size == 0 { return Some((&data[4..], &[])); }
+        if size < 8 { return None; }
+        Some((data.get(size..)?, data.get(4..size)?))
     }
 
     fn to_atom(data: &[u8]) -> Vec<u8> {
@@ -340,38 +357,30 @@ pub struct ImageDescription {
 }
 
 impl ImageDescription {
-    pub fn decode(desc: &[u8]) -> Self {
-        let parsed = QTAtom::parse(desc);
-        let ((mut extra, _), description) = QTImageDescription::from_bytes((&parsed, 0)).unwrap();
+    pub fn decode(desc: &[u8]) -> Option<Self> {
+        let (_, parsed) = QTAtom::parse(desc)?;
+        let ((mut extra, _), description) = QTImageDescription::from_bytes((parsed, 0)).ok()?;
         info!("Desc {description:?}");
         let mut r#type: Option<ImageDescriptionType> = None;
-        while extra.len() > 0 {
-            let atom = QTAtom::parse(extra);
-            extra = &extra[atom.len() + 4..];
-            if atom.is_empty() { continue };
-
-            let atom_type = str::from_utf8(&atom[..4]).expect("bad atom TYPE?");
-            match atom_type {
-                "avcC" => {
-                    let (_, avcc) = AvccDescription::from_bytes((&atom, 0)).unwrap();
+        while !extra.is_empty() {
+            let (remaining, atom) = QTAtom::parse(extra)?;
+            extra = remaining;
+            if atom.is_empty() { continue; }
+            match atom.get(..4)? {
+                b"avcC" => {
+                    let (_, avcc) = AvccDescription::from_bytes((atom, 0)).ok()?;
                     info!("Got AVCC {avcc:?}");
                     r#type = Some(ImageDescriptionType::H264(avcc));
                 },
-                "hvcC" => {
-                    let (_, hvcc) = HvccDescription::from_bytes((&atom, 0)).unwrap();
+                b"hvcC" => {
+                    let (_, hvcc) = HvccDescription::from_bytes((atom, 0)).ok()?;
                     info!("Got HVCC {hvcc:?}");
                     r#type = Some(ImageDescriptionType::H265(hvcc));
-                }
-                _unk => {
-                    warn!("skipping unknown atom type {_unk}!");
-                    continue;
-                }
+                },
+                unknown => warn!("skipping unknown atom type {unknown:?}!"),
             }
         }
-        Self {
-            desc: description,
-            r#type: r#type.expect("type of this"),
-        }
+        Some(Self { desc: description, r#type: r#type? })
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -535,12 +544,12 @@ pub fn get_stream_id(stream: &VcMediaNegotiationBlobV2StreamGroupStream) -> u32 
 }
 
 
-// 24khz SSRCs will roll over after 2 days.
-// When this happens, maybe you should hang up the call and get some sleep.
+// RTP timestamps wrap and may start near that boundary. Keep playback-head
+// ownership explicit and compare observed timestamps in the modular half-range.
 #[derive(Default)]
 struct FTQualityZipper {
     current_ssrc: u32,
-    current_ssrc_timestamp: u32,
+    current_ssrc_timestamp: Option<u32>,
     mark_fail: u16,
     ssrc_codecs: HashMap<u32, (Option<u32> /* first inactive timestamp after playback head */, AVSessionCodec)>,
     flushed_samples: VecDeque<Sample>,
@@ -558,17 +567,31 @@ impl FTQualityZipper {
             .or_insert_with(|| (None, AVSessionCodec::from_payload(packet.header.payload_type).unwrap()));
 
         if packet_ssrc != self.current_ssrc {
-            let force_switch = packet.header.timestamp > self.current_ssrc_timestamp + 2400;
+            let force_switch = match self.current_ssrc_timestamp {
+                Some(head) => {
+                    let advance = packet.header.timestamp.wrapping_sub(head);
+                    advance > 2400 && advance < 0x8000_0000
+                },
+                // Preserve the existing pre-playback selection behavior.
+                None => packet.header.timestamp > 2400,
+            };
             let clean_switch = {
                 let codec = self.ssrc_codecs.get_mut(&packet_ssrc).unwrap();
                 let candidate_start = match codec.0 {
-                    Some(start) if self.current_ssrc_timestamp <= start => {
-                        start.min(packet.header.timestamp)
+                    Some(start) if self.current_ssrc_timestamp
+                        .is_none_or(|head| start.wrapping_sub(head) < 0x8000_0000) => {
+                        if self.current_ssrc_timestamp.is_none() {
+                            start.min(packet.header.timestamp)
+                        } else if packet.header.timestamp.wrapping_sub(start) < 0x8000_0000 {
+                            start
+                        } else {
+                            packet.header.timestamp
+                        }
                     },
                     _ => packet.header.timestamp,
                 };
                 codec.0 = Some(candidate_start);
-                candidate_start.wrapping_sub(self.current_ssrc_timestamp) < 1500 /* 15fps */
+                candidate_start.wrapping_sub(self.current_ssrc_timestamp.unwrap_or(0)) < 1500 /* 15fps */
             };
 
             if force_switch || clean_switch {
@@ -619,7 +642,8 @@ impl FTQualityZipper {
                 (self.ssrc_codecs.get_mut(&self.current_ssrc)?.1.pop()?, true)
             };
 
-            if popped.packet_timestamp < self.current_ssrc_timestamp {
+            if self.current_ssrc_timestamp.is_some_and(|head|
+                popped.packet_timestamp.wrapping_sub(head) >= 0x8000_0000) {
                 continue;
             }
 
@@ -657,7 +681,7 @@ impl FTQualityZipper {
                 self.mark_fail = 0;
             }
 
-            self.current_ssrc_timestamp = popped.packet_timestamp;
+            self.current_ssrc_timestamp = Some(popped.packet_timestamp);
             return Some((popped, orig_dropped));
         }
     }
@@ -1825,16 +1849,12 @@ impl IncomingFrameHandler {
 
                     let ssrc = master_ssrc_map.get(&header.ssrc);
                     let mki: Option<[u8; 2]> = if let Some(&(_ssrc, is_group)) = ssrc {
-                        Some(if is_group {
-                            recv.data[recv.data.len() - 6..recv.data.len() - 6 + 2].try_into().unwrap()
-                        } else {
-                            let hmac_len = payload.tag_len();
-                            if header.sequence_number & 0x7f == 0 {
-                                recv.data[recv.data.len() - hmac_len - 6..recv.data.len() - hmac_len - 6 + 2].try_into().unwrap()
-                            } else {
-                                recv.data[recv.data.len() - hmac_len - 2..recv.data.len() - hmac_len - 2 + 2].try_into().unwrap()
-                            }
-                        })
+                        let Some(index) = received_srtp_mki(&recv.data, header.marshal_size(),
+                            header.sequence_number, is_group, payload.tag_len()) else {
+                            warn!("Dropping truncated SRTP trailer for SSRC {}", header.ssrc);
+                            continue;
+                        };
+                        Some(index)
                     } else { None };
 
                     let (ssrc, is_group, mki) = match ssrc_state.entry((header.ssrc, mki)).or_insert_with(|| SSRCState::Waiting(vec![], SystemTime::now() + Duration::from_secs(5))) {
@@ -1881,7 +1901,13 @@ impl IncomingFrameHandler {
                             continue
                         }
                     };
-                    let unmarshalled = rtc_rtp::Packet::unmarshal(&mut result).unwrap();
+                    let unmarshalled = match rtc_rtp::Packet::unmarshal(&mut result) {
+                        Ok(packet) => packet,
+                        Err(error) => {
+                            warn!("Dropping malformed authenticated RTP for SSRC {}: {error}", header.ssrc);
+                            continue;
+                        }
+                    };
                     // Feedback and receive accounting must not trust an unauthenticated extension.
                     let video_meta = match stat_tracker.track(&recv, &header, tracked_packets, &control, &ssrc) {
                         Ok(data) => data,
@@ -2086,6 +2112,13 @@ impl IncomingFrameHandler {
                                     continue;
                                 }
                                 data = remaining;
+                            } else if matches!(channel_type, ChannelType::H264 | ChannelType::H265)
+                                && annex_b_payload_start(data).unwrap_or(data)
+                                    .starts_with(&[0x92, 0xe6, 0xc0, 0xa3]) {
+                                // Recognized but invalid configuration is not a
+                                // compressed picture and must not reach a codec.
+                                warn!("Discarding malformed image description for SSRC {header_ssrc}");
+                                continue;
                             }
                             // info!("Smaple before {} {} {}", encode_hex(&data), sample.prev_dropped_packets, recv.packet_id);
                             let mut frame_meta = HashMap::new();
@@ -5950,12 +5983,9 @@ impl DecoderConfiguration {
         
         let annex_start: &[u8] = annex_b_payload_start(packet).unwrap_or(packet);
         if annex_start.starts_with(&[0x92, 0xe6, 0xc0, 0xa3]) {
-            let size = u32::from_be_bytes(annex_start.get(4..8)?.try_into().ok()?) as usize;
-            if size < 8 {
-                return None
-            }
-            let end = size + 4;
-            return Some((&annex_start[end..], Self::ImageDescription(ImageDescription::decode(&annex_start.get(4..end)?))))
+            let (end, description) = apple_image_description_payload(annex_start)?;
+            return Some((annex_start.get(end..)?,
+                Self::ImageDescription(ImageDescription::decode(description)?)))
         }
 
         let mut total_config = vec![];
@@ -5963,11 +5993,11 @@ impl DecoderConfiguration {
         while let Some(nal) = annex_b.next() {
             let is_config = match format {
                 ChannelType::H264 => {
-                    let nal_type = nal[0] & 0x1f;
+                    let nal_type = nal.first()? & 0x1f;
                     matches!(nal_type, 7 /* SPS */ | 8 /* PPS */)
                 },
                 ChannelType::H265 => {
-                    let nal_type = (nal[0] >> 1) & 0x3f;
+                    let nal_type = (nal.first()? >> 1) & 0x3f;
                     matches!(nal_type, 32 /* VPS */ | 33 /* SPS */ | 34 /* PPS */)
                 },
                 _ => return None
