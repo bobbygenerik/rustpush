@@ -1135,6 +1135,48 @@ impl<'t> Iterator for AudioParser<'t> {
     }
 }
 
+// Decode the existing RED layout atomically: malformed redundancy must not
+// panic the media worker or dispatch a partially unfolded packet.
+fn parse_red_audio(unmarshalled: &Packet) -> Option<Vec<Packet>> {
+    let mut bytes = &unmarshalled.payload[..];
+    let mut segments = vec![];
+    loop {
+        let mut header = unmarshalled.header.clone();
+        if bytes.first()? & 0x80 != 0 {
+            let ((remaining, _), redundant) = RedRedundantHeader::from_bytes((bytes, 0)).ok()?;
+            bytes = remaining;
+            header.timestamp = header.timestamp.wrapping_sub(redundant.timestamp_offset as u32);
+            header.payload_type = redundant.header.payload_type;
+            segments.push((header, Some(redundant.block_len as usize)));
+        } else {
+            let ((remaining, _), primary) = RedHeader::from_bytes((bytes, 0)).ok()?;
+            bytes = remaining;
+            header.payload_type = primary.payload_type;
+            segments.push((header, None));
+            break;
+        }
+    }
+
+    let mut packets = Vec::with_capacity(segments.len());
+    for (mut header, length) in segments {
+        // Only the primary block consumes the remainder. A redundant block's
+        // explicit zero length must not consume subsequent blocks.
+        let (data, remaining) = bytes.split_at_checked(length.unwrap_or(bytes.len()))?;
+        if header.timestamp != unmarshalled.header.timestamp {
+            let mut audio = AudioParser(data);
+            let frames = audio.by_ref().count();
+            if frames == 0 || !audio.0.is_empty() { return None; }
+            let packet_time_len = u32::try_from(frames).ok()?.checked_mul(480)?;
+            let timestamp_delta = unmarshalled.header.timestamp.wrapping_sub(header.timestamp);
+            let seq_delta = ((timestamp_delta + packet_time_len / 2) / packet_time_len).max(1) as u16;
+            header.sequence_number = header.sequence_number.wrapping_sub(seq_delta);
+        }
+        packets.push(Packet { header, payload: data.to_vec().into() });
+        bytes = remaining;
+    }
+    Some(packets)
+}
+
 enum IncomingFrameFn {
     Pending(std::sync::Mutex<Vec<ChannelMessage>>),
     Handler(Box<dyn Fn(ChannelMessage) + Send + Sync>),
@@ -1982,48 +2024,11 @@ impl IncomingFrameHandler {
                     let mut packets = vec![];
                     
                     if payload == AVSessionPayload::Red {
-                        let mut segments = vec![];
-                        let mut bytes = &unmarshalled.payload[..];
-                        loop {
-                            let is_redundant = bytes[0] & 0x80 != 0;
-                            let mut header = unmarshalled.header.clone();
-
-                            if is_redundant {
-                                let ((remaining, _), redundant) = RedRedundantHeader::from_bytes((bytes, 0)).unwrap();
-                                bytes = remaining;
-
-                                header.timestamp = header.timestamp.wrapping_sub(redundant.timestamp_offset as u32);
-                                header.payload_type = redundant.header.payload_type;
-                                
-                                segments.push((header, redundant.block_len as usize));
-                            } else {
-                                let ((remaining, _), redundant) = RedHeader::from_bytes((bytes, 0)).unwrap();
-                                header.payload_type = redundant.payload_type;
-                                bytes = remaining;
-                                segments.push((header, 0));
-                                break;
-                            }
-                        }
-                        
-                        for (mut header, mut len) in segments {
-                            if len == 0 {
-                                len = bytes.len();
-                            }
-                            if header.timestamp != unmarshalled.header.timestamp {
-                                let packet_time_len = (AudioParser(&bytes[..len]).count() * 480) as u32;
-                                let timestamp_delta = unmarshalled.header.timestamp.wrapping_sub(header.timestamp);
-                                let seq_delta = ((timestamp_delta + (packet_time_len / 2)) / packet_time_len).max(1) as u16;
-                                header.sequence_number = header.sequence_number.wrapping_sub(seq_delta);
-                            }
-
-                            // info!("Header RED {:?} {}", header, encode_hex(&bytes[..len]));
-                            packets.push(Packet {
-                                header,
-                                payload: bytes[..len].to_vec().into(),
-                            });
-                            
-                            bytes = &bytes[len..];
-                        }
+                        let Some(decoded) = parse_red_audio(&unmarshalled) else {
+                            warn!("Discarding malformed RED audio for SSRC {}", header.ssrc);
+                            continue;
+                        };
+                        packets = decoded;
                     } else if let Some(fec) = video_meta.as_ref().and_then(|v| v.fec_header.as_ref()) {
                         let Some(position) = fec.packet_index() else { continue };
                         let group = ssrc.fec_data.entry(header.timestamp).or_default()
