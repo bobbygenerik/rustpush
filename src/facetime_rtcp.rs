@@ -86,12 +86,13 @@ pub(super) fn encode_application_feedback(
 }
 
 /// Wire serializer for iOS 27 legacy RTCP LTR ACK (PT=192, FMT=0)
-/// (`__RTCPAddLTRAckPacket` 0x205f650a4). Serializes `sender_ssrc` only
-/// (no remote SSRC field) followed by 1..=16 big-endian u16 tokens with
-/// `0xffff` odd-count tail padding.
+/// (`_RTPSendRTCP` 0x205f650a4). Serializes `sender_ssrc` only
+/// (no remote SSRC field) followed by 1..=10 big-endian u16 tokens (native
+/// writer buffer bounds check at 0x205f653e0) with `0xffff` odd-count tail
+/// padding.
 #[allow(dead_code)]
 pub(super) fn encode_legacy_ltr_ack(sender_ssrc: u32, tokens: &[u16]) -> Result<Vec<u8>> {
-    if tokens.is_empty() || tokens.len() > 16 || tokens.contains(&0xffff) {
+    if tokens.is_empty() || tokens.len() > 10 || tokens.contains(&0xffff) {
         return Err(Error::InvalidHeader);
     }
     let dwords = 1 + tokens.len().div_ceil(2);
@@ -109,8 +110,12 @@ pub(super) fn encode_legacy_ltr_ack(sender_ssrc: u32, tokens: &[u16]) -> Result<
     Ok(buf)
 }
 
-/// Wire parser for iOS 27 legacy RTCP LTR ACK (PT=192, FMT=0)
-/// (`__VideoReceiver_ProcessRtcpLTRAck` 0x205ff1854). Returns `(sender_ssrc, tokens)`.
+/// Wire parser for iOS 27 legacy RTCP LTR ACK (PT=192, FMT=0).
+///
+/// Not matched to a native function: 0x205ff1854 is `__VideoReceiver_SendRTCP`,
+/// and the real `__VideoReceiver_ProcessRtcpLTRAck` at 0x206008aa0 receives one
+/// already-selected 32-bit value rather than parsing PT=192 u16 tokens.
+/// Returns `(sender_ssrc, tokens)`.
 #[allow(dead_code)]
 pub(super) fn parse_legacy_ltr_ack(packet: &[u8]) -> Result<(u32, Vec<u16>)> {
     if packet.len() < 12 || packet[0] != 0x80 || packet[1] != 192 {
@@ -162,4 +167,22 @@ pub(super) fn parse(mut data: &[u8]) -> Result<Vec<Box<dyn Packet>>> {
         data = &data[length..];
     }
     Ok(packets)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_legacy_ltr_ack_enforces_ten_token_native_limit() {
+        let max = encode_legacy_ltr_ack(0x1122_3344, &[0x1234; 10]).unwrap();
+        assert_eq!(parse_legacy_ltr_ack(&max).unwrap(), (0x1122_3344, vec![0x1234; 10]));
+
+        let odd = encode_legacy_ltr_ack(0x1122_3344, &[0x0042, 0x0043, 0x0044]).unwrap();
+        assert_eq!(parse_legacy_ltr_ack(&odd).unwrap(), (0x1122_3344, vec![0x0042, 0x0043, 0x0044]));
+
+        assert!(encode_legacy_ltr_ack(0x1122_3344, &[]).is_err());
+        assert!(encode_legacy_ltr_ack(0x1122_3344, &[0x1234; 11]).is_err());
+        assert!(encode_legacy_ltr_ack(0x1122_3344, &[0xffff]).is_err());
+    }
 }
