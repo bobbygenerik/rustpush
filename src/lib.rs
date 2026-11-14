@@ -8,6 +8,7 @@ mod error;
 mod auth;
 mod delegate_request;
 mod ids;
+pub mod audio_stall;
 pub mod avconference;
 pub mod sharedstreams;
 pub mod findmy;

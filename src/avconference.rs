@@ -1738,7 +1738,8 @@ pub struct IncomingFrameHandler {
     target_audio: std::sync::mpsc::SyncSender<IncomingFrameCommand>,
     target_control: tokio::sync::mpsc::Sender<AVInternalMessage>,
     handler: Arc<std::sync::RwLock<IncomingFrameFn>>,
-    stats: Arc<IncomingFrameStats>,
+    pub stats: Arc<IncomingFrameStats>,
+    pub last_audio_arrival: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
 }
 
 impl IncomingFrameHandler {
@@ -1750,18 +1751,21 @@ impl IncomingFrameHandler {
         let handler = Arc::new(std::sync::RwLock::new(IncomingFrameFn::Pending(std::sync::Mutex::new(vec![]))));
 
         let stats = Arc::new(IncomingFrameStats::default());
+        let last_audio_arrival = Arc::new(std::sync::Mutex::new(None));
+        let last_audio_arrival_audio = last_audio_arrival.clone();
+
         let handler1 = handler.clone();
         let stats1 = stats.clone();
         let control = target_control.clone();
         std::thread::spawn(move || {
-            Self::handle_media(recv_video, handler1, stats1, control, false);
+            Self::handle_media(recv_video, handler1, stats1, control, None, false);
         });
 
         let handler1 = handler.clone();
         let stats1 = stats.clone();
         let control = target_control.clone();
         std::thread::spawn(move || {
-            Self::handle_media(recv_audio, handler1, stats1, control, true);
+            Self::handle_media(recv_audio, handler1, stats1, control, Some(last_audio_arrival_audio), true);
         });
 
         (Arc::new(Self {
@@ -1769,11 +1773,12 @@ impl IncomingFrameHandler {
             target_control,
             target_video,
             handler,
-            stats
+            stats,
+            last_audio_arrival,
         }), recv_control)
     }
 
-    fn handle_media(channel: std::sync::mpsc::Receiver<IncomingFrameCommand>, incoming_handler: Arc<std::sync::RwLock<IncomingFrameFn>>, stats: Arc<IncomingFrameStats>, control: tokio::sync::mpsc::Sender<AVInternalMessage>, audio: bool) {
+    fn handle_media(channel: std::sync::mpsc::Receiver<IncomingFrameCommand>, incoming_handler: Arc<std::sync::RwLock<IncomingFrameFn>>, stats: Arc<IncomingFrameStats>, control: tokio::sync::mpsc::Sender<AVInternalMessage>, last_audio_arrival: Option<Arc<std::sync::Mutex<Option<std::time::Instant>>>>, audio: bool) {
         let mut ssrc_map: HashMap<u32, AVSessionSSRC> = HashMap::new();
         let mut master_ssrc_map: HashMap<u32, (u32 /* 'stream-specific' SSRC (u1 SSRC) */, bool /* is group */)> = HashMap::new();
         let mut ssrc_state: HashMap<(u32, Option<[u8; 2]>), SSRCState> = HashMap::new();
@@ -1950,6 +1955,13 @@ impl IncomingFrameHandler {
                             continue;
                         }
                     };
+                    if audio && !is_group {
+                        if let Some(arrival_lock) = &last_audio_arrival {
+                            if let Ok(mut last) = arrival_lock.lock() {
+                                *last = Some(recv.time_parsed.into_std());
+                            }
+                        }
+                    }
                     // Feedback and receive accounting must not trust an unauthenticated extension.
                     let video_meta = match stat_tracker.track(&recv, &header, tracked_packets, &control, &ssrc) {
                         Ok(data) => data,
@@ -4614,6 +4626,7 @@ impl AVSession {
 
         let session_handle = Arc::downgrade(&new_session);
         let session_weak = session_handle.clone();
+        let stall_session = session_handle.clone();
         tokio::spawn(async move {
             while let Some(ctrl) = ctrl_raw_recv.recv().await {
                 let Some(session_handle) = session_handle.upgrade() else { break };
@@ -4622,6 +4635,76 @@ impl AVSession {
                 }
             }
             info!("CLEANUP: Internal control torn down!");
+        });
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(20));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut detector = crate::audio_stall::AudioStallDetector::new();
+            let mut policy = crate::audio_stall::AudioStallPolicy::new();
+            let mut disconnected = false;
+
+            loop {
+                interval.tick().await;
+                let Some(session) = stall_session.upgrade() else { break; };
+                if !session.video_recovery_live.load(Ordering::Acquire) { break; }
+                if !session.u1.load(Ordering::Relaxed) { continue; }
+                if disconnected { break; }
+
+                let last_arrival = session
+                    .frame_handler
+                    .last_audio_arrival
+                    .lock()
+                    .ok()
+                    .and_then(|g| *g);
+
+                let now = std::time::Instant::now();
+                if let Some(report) = detector.poll(now, last_arrival) {
+                    let audio_expected = {
+                        let state = session.state.lock().await;
+                        let peer = if state.active_participants.len() == 1 {
+                            let id = *state.active_participants.iter().next().unwrap();
+                            state.encryption_states.get(&id)
+                        } else if state.encryption_states.len() == 1 {
+                            state.encryption_states.values().next()
+                        } else {
+                            state.active_participants.iter().find_map(|id| state.encryption_states.get(id))
+                        };
+                        peer.is_some_and(|p| p.remote_media.microphone == Some(video_stream_group_state::RemoteMediaState::Enabled))
+                    };
+
+                    let action = policy.on_report(report, audio_expected);
+                    match action {
+                        crate::audio_stall::Action::None => {}
+                        crate::audio_stall::Action::StallingChanged(stalling) => {
+                            info!("[AudioStall] 1:1 remote audio stalling changed: {stalling}");
+                        }
+                        crate::audio_stall::Action::Disconnect { seconds } => {
+                            warn!(
+                                "[AudioStall] 1:1 remote audio stall exceeded disconnect threshold ({}s); terminating call",
+                                seconds
+                            );
+                            disconnected = true;
+
+                            let _ = crate::facetime::native_signaling::publish_native_signal(
+                                session.session_id.clone(),
+                                None,
+                                crate::facetime::native_signaling::FTNativeSignal::CallTerminated {
+                                    reason: format!("no remote packets ({}s)", seconds),
+                                },
+                            );
+
+                            session.stop_video_recovery();
+                            if let Err(e) = session.link.unalloc_bind().await {
+                                warn!("[AudioStall] Failed to unbind relay on disconnect: {e}");
+                            }
+
+                            break;
+                        }
+                    }
+                }
+            }
+            info!("CLEANUP: Audio stall detector task torn down!");
         });
 
         let control_recv_opt = new_session.control.lock().await.take();
