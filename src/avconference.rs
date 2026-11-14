@@ -4670,7 +4670,7 @@ impl AVSession {
                         } else {
                             state.active_participants.iter().find_map(|id| state.encryption_states.get(id))
                         };
-                        peer.is_some_and(|p| p.remote_media.microphone == Some(video_stream_group_state::RemoteMediaState::Enabled))
+                        peer.is_some_and(|p| is_remote_audio_expected(p.remote_media.microphone))
                     };
 
                     let action = policy.on_report(report, audio_expected);
@@ -7088,6 +7088,43 @@ mod frame_feature_tests {
         let (payload, metadata) = features.parse_frame(&[101, 165, 90, 1]).unwrap();
         assert_eq!(payload, &[101]);
         assert_eq!(metadata.get("RVRA1").map(Vec::as_slice), Some(&[165, 90][..]));
+    }
+}
+
+pub use video_stream_group_state::RemoteMediaState;
+
+/// Whether 1:1 remote audio is expected by the stall detector given the peer's
+/// known microphone media state.
+///
+/// iOS 27.0.1 `AVConference` arms audio from call start (`_remoteAudioEnabled = 1`,
+/// `_remoteAudioPaused = 0` in `-[VCSessionParticipantRemote initWithConfig:delegate:]`,
+/// `0x20609a884..0x20609a8a8`) before any `RemoteMediaStates` message arrives (`None` -> `true`).
+/// State `2` (`Paused`) dispatches `dispatchedSetRemoteAudioPaused:YES` (`0x20609fe08..0x20609fe30`);
+/// state `1` (`Enabled`) dispatches `dispatchedSetRemoteAudioEnabled:YES` and
+/// `dispatchedSetRemoteAudioPaused:NO` (`0x20609fb20..0x20609fb54`).
+/// `Disabled` (`0`, `dispatchedSetRemoteAudioEnabled:NO`) and `Unresolved` (`> 2`, ignored by
+/// `setRemoteMediaState:forMediaType:`) retain their prior `false` behaviour.
+pub fn is_remote_audio_expected(microphone: Option<RemoteMediaState>) -> bool {
+    match microphone {
+        None | Some(RemoteMediaState::Enabled) => true,
+        Some(RemoteMediaState::Paused) => false,
+        Some(RemoteMediaState::Disabled)
+        | Some(RemoteMediaState::Unresolved) => false,
+    }
+}
+
+#[cfg(test)]
+mod audio_expected_tests {
+    use super::is_remote_audio_expected;
+    use super::video_stream_group_state::RemoteMediaState;
+
+    #[test]
+    fn audio_expected_armed_from_call_start_and_disarmed_on_pause() {
+        assert!(is_remote_audio_expected(None));
+        assert!(!is_remote_audio_expected(Some(RemoteMediaState::Paused)));
+        assert!(is_remote_audio_expected(Some(RemoteMediaState::Enabled)));
+        assert!(!is_remote_audio_expected(Some(RemoteMediaState::Disabled)));
+        assert!(!is_remote_audio_expected(Some(RemoteMediaState::Unresolved)));
     }
 }
 

@@ -12,7 +12,7 @@ pub(super) fn parse_stream_group_state_payload(payload: &[u8]) -> Option<HashMap
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum RemoteMediaState {
+pub enum RemoteMediaState {
     Disabled,
     Enabled,
     Paused,
