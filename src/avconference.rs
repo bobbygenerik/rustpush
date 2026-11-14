@@ -1346,6 +1346,8 @@ pub struct RecvStatTracker {
     our_ssrc: u32,
     /// Last time we sent a Receiver Report.
     last_rr_send: Option<Instant>,
+    /// Last received camera status byte from RTP header extension `(profile >> 8) as u8`.
+    last_camera_status_byte: Option<u8>,
 }
 
 impl RecvStatTracker {
@@ -1367,6 +1369,7 @@ impl RecvStatTracker {
             ssrc_rr_state: HashMap::new(),
             our_ssrc: rand::random(),
             last_rr_send: None,
+            last_camera_status_byte: None,
         }
     }
 
@@ -1438,7 +1441,16 @@ impl RecvStatTracker {
         // Reject malformed video metadata before frame accounting. The caller
         // must drop the packet, not mistake a failed FEC parse for plain video.
         let video_data = if matches!(payload, AVSessionPayload::H265 | AVSessionPayload::H264) && !header.extensions.is_empty() {
-            Some(FTVideoControlData::from_ext(header.extension_profile, header.extensions[0].payload.to_vec()).ok_or(())?)
+            let ctrl = FTVideoControlData::from_ext(header.extension_profile, header.extensions[0].payload.to_vec()).ok_or(())?;
+            let raw_byte = (header.extension_profile >> 8) as u8;
+            if self.last_camera_status_byte != Some(raw_byte) {
+                self.last_camera_status_byte = Some(raw_byte);
+                info!(
+                    "[FTVideo] remote camera status changed: raw=0x{:02x} orientation={:?}",
+                    raw_byte, ctrl.camera_status.orientation
+                );
+            }
+            Some(ctrl)
         } else { None };
         let feedback_configuration = ssrc.feedback.configuration();
         if self.audio && self.audio_history_context != Some((ssrc.owner, feedback_configuration)) {
