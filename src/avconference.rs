@@ -1804,6 +1804,8 @@ impl IncomingFrameHandler {
         let mut video_timing = HashMap::<(u32, u8), video_receive_timing::VideoReceiveTiming>::new();
         let mut video_windows = HashMap::<(u32, u8), video_receive_diagnostics::VideoReceiveWindow>::new();
         let mut video_nacks = HashMap::<u32, (i64, video_nack::VideoNackGenerator)>::new();
+        let mut last_config_camera_meta: Option<FTVideoCameraStatus> = None;
+        let mut last_sample_camera_meta: Option<FTVideoCameraStatus> = None;
         let mut retry_enqueue_after = Duration::ZERO;
         loop {
             let now = diagnostic_epoch.elapsed();
@@ -2119,6 +2121,14 @@ impl IncomingFrameHandler {
                             }
                             if let Some((remaining, config)) = DecoderConfiguration::parse(data, channel_type) {
                                 info!("mediainfo {:?}", config);
+                                let config_camera_meta = video_meta.as_ref().map(|i| i.camera_status);
+                                if config_camera_meta != last_config_camera_meta {
+                                    last_config_camera_meta = config_camera_meta;
+                                    info!(
+                                        "[FTVideo] config camera_meta changed: {:?}",
+                                        config_camera_meta.map(|m| (m.orientation, m.orientation as u8, m.is_back, m.is_mirrored))
+                                    );
+                                }
                                 incoming_handler.read().unwrap().handle(ChannelMessage {
                                     participant: ssrc.owner,
                                     stream_id: if is_group { header_ssrc & 0xffff } else { 0 },
@@ -2192,6 +2202,16 @@ impl IncomingFrameHandler {
                                         }
                                     })
                             } else { None };
+                            let sample_camera_meta = video_meta.as_ref().map(|i| i.camera_status);
+                            if matches!(channel_type, ChannelType::H264 | ChannelType::H265)
+                                && sample_camera_meta != last_sample_camera_meta
+                            {
+                                last_sample_camera_meta = sample_camera_meta;
+                                info!(
+                                    "[FTVideo] sample camera_meta changed: {:?}",
+                                    sample_camera_meta.map(|m| (m.orientation, m.orientation as u8, m.is_back, m.is_mirrored))
+                                );
+                            }
                             incoming_handler.read().unwrap().handle(ChannelMessage {
                                 participant: ssrc.owner,
                                 // maybe this if isn't nessesary, it's possible if not likely stream ID sent in u1 mode is ssrc & 0xffff.
@@ -2720,7 +2740,7 @@ impl VCControlData {
 
 // source is 0 (normal), 1 (screen), 2, 3, (reserved)
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct FTVideoCameraStatus {
     pub orientation: DeviceOrientation,
     pub is_mirrored: bool,
