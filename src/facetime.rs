@@ -986,9 +986,16 @@ impl FTClient {
         let mut my_session = self.state.write().await;
         my_session.cleanup();
         let group = session.group_id.clone();
+        let session_reused = my_session.sessions.contains_key(&group);
         my_session.sessions.insert(group.clone(), session);
 
         let session = my_session.sessions.get_mut(&group).unwrap();
+        info!(
+            "Outgoing FaceTime session: guid={} state={} members={:?}",
+            group,
+            if session_reused { "reused" } else { "fresh" },
+            session.members.iter().map(|m| m.handle.as_str()).collect::<Vec<_>>()
+        );
 
         self.join(session, true).await?;
 
@@ -1130,6 +1137,17 @@ impl FTClient {
         let my_participant = builder_session.participants.values().find(|p| &p.token == &base64_encoded).ok_or(PushError::NoParticipantTokenIndex)?.clone();
 
         let targets = self.identity.cache.lock().await.get_participants_targets(&topic, &handle, &relevant_people);
+        info!(
+            "Outgoing FaceTime {}: guid={} sender={} recipients={:?} targets={} participants={} active_participants={} pending_keys={}",
+            if ring { "invitation/ring" } else { "join" },
+            builder_session.group_id,
+            handle,
+            relevant_people,
+            targets.len(),
+            builder_session.participants.len(),
+            builder_session.participants.values().filter(|p| p.active.is_some()).count(),
+            builder_session.pending_keys.len(),
+        );
         self.identity.send_message(topic, IDSSendMessage {
             sender: handle.clone(),
             raw: Raw::Builder(Box::new(move |target| {
@@ -1682,6 +1700,14 @@ impl FTClient {
                     }
                 },
                 ConversationMessageType::Decline => {
+                    info!(
+                        "Incoming FaceTime Decline: guid={} sender={} token={} target={} decoded={:?}",
+                        decoded.conversation_group_uuid_string,
+                        sender,
+                        encode_hex(&token),
+                        target,
+                        decoded
+                    );
                     let mut state = self.state.write().await;
                     let guid = decoded.conversation_group_uuid_string.clone();
                     let _ = native_signaling::publish_native_signal(
