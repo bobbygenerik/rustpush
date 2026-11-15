@@ -10,6 +10,7 @@ mod delegate_request;
 mod ids;
 pub mod audio_stall;
 pub mod avconference;
+pub mod bandwidth_estimator;
 pub mod sharedstreams;
 pub mod findmy;
 pub mod facetime;
