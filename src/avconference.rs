@@ -2859,7 +2859,7 @@ impl FTVideoCameraStatus {
         }
     }
 
-    fn encode(&self) -> u8 {
+    pub fn encode(&self) -> u8 {
         self.orientation as u8
             | (self.is_mirrored as u8) << 2
             | (self.is_back as u8) << 3
@@ -6356,6 +6356,8 @@ pub struct FTMediaFrameEnvelope {
     pub decode_receipt: Option<u64>,
     pub height: Option<i32>,
     pub camera_orientation: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub camera_status_bits: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub receive_timing: Option<FTReceiveTiming>,
     #[serde(serialize_with = "serialize_frame_b64")]

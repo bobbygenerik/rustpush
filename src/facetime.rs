@@ -739,6 +739,7 @@ impl FTClient {
                     width,
                     height,
                     camera_orientation: msg.camera_meta.map(|m| m.orientation as u8),
+                    camera_status_bits: msg.camera_meta.map(|m| m.encode() | 0x80),
                     receive_timing: msg.receive_timing.clone(),
                     frame,
                 });
