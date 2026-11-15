@@ -301,8 +301,9 @@ impl VCRateControlBandwidthEstimator {
         // 0x2063b9f14..0x2063b9f24:
         // If RAT is 5 or 6 AND !is_first_packet (`+0x45`), perform initial averaging (`loc_2063ba210`).
         if is_rat_5_or_6 && !self.is_first_packet {
-            let half_est = self.estimated_bandwidth * 0.5;
-            let sample_for_avg = if bwe < half_est { bwe } else { half_est };
+            // 0x2063ba210..0x2063ba21c: d0 holds _maxDetectableBandwidth (`[x19, #0x178]`)
+            let half_max = self.max_detectable_bandwidth * 0.5;
+            let sample_for_avg = if bwe < half_max { bwe } else { half_max };
             let prev_state = self.bandwidth_estimation_state;
             let new_state = prev_state + 1;
             self.bandwidth_estimation_state = new_state;
@@ -371,8 +372,9 @@ impl VCRateControlBandwidthEstimator {
 
         // 0x2063ba0c8..0x2063ba1a4: initial estimation when est == 0.0
         if est == 0.0 {
-            let init_cap = 100_000.0; // 0x2066a3f88
-            self.estimated_bandwidth = if bwe < init_cap { bwe } else { init_cap };
+            let init_floor = 100_000.0; // 0x2066a3f88
+            // 0x2063ba0d8..0x2063ba0dc: fcmp d8, d0; fcsel d0, d0, d8, mi -> MAX(bwe, 100_000.0)
+            self.estimated_bandwidth = if bwe < init_floor { init_floor } else { bwe };
             self.sudden_change_state = 0;
             if self.forced_initial_bandwidth_estimation != 0 {
                 self.estimated_bandwidth = self.forced_initial_bandwidth_estimation as f64;
@@ -681,16 +683,17 @@ impl VCRateControlBandwidthEstimator {
 
             let mut next_bytes = 0u32;
             if !is_probing {
-                // 0x2063ba57c..0x2063ba588
+                // 0x2063ba57c..0x2063ba588: head is late iff (early_time > 0.0 && arrival_time < early_time)
                 let early_t = self.early_probing_packet_arrival_time;
-                if early_t > 0.0 && arrival_time >= early_t {
-                    self.total_bytes_in_probing_sequence = 0;
-                    self.total_packets_in_probing_sequence = 0;
-                } else {
-                    // 0x2063ba660
+                if early_t > 0.0 && arrival_time < early_t {
+                    // 0x2063ba5b8 -> 0x2063ba660
                     next_bytes = self.early_bytes_in_probing_sequence;
                     self.total_bytes_in_probing_sequence = next_bytes;
                     self.total_packets_in_probing_sequence = self.early_packets_in_probing_sequence;
+                } else {
+                    // 0x2063ba58c..0x2063ba594
+                    self.total_bytes_in_probing_sequence = 0;
+                    self.total_packets_in_probing_sequence = 0;
                 }
             } else {
                 // 0x2063ba58c..0x2063ba594
@@ -704,11 +707,13 @@ impl VCRateControlBandwidthEstimator {
             self.early_probing_packet_size = packet_size;
             self.last_probing_sequence_reference_time = 0.0;
 
-            if !is_probing || packet_id == 0 {
+            // 0x2063ba684: cbz w23, loc_2063ba5b0 -> clear early_* only when packet_id == 0
+            // 0x2063ba688: cbz w22, loc_2063ba6a4 -> when !is_probing && packet_id != 0, leave early_* unchanged
+            if packet_id == 0 {
                 self.early_probing_packet_arrival_time = 0.0;
                 self.early_bytes_in_probing_sequence = 0;
                 self.early_packets_in_probing_sequence = 0;
-            } else if next_bytes == 0 {
+            } else if is_probing && next_bytes == 0 {
                 self.early_probing_packet_arrival_time = arrival_time;
                 self.early_bytes_in_probing_sequence = self
                     .early_bytes_in_probing_sequence

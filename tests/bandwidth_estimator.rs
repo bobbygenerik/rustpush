@@ -74,17 +74,17 @@ fn test_update_bwe_initial_cap_0x2063ba0c8() {
     est.set_radio_access_technology(3);
     est.set_mode(1);
 
-    // 0x2063ba0d0..0x2063ba0e4: capped at 100_000.0 when est == 0.0
+    // 0x2063ba0d0..0x2063ba0e4: floored at 100_000.0 when est == 0.0
     let ret = est.update_bandwidth_estimation(500_000.0, 1.0);
     assert_eq!(ret, 500_000.0);
-    assert_eq!(est.estimated_bandwidth, 100_000.0);
+    assert_eq!(est.estimated_bandwidth, 500_000.0);
     assert_eq!(est.sudden_change_state, 0);
 
     let mut est2 = VCRateControlBandwidthEstimator::new();
     est2.set_radio_access_technology(3);
     est2.set_mode(1);
     est2.update_bandwidth_estimation(60_000.0, 1.0);
-    assert_eq!(est2.estimated_bandwidth, 60_000.0);
+    assert_eq!(est2.estimated_bandwidth, 100_000.0);
     assert_eq!(est2.sudden_change_state, 0);
 }
 
@@ -176,7 +176,8 @@ fn test_update_bwe_rat5_initial_avg_0x2063ba210() {
     est.first_diverge_time = 1.0;
     est.set_estimated_bandwidth(200_000.0);
 
-    // sample 300_000 capped by min(300_000, 200_000 * 0.5) = 100_000
+    // RAT 5, mode 1 -> max_detectable_bandwidth = 400_000 -> half_max = 200_000.0
+    // sample 300_000 contributes min(300_000, 200_000) = 200_000
     est.update_bandwidth_estimation(300_000.0, 2.0);
     assert_eq!(est.bandwidth_estimation_state, 1);
     assert!(!est.is_first_packet);
@@ -184,7 +185,7 @@ fn test_update_bwe_rat5_initial_avg_0x2063ba210() {
     // At t = 8.0, 8.0 - 1.0 == 7.0 >= 7.0 -> finishes initial averaging
     est.update_bandwidth_estimation(300_000.0, 8.0);
     assert!(est.is_first_packet);
-    assert_eq!(est.estimated_bandwidth, 100_000.0);
+    assert_eq!(est.estimated_bandwidth, 200_000.0);
     assert_eq!(est.bandwidth_estimation_state, 0);
     assert_eq!(est.sudden_change_state, 0);
 }
@@ -204,8 +205,8 @@ fn test_calculate_bwe_probing_sequence_0x2063ba414() {
     est.calculate_bandwidth_estimation(1000, 500, true, 1, true, 1.015625);
 
     assert_eq!(est.estimated_bandwidth_uncapped, 512_000.0);
-    // Initial est was 0.0 -> capped at 100_000.0
-    assert_eq!(est.estimated_bandwidth, 100_000.0);
+    // Initial est was 0.0 -> max(512_000.0, 100_000.0) = 512_000.0
+    assert_eq!(est.estimated_bandwidth, 512_000.0);
 }
 
 #[test]
@@ -315,4 +316,69 @@ fn test_collector_quantization_and_staleness_0x205ed4870_0x205ed38fc() {
     );
     // Collector mode 5 skips ComputeBWEstimation
     assert_eq!(compute_bw_estimation_from_map(&mut map, 5, 0, 10.0), None);
+}
+
+#[test]
+fn test_1a_initial_floor_max_0x2063ba0d0() {
+    let mut est_low = VCRateControlBandwidthEstimator::new();
+    est_low.set_radio_access_technology(3);
+    est_low.set_mode(1);
+    est_low.update_bandwidth_estimation(50_000.0, 1.0);
+    assert_eq!(est_low.estimated_bandwidth, 100_000.0);
+
+    let mut est_high = VCRateControlBandwidthEstimator::new();
+    est_high.set_radio_access_technology(3);
+    est_high.set_mode(1);
+    est_high.update_bandwidth_estimation(2_000_000.0, 1.0);
+    assert_eq!(est_high.estimated_bandwidth, 2_000_000.0);
+}
+
+#[test]
+fn test_1b_rat5_warmup_half_max_detectable_0x2063ba210() {
+    let mut est = VCRateControlBandwidthEstimator::new();
+    est.set_radio_access_technology(5);
+    est.set_mode(3); // max_detectable_bandwidth = 800_000.0 -> 0.5 * max = 400_000.0
+    est.is_first_packet = false;
+    est.first_diverge_time = 1.0;
+    est.set_estimated_bandwidth(50_000.0);
+
+    // sample 600_000 contributes min(600_000, 400_000) = 400_000
+    est.update_bandwidth_estimation(600_000.0, 2.0);
+    assert_eq!(est.total_bandwidth, 400_000.0);
+
+    // sample 300_000 at t = 8.0 (dt = 7.0 >= 7.0) contributes 300_000 -> avg (400_000 + 300_000)/2 = 350_000
+    est.update_bandwidth_estimation(300_000.0, 8.0);
+    assert!(est.is_first_packet);
+    assert_eq!(est.estimated_bandwidth, 350_000.0);
+}
+
+#[test]
+fn test_1c_non_probing_nonzero_ts_preserves_early_and_head_late_0x2063ba57c_0x2063ba684() {
+    let mut est = VCRateControlBandwidthEstimator::new();
+    est.set_radio_access_technology(3);
+    est.set_mode(1);
+    est.is_initialized = true;
+    est.last_probing_sequence_id = 10;
+    est.early_probing_packet_arrival_time = 5.0;
+    est.early_bytes_in_probing_sequence = 700;
+    est.early_packets_in_probing_sequence = 2;
+
+    // Non-probing packet with non-zero packet_id/timestamp (w23 = 99) and arrival_time 6.0 >= early_time 5.0:
+    // head is NOT late -> total_bytes/packets reset to 0, and early_* MUST remain unchanged (cbnz w23 -> cbz w22).
+    est.calculate_bandwidth_estimation(100, 300, false, 99, false, 6.0);
+    assert_eq!(est.total_bytes_in_probing_sequence, 0);
+    assert_eq!(est.total_packets_in_probing_sequence, 0);
+    assert_eq!(est.early_probing_packet_arrival_time, 5.0);
+    assert_eq!(est.early_bytes_in_probing_sequence, 700);
+    assert_eq!(est.early_packets_in_probing_sequence, 2);
+
+    // Head is late when early_time > 0.0 && arrival < early_time (0x2063ba57c..0x2063ba660)
+    est.calculate_bandwidth_estimation(101, 300, false, 99, false, 4.0);
+    assert_eq!(est.total_bytes_in_probing_sequence, 700);
+    assert_eq!(est.total_packets_in_probing_sequence, 2);
+    // And when early_time == 0.0 even with non-zero early_bytes, head is NOT late -> 0
+    est.early_probing_packet_arrival_time = 0.0;
+    est.calculate_bandwidth_estimation(102, 300, false, 99, false, 4.0);
+    assert_eq!(est.total_bytes_in_probing_sequence, 0);
+    assert_eq!(est.total_packets_in_probing_sequence, 0);
 }
