@@ -1622,7 +1622,6 @@ impl RecvStatTracker {
                         // info!("Audio data {data:?}");
                         if let Some(time) = data.current_send_timestamp {
                             self.stats.last_feedback.store(time, Ordering::Relaxed);
-                            self.stats.last_feedback_time.store(duration_since_epoch().as_millis() as u64, Ordering::Relaxed);
                         }
 
                         let cumulative_in_order = if let Some(count) = data.video_received_packets {
@@ -1794,7 +1793,6 @@ pub trait TimingTarget: Send + Sync {
 #[derive(Default)]
 struct IncomingFrameStats {
     last_feedback: AtomicU16,
-    last_feedback_time: AtomicU64,
     total_recv_count: AtomicU16,
     total_recv_bytes: AtomicU64,
     audio_burst_loss: AtomicU8,
@@ -4229,6 +4227,7 @@ pub struct AudioSender {
 impl AudioSender {
     /// PCM input is encoded to the negotiated 480-sample AAC-ELD format.
     pub fn send_audio_pcm(&mut self, pcm: &[u8], timestamp: u32) -> Result<(), String> {
+        let enqueue_time_s = duration_since_epoch().as_secs_f64();
         if let Some(offer) = &self.audio_offer {
             offer.ensure_aac_supported().map_err(|error| error.to_string())?;
         }
@@ -4238,12 +4237,23 @@ impl AudioSender {
         }
         let frame = self.aac_encoder.as_mut().unwrap().encode(pcm)?;
         if !frame.is_empty() {
-            self.send_audio_frame(&frame, timestamp).map_err(|e| e.to_string())?;
+            self.send_audio_frame_with_enqueue_time(&frame, timestamp, enqueue_time_s)
+                .map_err(|e| e.to_string())?;
         }
         Ok(())
     }
 
     pub fn send_audio_frame(&mut self, sample: &[u8], timestamp: u32) -> Result<(), PushError> {
+        let enqueue_time_s = duration_since_epoch().as_secs_f64();
+        self.send_audio_frame_with_enqueue_time(sample, timestamp, enqueue_time_s)
+    }
+
+    fn send_audio_frame_with_enqueue_time(
+        &mut self,
+        sample: &[u8],
+        timestamp: u32,
+        enqueue_time_s: f64,
+    ) -> Result<(), PushError> {
         if let Some(offer) = &self.audio_offer {
             offer.ensure_aac_supported()?;
         }
@@ -4278,16 +4288,11 @@ impl AudioSender {
                 f64::from_bits(stats.short_q13_lag.load(Ordering::Relaxed)) -
                 f64::from_bits(stats.long_q13_lag.load(Ordering::Relaxed)));
 
-            let current_send = ((timestamp as u64 + 52676) * 16 / 375) as u16;
+            let send_time_s = duration_since_epoch().as_secs_f64();
+            let current_send = crate::feedback_delay::ntp_send_timestamp(send_time_s);
             stats.outgoing_send_time.store(current_send, Ordering::Relaxed);
 
-            let queue_sent = stats.last_feedback_time.load(Ordering::Relaxed);
-            let queue_delay = duration_since_epoch().as_millis() as u64 - queue_sent;
-            let queue_delay_1024 = if queue_sent == 0 {
-                0
-            } else {
-                (queue_delay * 128 / 125).clamp(1, u16::MAX as u64)
-            };
+            let queue_delay_1024 = crate::feedback_delay::pack_queuing_delay(enqueue_time_s, send_time_s);
 
             let feedback_version = self.feedback.configuration() as u8;
             let packed_loss = audio_feedback::loss_stats_enabled(feedback_version);

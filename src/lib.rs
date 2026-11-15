@@ -14,6 +14,7 @@ pub mod bandwidth_estimator;
 pub mod sharedstreams;
 pub mod findmy;
 pub mod facetime;
+pub mod feedback_delay;
 #[cfg(not(target_arch = "wasm32"))]
 mod evs_decoder;
 pub mod icloud;
