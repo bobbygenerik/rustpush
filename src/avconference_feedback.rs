@@ -114,10 +114,13 @@ pub(super) fn normalize_frame_loss(size: u16, loss: u16) -> (u8, u8) {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Eq)]
 pub(super) struct FTAudioControlData {
     pub(super) version: u8,
-    // Native receiveQueueTarget / 20, not a bitrate estimate (v2 only).
+    /// Raw wire flags byte (byte 0 of v2 header: `0x80 | flags`, or `0x40 | flags` in v1).
+    /// Excluded from `PartialEq` so existing roundtrip fixtures remain unchanged.
+    pub(super) raw_flags: u8,
+    // Native receiveQueueTarget / 10 (raw byte in v2 header byte 1).
     pub(super) receive_queue_target_bucket: u8,
     pub(super) feedback_sequence: u16,
     // Native totalReceivedKBytes (v2 only).
@@ -137,6 +140,28 @@ pub(super) struct FTAudioControlData {
     pub(super) ce: Option<u16>,
     // feedback/history index, secondary-only count, primary count, total count.
     pub(super) connection_stats_blob: Option<[u8; 4]>,
+}
+
+impl PartialEq for FTAudioControlData {
+    fn eq(&self, other: &Self) -> bool {
+        self.version == other.version
+            && self.receive_queue_target_bucket == other.receive_queue_target_bucket
+            && self.feedback_sequence == other.feedback_sequence
+            && self.total_kbytes_recv == other.total_kbytes_recv
+            && self.audio_burst_loss == other.audio_burst_loss
+            && self.audio_received_packets == other.audio_received_packets
+            && self.queuing_delay == other.queuing_delay
+            && self.current_send_timestamp == other.current_send_timestamp
+            && self.q13_one_way_delay == other.q13_one_way_delay
+            && self.video_burst_loss == other.video_burst_loss
+            && self.video_frame_size == other.video_frame_size
+            && self.video_packet_loss == other.video_packet_loss
+            && self.video_received_packets == other.video_received_packets
+            && self.bandwidth_estimate == other.bandwidth_estimate
+            && self.ect == other.ect
+            && self.ce == other.ce
+            && self.connection_stats_blob == other.connection_stats_blob
+    }
 }
 
 impl FTAudioControlData {
@@ -172,8 +197,14 @@ impl FTAudioControlData {
         // Length is checked before indexing. No allocation or untrusted drain.
         let word = |offset| u16::from_be_bytes([payload[offset], payload[offset + 1]]);
         let packed = word(4);
+        let raw_flags = if version == 2 {
+            (profile >> 8) as u8
+        } else {
+            profile as u8
+        };
         let mut data = Self {
             version,
+            raw_flags,
             feedback_sequence: word(0),
             audio_received_packets: packed & 0x0fff,
             queuing_delay: Some(word(6)),
@@ -428,5 +459,56 @@ mod tests {
             FTAudioControlData { version: 0, ..data() }] {
             assert_eq!(sample.to_ext(), None);
         }
+    }
+
+    #[test]
+    fn v2_handbuilt_video_and_ecn_all_fields_from_layout_doc() {
+        // feedback-fields.md:
+        // byte 0: 0x80 (v2) | 0x08 (hasECN) | 0x04 (hasVideoStats) | 0x01 (hasFeedback) = 0x8d
+        // byte 1: 0x14 = 20 (receiveQueueTarget/10 -> 200)
+        let profile: u16 = 0x8d14;
+        let payload: [u8; 20] = [
+            0x12, 0x34, // timeStamp = 0x1234 (4660)
+            0x04, 0x56, // totalReceivedKBytes = 0x0456 (1110)
+            0x52, 0xab, // audioBurstLoss = 5, audioReceivedPkts = 0x2ab (683)
+            0x00, 0x2a, // queuingDelay = 42
+            0x78, 0x9a, // sendTimestamp = 0x789a (30874)
+            0x03, 0x20, // owrd = 0x0320 (800)
+            0x31, 0x47, // videoBurstLoss = 3, videoReceivedPkts = 0x147 (327), packed=(size 5, loss 7)
+            0x05, 0xdc, // bandwidthEstimation = 0x05dc (1500 kbps)
+            0x00, 0x11, // ecnECT1Count = 17
+            0x00, 0x02, // ecnCECount = 2
+        ];
+
+        // Cumulative mode (feedback_version = 0)
+        let cum = FTAudioControlData::from_ext_with_feedback_version(profile, &payload, 0).unwrap();
+        assert_eq!(cum.version, 2);
+        assert_eq!(cum.raw_flags, 0x8d);
+        assert_eq!(cum.receive_queue_target_bucket, 20);
+        assert_eq!(cum.feedback_sequence, 0x1234);
+        assert_eq!(cum.total_kbytes_recv, 0x0456);
+        assert_eq!(cum.audio_burst_loss, 5);
+        assert_eq!(cum.audio_received_packets, 0x2ab);
+        assert_eq!(cum.queuing_delay, Some(42));
+        assert_eq!(cum.current_send_timestamp, Some(0x789a));
+        assert_eq!(cum.q13_one_way_delay, Some(0x0320));
+        assert_eq!(cum.video_burst_loss, Some(3));
+        assert_eq!(cum.video_received_packets, Some(0x147));
+        assert_eq!(cum.video_frame_size, None);
+        assert_eq!(cum.video_packet_loss, None);
+        assert_eq!(cum.bandwidth_estimate, Some(1500));
+        assert_eq!(cum.ect, Some(17));
+        assert_eq!(cum.ce, Some(2));
+        assert_eq!(cum.connection_stats_blob, None);
+
+        // Packed mode (feedback_version = 1)
+        let packed = FTAudioControlData::from_ext_with_feedback_version(profile, &payload, 1).unwrap();
+        assert_eq!(packed.raw_flags, 0x8d);
+        assert_eq!(packed.video_received_packets, None);
+        assert_eq!(packed.video_frame_size, Some(5));
+        assert_eq!(packed.video_packet_loss, Some(7));
+        assert_eq!(packed.bandwidth_estimate, Some(1500));
+        assert_eq!(packed.ect, Some(17));
+        assert_eq!(packed.ce, Some(2));
     }
 }

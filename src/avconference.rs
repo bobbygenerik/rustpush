@@ -1348,6 +1348,71 @@ pub struct RecvStatTracker {
     last_rr_send: Option<Instant>,
     /// Last received camera status byte from RTP header extension `(profile >> 8) as u8`.
     last_camera_status_byte: Option<u8>,
+    last_feedback_rx: FeedbackLogState,
+}
+
+#[derive(Default)]
+struct FeedbackLogState {
+    last_key: Option<(Option<u16>, u8, u8, Option<u16>, Option<u16>, Option<[u8; 4]>)>,
+    last_logged: Option<Instant>,
+}
+
+impl FeedbackLogState {
+    fn maybe_log(&mut self, tag: &str, profile: u16, payload: &[u8], data: &FTAudioControlData) {
+        let raw_flags = if data.version == 2 {
+            (profile >> 8) as u8
+        } else {
+            profile as u8
+        };
+        let key = (
+            data.bandwidth_estimate,
+            data.receive_queue_target_bucket,
+            raw_flags,
+            data.ect,
+            data.ce,
+            data.connection_stats_blob,
+        );
+        let changed = self.last_key.as_ref() != Some(&key);
+        let rate_ok = self
+            .last_logged
+            .is_none_or(|t| t.elapsed() >= Duration::from_secs(1));
+        if !changed && !rate_ok {
+            return;
+        }
+        self.last_key = Some(key);
+        self.last_logged = Some(Instant::now());
+
+        let len_words = ((payload.len() + 3) / 4) as u16;
+        let mut raw = Vec::with_capacity(4 + payload.len());
+        raw.extend_from_slice(&profile.to_be_bytes());
+        raw.extend_from_slice(&len_words.to_be_bytes());
+        raw.extend_from_slice(payload);
+        let raw_hex = encode_hex(&raw[..raw.len().min(24)]);
+
+        info!(
+            "[{tag}] ver={} flags=0x{:02x} rqt_bucket={} (rqt={}) seq={} total_kb={} audio_burst={} audio_pkts={} qdelay={:?} send_ts={:?} owrd={:?} video_burst={:?} video_size={:?} video_loss={:?} video_pkts={:?} bwe={:?} ect={:?} ce={:?} conn_stats={:?} raw={}",
+            data.version,
+            raw_flags,
+            data.receive_queue_target_bucket,
+            u16::from(data.receive_queue_target_bucket) * 10,
+            data.feedback_sequence,
+            data.total_kbytes_recv,
+            data.audio_burst_loss,
+            data.audio_received_packets,
+            data.queuing_delay,
+            data.current_send_timestamp,
+            data.q13_one_way_delay,
+            data.video_burst_loss,
+            data.video_frame_size,
+            data.video_packet_loss,
+            data.video_received_packets,
+            data.bandwidth_estimate,
+            data.ect,
+            data.ce,
+            data.connection_stats_blob,
+            raw_hex,
+        );
+    }
 }
 
 impl RecvStatTracker {
@@ -1370,6 +1435,7 @@ impl RecvStatTracker {
             our_ssrc: rand::random(),
             last_rr_send: None,
             last_camera_status_byte: None,
+            last_feedback_rx: FeedbackLogState::default(),
         }
     }
 
@@ -1547,6 +1613,12 @@ impl RecvStatTracker {
                     // or prevent its payload from reaching the decoder.
                     if let Some(data) = FTAudioControlData::from_ext_with_feedback_version(
                         header.extension_profile, &header.extensions[0].payload, feedback_configuration as u8) {
+                        self.last_feedback_rx.maybe_log(
+                            "FTFeedbackRx",
+                            header.extension_profile,
+                            &header.extensions[0].payload,
+                            &data,
+                        );
                         // info!("Audio data {data:?}");
                         if let Some(time) = data.current_send_timestamp {
                             self.stats.last_feedback.store(time, Ordering::Relaxed);
@@ -1807,7 +1879,23 @@ impl IncomingFrameHandler {
         let mut last_config_camera_meta: Option<FTVideoCameraStatus> = None;
         let mut last_sample_camera_meta: Option<FTVideoCameraStatus> = None;
         let mut retry_enqueue_after = Duration::ZERO;
+        let mut video_rx_bytes_1s: u64 = 0;
+        let mut video_rx_pkts_1s: u64 = 0;
+        let mut video_rx_keyframes_1s: u64 = 0;
+        let mut last_video_rx_keyframe: Option<Instant> = None;
+        let mut last_video_rx_log: Instant = Instant::now();
         loop {
+            if !audio && last_video_rx_log.elapsed() >= Duration::from_secs(1) {
+                let since_kf_ms = last_video_rx_keyframe.map(|t| t.elapsed().as_millis());
+                info!(
+                    "[FTVideoRx] bytes_1s={} pkts_1s={} keyframes_1s={} since_last_keyframe_ms={:?}",
+                    video_rx_bytes_1s, video_rx_pkts_1s, video_rx_keyframes_1s, since_kf_ms
+                );
+                video_rx_bytes_1s = 0;
+                video_rx_pkts_1s = 0;
+                video_rx_keyframes_1s = 0;
+                last_video_rx_log = Instant::now();
+            }
             let now = diagnostic_epoch.elapsed();
             if now >= retry_enqueue_after {
                 for (&media_ssrc, (participant, generator)) in &mut video_nacks {
@@ -2036,6 +2124,10 @@ impl IncomingFrameHandler {
                         // synthetic packets do not add another transport arrival.
                         ssrc.feedback.record_video_packet();
                     }
+                    if !audio && matches!(payload, AVSessionPayload::H264 | AVSessionPayload::H265) {
+                        video_rx_bytes_1s += recv.packet_size as u64;
+                        video_rx_pkts_1s += 1;
+                    }
 
                     if ssrc.fec_data.len() > 5 {
                         ssrc.fec_data.pop_first();
@@ -2180,6 +2272,15 @@ impl IncomingFrameHandler {
                                 // info!("sample {}", encode_hex(&data));
                             }
                             if matches!(channel_type, ChannelType::H264 | ChannelType::H265) {
+                                let is_keyframe = AnnexB::new(&data).any(|nal| match (channel_type, nal.first()) {
+                                    (ChannelType::H265, Some(&h)) => matches!((h >> 1) & 0x3f, 16..=21),
+                                    (ChannelType::H264, Some(&h)) => (h & 0x1f) == 5,
+                                    _ => false,
+                                });
+                                if is_keyframe {
+                                    video_rx_keyframes_1s += 1;
+                                    last_video_rx_keyframe = Some(Instant::now());
+                                }
                                 video_windows.entry((header_ssrc, payload_type)).or_default().frame(
                                     data.len(), sample.prev_dropped_packets.saturating_sub(sample.prev_padding_packets),
                                     before_footer.saturating_sub(data.len()), footer_control);
@@ -4122,6 +4223,7 @@ pub struct AudioSender {
     feedback: Arc<ParticipantFeedbackState>,
     aac_encoder: Option<facetime_aac::FaceTimeAacEncoder>,
     audio_offer: Option<Arc<audio_offer::RemoteAudioOffer>>,
+    last_feedback_tx: FeedbackLogState,
 }
 
 impl AudioSender {
@@ -4235,8 +4337,10 @@ impl AudioSender {
             // };
 
             // info!("Sending ext {extension:?}");
-            extension.to_ext_with_feedback_version(feedback_version).ok_or_else(|| std::io::Error::new(
-                std::io::ErrorKind::InvalidData, "incomplete FaceTime audio feedback"))?
+            let (profile, ext_payload) = extension.to_ext_with_feedback_version(feedback_version).ok_or_else(|| std::io::Error::new(
+                std::io::ErrorKind::InvalidData, "incomplete FaceTime audio feedback"))?;
+            self.last_feedback_tx.maybe_log("FTFeedbackTx", profile, &ext_payload, &extension);
+            (profile, ext_payload)
         } else {
             (0, vec![])
         };
@@ -4962,6 +5066,7 @@ impl AVSession {
             feedback,
             aac_encoder: None,
             audio_offer,
+            last_feedback_tx: FeedbackLogState::default(),
         })
     }
 
