@@ -147,9 +147,9 @@ impl VCRateControlBandwidthEstimator {
     /// `-[VCRateControlBandwidthEstimator init]` (`0x2063b934c`).
     pub fn new() -> Self {
         let mut sudden_change_parameters = SuddenChangeParameters::default();
-        // 0x2063b9384..0x2063b9398
-        sudden_change_parameters.duration_threshold_upward = 0.5;
-        sudden_change_parameters.duration_threshold_downward = 10.0;
+        // 0x2063b93a4..0x2063b93b4: setPercentage:0.5, setMinSamplesCountFastBandwidthEstimation:10
+        sudden_change_parameters.percentage = 0.5;
+        sudden_change_parameters.min_samples_count_fast_bandwidth_estimation = 10;
 
         Self {
             total_bytes_in_probing_sequence: 0,
@@ -942,6 +942,10 @@ impl VCRateControlBandwidthEstimatorMap {
 
     /// `_VCRateControlBandwidthEstimatorMap_bandwidthEstimationState` (`0x2063bb800`).
     pub fn bandwidth_estimation_state(&self) -> i32 {
+        // 0x2063bb808..0x2063bb81c: returns 0 when _defaultEstimator == nil OR _mode in {4, 5}
+        if self.mode == 4 || self.mode == 5 {
+            return 0;
+        }
         if let Some(def_id) = self.default_estimator_id {
             self.bandwidth_estimators
                 .get(&def_id)

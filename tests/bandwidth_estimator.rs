@@ -7,9 +7,18 @@ use rustpush::bandwidth_estimator::{
 #[test]
 fn test_init_0x2063b934c() {
     let est = VCRateControlBandwidthEstimator::new();
-    // 0x2063b9384..0x2063b9398
-    assert_eq!(est.sudden_change_parameters.duration_threshold_upward, 0.5);
-    assert_eq!(est.sudden_change_parameters.duration_threshold_downward, 10.0);
+    // 0x2063b93a4..0x2063b93b4: setPercentage:0.5, setMinSamplesCountFastBandwidthEstimation:10
+    assert_eq!(est.sudden_change_parameters.percentage, 0.5);
+    assert_eq!(
+        est.sudden_change_parameters
+            .min_samples_count_fast_bandwidth_estimation,
+        10
+    );
+    assert_eq!(est.sudden_change_parameters.duration_threshold_upward, 0.0);
+    assert_eq!(
+        est.sudden_change_parameters.duration_threshold_downward,
+        0.0
+    );
     // 0x2063b939c
     assert_eq!(est.min_probing_sequence_size, 250);
     assert_eq!(est.estimated_bandwidth, 0.0);
@@ -381,4 +390,48 @@ fn test_1c_non_probing_nonzero_ts_preserves_early_and_head_late_0x2063ba57c_0x20
     est.calculate_bandwidth_estimation(102, 300, false, 99, false, 4.0);
     assert_eq!(est.total_bytes_in_probing_sequence, 0);
     assert_eq!(est.total_packets_in_probing_sequence, 0);
+}
+
+#[test]
+fn test_audit_init_sudden_change_defaults_0x2063b93a8_0x2063b93b4() {
+    // -[VCRateControlBandwidthEstimator init] (0x2063b934c):
+    // 0x2063b93a4..0x2063b93a8: fmov d0, #0.5; bl setPercentage:
+    // 0x2063b93ac..0x2063b93b4: mov w2, #0xa; bl setMinSamplesCountFastBandwidthEstimation:
+    let est = VCRateControlBandwidthEstimator::new();
+    assert_eq!(est.sudden_change_parameters.percentage, 0.5);
+    assert_eq!(
+        est.sudden_change_parameters
+            .min_samples_count_fast_bandwidth_estimation,
+        10
+    );
+    assert_eq!(est.sudden_change_parameters.duration_threshold_upward, 0.0);
+    assert_eq!(
+        est.sudden_change_parameters.duration_threshold_downward,
+        0.0
+    );
+}
+
+#[test]
+fn test_audit_map_bandwidth_estimation_state_modes_4_5_0x2063bb808() {
+    // -[VCRateControlBandwidthEstimatorMap bandwidthEstimationState] (0x2063bb800):
+    // 0x2063bb808..0x2063bb81c: returns 0 when defaultEstimator == nil OR mode in {4, 5},
+    // otherwise returns defaultEstimator.bandwidthEstimationState.
+    let mut map = VCRateControlBandwidthEstimatorMap::new();
+    map.set_mode(1);
+    map.set_radio_access_technology(1);
+    let est = map.bandwidth_estimator_mut(1, true, false).unwrap();
+    est.estimated_bandwidth = 1_000_000.0;
+    // 2_000_000 >= (1.0 + 0.5) * 1_000_000 -> upward divergence -> bandwidth_estimation_state = 1
+    est.update_bandwidth_estimation(2_000_000.0, 1.0);
+    assert_eq!(est.bandwidth_estimation_state, 1);
+
+    assert_eq!(map.bandwidth_estimation_state(), 1);
+    map.set_mode(4);
+    assert_eq!(map.bandwidth_estimation_state(), 0);
+    map.set_mode(5);
+    assert_eq!(map.bandwidth_estimation_state(), 0);
+    map.set_mode(3);
+    assert_eq!(map.bandwidth_estimation_state(), 1);
+    map.set_mode(6);
+    assert_eq!(map.bandwidth_estimation_state(), 1);
 }
