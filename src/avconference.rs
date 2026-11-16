@@ -1362,7 +1362,15 @@ struct FeedbackLogState {
 }
 
 impl FeedbackLogState {
-    fn maybe_log(&mut self, tag: &str, profile: u16, payload: &[u8], data: &FTAudioControlData, owrd_raw: Option<f64>) {
+    fn maybe_log(
+        &mut self,
+        tag: &str,
+        profile: u16,
+        payload: &[u8],
+        data: &FTAudioControlData,
+        owrd_raw: Option<f64>,
+        bwe_debug: Option<(u32, i32, u8)>,
+    ) {
         let raw_flags = if data.version == 2 {
             (profile >> 8) as u8
         } else {
@@ -1394,7 +1402,7 @@ impl FeedbackLogState {
         let raw_hex = encode_hex(&raw[..raw.len().min(24)]);
 
         info!(
-            "[{tag}] ver={} flags=0x{:02x} rqt_bucket={} (rqt={}) seq={} total_kb={} audio_burst={} audio_pkts={} qdelay={:?} send_ts={:?} owrd_raw={:?} owrd={:?} video_burst={:?} video_size={:?} video_loss={:?} video_pkts={:?} bwe={:?} ect={:?} ce={:?} conn_stats={:?} raw={}",
+            "[{tag}] ver={} flags=0x{:02x} rqt_bucket={} (rqt={}) seq={} total_kb={} audio_burst={} audio_pkts={} qdelay={:?} send_ts={:?} owrd_raw={:?} owrd={:?} video_burst={:?} video_size={:?} video_loss={:?} video_pkts={:?} bwe={:?} bwe_raw={:?} bwe_state={:?} bwe_stable={:?} ect={:?} ce={:?} conn_stats={:?} raw={}",
             data.version,
             raw_flags,
             data.receive_queue_target_bucket,
@@ -1412,6 +1420,9 @@ impl FeedbackLogState {
             data.video_packet_loss,
             data.video_received_packets,
             data.bandwidth_estimate,
+            bwe_debug.map(|b| b.0),
+            bwe_debug.map(|b| b.1),
+            bwe_debug.map(|b| b.2),
             data.ect,
             data.ce,
             data.connection_stats_blob,
@@ -1641,6 +1652,7 @@ impl RecvStatTracker {
                             &header.extensions[0].payload,
                             &data,
                             None,
+                            None,
                         );
                         // info!("Audio data {data:?}");
                         if let Some(time) = data.current_send_timestamp {
@@ -1791,6 +1803,304 @@ pub trait TimingTarget: Send + Sync {
     fn presentation_for(&self, timestamp: u32) -> Instant;
 }
 
+/// Feature flag gating real receiver-side probing BWE measurement and reporting in 1:1 calls.
+pub const REPORT_REAL_BWE: bool = true;
+
+/// Pack `bandwidthEstimation` (kbps) and `isBWEStable` into the wire `u16` field matching
+/// Apple's `__AVCStatisticsCollector_ComputeBWEstimation` (`0x205ed47b4` at `0x205ed489c..8cc`),
+/// `__AVCStatisticsCollector_GetVCStatisticsWithType` (`0x205ed3874` at `0x205ed38fc..934`),
+/// `_VCRateControlSetFeedbackControlInfo` (`0x205eba29c` at `0x205eba31c..324`), and
+/// `_VCMediaControlInfoFaceTimeAudio_SerializeBuffer` (`0x2064c1f48` at `0x2064c2090..20a8`).
+///
+/// Units & layout:
+/// - Units: **kbps** (`0x205ed489c..8cc`: `uVar1 = (bps / 1000) & 0x7ffff8`, rounded down to a
+///   multiple of `8 kbps`; low bit `bit 0 = (bandwidthEstimationState == 1)` encodes `isBWEStable`,
+///   recovered on readout by `/ 1000` at `0x205ed3900`).
+/// - Unserialized feedback slot (`_VCRateControlSetFeedbackControlInfo` `0x205eba31c..324`):
+///   `0x205eba31c: ldr w8, [sp, #0x50]` (`VCStatistics.bandwidthEstimation`, `u32` kbps | bit 0)
+///   `0x205eba324: strh w8, [sp, #0xa]` (`u16` bandwidth slot)
+/// - Wire clamp & big-endian serialization (`0x2064c1f48` at `0x2064c2090..20a8`):
+///   `0x2064c2090: ldr w9, [x0, #0x14]`
+///   `0x2064c2094: mov w12, #0xffff`
+///   `0x2064c2098: cmp w9, w12`
+///   `0x2064c209c: csel w9, w9, w12, cc` (`min(val, 0xffff)` = `65535 kbps` clamp)
+///   `0x2064c20a0..a8: rev w9, w9; lsr w9, w9, #0x10; strh w9, [x11]`
+pub fn pack_bandwidth_estimate_u16(bwe_kbps: u32, stable: bool) -> u16 {
+    if bwe_kbps == 0 {
+        return 0;
+    }
+    let quantized = bwe_kbps & 0x7f_fff8;
+    if quantized == 0 {
+        return 0;
+    }
+    let packed = quantized | u32::from(stable);
+    packed.min(u16::MAX as u32) as u16
+}
+
+/// Returns true iff an incoming video RTP payload qualifies to start a probing-sequence burst under
+/// `_VideoReceiver_ProcessVideoRTPInternal` (`0x2060056cc..56fc`:
+/// `(u32)slice_type <= 6 && ((1 << slice_type) & 0x4c) != 0`, matching `slice_type in {2, 3, 6}`)
+/// and `_ReadFrameSliceHeader` (`0x205fba93c`).
+pub fn is_probing_slice_payload(payload_type: u8, payload: &[u8]) -> bool {
+    if payload.len() < 4 {
+        return false;
+    }
+    // 0x205fba98c..99c: magic 0xa3c0e692 slice header prefix -> slice_type 2 (`0x205fbac4c`).
+    if payload[..4] == [0x92, 0xe6, 0xc0, 0xa3] {
+        return true;
+    }
+    match payload_type {
+        // H.264 (`0x205fbaa64..70` -> `0x205fba4c8`)
+        123 => {
+            let nal_type = payload[0] & 0x1f;
+            // SPS -> 3 (`0x205fba60c`); FU-A/B (`28, 29`, `(b0 & 0x1e) == 0x1c`) -> 6 (`0x205fba614..628`).
+            nal_type == 7 || (payload[0] & 0x1e) == 0x1c
+        }
+        // HEVC / H.265 (`0x205fbac54..9c`)
+        100 => {
+            // `0x205fbac8c..9c`: HEVC FU (`(b0 & 0x7e) == 0x62`, NAL type 49) maps to slice_type 6.
+            if (payload[0] & 0x7e) == 0x62 {
+                return true;
+            }
+            let nal_type = (payload[0] >> 1) & 0x3f;
+            // Single-NAL IRAP (BLA..CRA: 16..=21) or SPS (33).
+            if matches!(nal_type, 16..=21 | 33) {
+                return true;
+            }
+            // HEVC Aggregation Packet (AP, NAL type 48): `[u16 BE len][nal]...`
+            if nal_type == 48 {
+                let mut off = 2usize;
+                while off + 2 <= payload.len() {
+                    let nalu_len = u16::from_be_bytes([payload[off], payload[off + 1]]) as usize;
+                    off += 2;
+                    if nalu_len == 0 || off + nalu_len > payload.len() {
+                        break;
+                    }
+                    let inner_type = (payload[off] >> 1) & 0x3f;
+                    if matches!(inner_type, 16..=21 | 33) {
+                        return true;
+                    }
+                    off += nalu_len;
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Accepted probing-burst summary emitted for `[FTBwe]` logging and tests.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BweAcceptedBurst {
+    pub bytes: u32,
+    pub span_ms: f64,
+    pub estimate_kbps: u32,
+    pub state: i32,
+}
+
+/// Snapshot of current quantized feedback BWE + raw/state metadata for `[FTFeedbackTx]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BweFeedbackSnapshot {
+    pub packed_u16: u16,
+    pub raw_kbps: u32,
+    pub state: i32,
+    pub stable: bool,
+}
+
+/// Receiver-side 1:1 probing burst detector (`_VideoReceiver_ProcessVideoRTPInternal` `0x20600564c..59b0`,
+/// slice-type branch `[x19 + 0x877] == 0`) driving `AVCStatisticsCollectorBwe` (`mode = 1, rat = 1`).
+#[derive(Debug, Clone)]
+pub struct VideoBweProbeReceiver {
+    pub collector: crate::bandwidth_estimator::AVCStatisticsCollectorBwe,
+    /// `[x22 + 0xdc8]`: RTP timestamp of active probing frame.
+    cur_probing_seq_ts: u32,
+    /// `[x22 + 0xdcc]`: currently tracking packets of a probing frame.
+    is_probing: bool,
+    /// `[x22 + 0xdd0]`: timestamp of last completed probing/closing frame for the `2.0 s` gate.
+    last_cooldown_time: Option<f64>,
+    /// Tracks an RTP timestamp already accepted & logged on its `marker == true` packet so
+    /// Apple's deferred flush of `[x20 + 0x8]` on the next frame does not log a duplicate `[FTBwe]`.
+    last_logged_seq_ts: Option<u32>,
+    accepted_burst_count: u64,
+}
+
+impl Default for VideoBweProbeReceiver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VideoBweProbeReceiver {
+    /// Mode `1` (`1:1`), `RAT = 1` (Wi-Fi qualification parameters: `0.008 s` min window,
+    /// `250 B` min sequence size, `6.5 Mbps` cap, `30.0 s` staleness expiry).
+    pub fn new() -> Self {
+        Self {
+            collector: crate::bandwidth_estimator::AVCStatisticsCollectorBwe::new(1, 1),
+            cur_probing_seq_ts: 0,
+            is_probing: false,
+            last_cooldown_time: None,
+            last_logged_seq_ts: None,
+            accepted_burst_count: 0,
+        }
+    }
+
+    /// Feed a decrypted 1:1 video RTP packet (non-parity) and return an accepted-burst summary
+    /// whenever the estimator accepts a new sample.
+    pub fn observe_packet(
+        &mut self,
+        payload_type: u8,
+        payload: &[u8],
+        rtp_timestamp: u32,
+        marker: bool,
+        packet_size: u32,
+        arrival_time_s: f64,
+    ) -> Option<BweAcceptedBurst> {
+        // 0x206005678..688: `2.0 s` cooldown since last closed probing frame.
+        if self
+            .last_cooldown_time
+            .is_some_and(|last| arrival_time_s - last < 2.0)
+        {
+            return None;
+        }
+
+        // `[x19 + 0x877] == 0` in 1:1 FaceTime -> slice-type branch `0x2060056cc`.
+        if is_probing_slice_payload(payload_type, payload) {
+            self.cur_probing_seq_ts = rtp_timestamp;
+            self.is_probing = true;
+        } else if self.is_probing && rtp_timestamp == self.cur_probing_seq_ts {
+            // 0x206005800..810: continuation packet of the active probing frame.
+            self.is_probing = true;
+        } else if self.is_probing {
+            // 0x20600648c..4b0: first packet of a subsequent frame closes the prior probing frame.
+            self.is_probing = false;
+            self.cur_probing_seq_ts = 0;
+        } else {
+            // Non-probing packet while idle (`0x206006494 -> loc_2060059b0`).
+            return None;
+        }
+
+        let is_probing_pkt = self.is_probing;
+
+        // Snapshot estimator state before feeding `type == 4` so we can detect accepted bursts
+        // and report `[FTBwe]` bytes and span without duplicating Apple's acceptance logic.
+        let before = self.default_estimator().map(|est| {
+            (
+                est.estimated_bandwidth,
+                est.over_range_count,
+                est.last_probing_sequence_id,
+                est.total_bytes_in_probing_sequence,
+                est.reference_packet_arrival_time,
+                est.last_probing_sequence_reference_time,
+                est.min_probing_sequence_size,
+            )
+        });
+
+        let evaluated = before.and_then(
+            |(est_before, over_before, active_id, active_bytes, first_t, last_t, min_bytes)| {
+                if is_probing_pkt && rtp_timestamp == active_id && marker {
+                    let bytes = active_bytes.wrapping_add(packet_size);
+                    if bytes > min_bytes {
+                        let span_s = last_t.max(arrival_time_s) - first_t;
+                        Some((est_before, over_before, active_id, true, bytes, span_s))
+                    } else {
+                        None
+                    }
+                } else if !(is_probing_pkt && rtp_timestamp == active_id)
+                    && active_bytes > min_bytes
+                    && self.last_logged_seq_ts != Some(active_id)
+                {
+                    let span_s = last_t - first_t;
+                    Some((est_before, over_before, active_id, false, active_bytes, span_s))
+                } else {
+                    None
+                }
+            },
+        );
+
+        self.collector.process_probing_packet(
+            rtp_timestamp,
+            packet_size,
+            is_probing_pkt,
+            rtp_timestamp,
+            marker,
+            arrival_time_s,
+            0,
+        );
+
+        // 0x20600595c..9ac: update `[x22, #0xdd0]` when marker ends frame or closing packet runs.
+        if marker || !self.is_probing {
+            self.last_cooldown_time = Some(arrival_time_s);
+        }
+
+        if let Some((est_before, _over_before, eval_ts, from_marker, bytes, span_s)) = evaluated {
+            if let Some((est_bw, over_after, max_over, state)) = self.default_estimator().map(|est| {
+                (
+                    est.estimated_bandwidth,
+                    est.over_range_count,
+                    est.max_over_range_count,
+                    est.bandwidth_estimation_state,
+                )
+            }) {
+                let accepted = est_bw > 0.0
+                    && (est_before == 0.0 || over_after == 0 || over_after >= max_over);
+                if accepted {
+                    self.last_logged_seq_ts = if from_marker { Some(eval_ts) } else { None };
+                    let estimate_kbps = (est_bw / 1000.0) as u32;
+                    let span_ms = span_s * 1000.0;
+                    let idx = self.accepted_burst_count;
+                    self.accepted_burst_count = idx.wrapping_add(1);
+                    if idx < 10 || idx % 20 == 0 {
+                        info!(
+                            "[FTBwe] burst bytes={} span_ms={:.2} estimate_kbps={} state={}",
+                            bytes, span_ms, estimate_kbps, state
+                        );
+                    }
+                    return Some(BweAcceptedBurst {
+                        bytes,
+                        span_ms,
+                        estimate_kbps,
+                        state,
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    fn default_estimator(&self) -> Option<&crate::bandwidth_estimator::VCRateControlBandwidthEstimator> {
+        self.collector
+            .map
+            .default_estimator_id
+            .and_then(|id| self.collector.map.bandwidth_estimators.get(&id))
+    }
+
+    /// Read current quantized `bandwidth_estimate` wire `u16`, enforcing `30.0 s` expiry.
+    pub fn snapshot(&self, current_time_s: f64) -> BweFeedbackSnapshot {
+        let kbps_packed = self.collector.readout_kbps(current_time_s);
+        if kbps_packed == 0 {
+            return BweFeedbackSnapshot {
+                packed_u16: 0,
+                raw_kbps: 0,
+                state: 0,
+                stable: false,
+            };
+        }
+        let state = self.collector.bandwidth_estimation_state();
+        let stable = (kbps_packed & 1) != 0;
+        let raw_kbps = self
+            .default_estimator()
+            .map(|e| (e.estimated_bandwidth / 1000.0) as u32)
+            .unwrap_or(kbps_packed & !7);
+        let packed_u16 = pack_bandwidth_estimate_u16(kbps_packed, stable);
+        BweFeedbackSnapshot {
+            packed_u16,
+            raw_kbps,
+            state,
+            stable,
+        }
+    }
+}
+
 struct IncomingFrameStats {
     last_feedback: AtomicU16,
     total_recv_count: AtomicU16,
@@ -1806,6 +2116,9 @@ struct IncomingFrameStats {
 
     outgoing_send_time: AtomicU16,
     frame_change_time: AtomicU16,
+
+    bwe_epoch: Instant,
+    bwe_probe: std::sync::Mutex<VideoBweProbeReceiver>,
 }
 
 impl Default for IncomingFrameStats {
@@ -1821,6 +2134,8 @@ impl Default for IncomingFrameStats {
             owrd_seconds: AtomicU64::new(f64::NAN.to_bits()),
             outgoing_send_time: AtomicU16::default(),
             frame_change_time: AtomicU16::default(),
+            bwe_epoch: Instant::now(),
+            bwe_probe: std::sync::Mutex::new(VideoBweProbeReceiver::new()),
         }
     }
 }
@@ -2139,6 +2454,28 @@ impl IncomingFrameHandler {
                         // Count authenticated RTP arrivals, including FEC parity; recovered
                         // synthetic packets do not add another transport arrival.
                         ssrc.feedback.record_video_packet();
+                        if REPORT_REAL_BWE {
+                            let is_parity = video_meta
+                                .as_ref()
+                                .and_then(|v| v.fec_header.as_ref())
+                                .is_some_and(|fec| !fec.is_data);
+                            if !is_parity {
+                                let arrival_s = recv
+                                    .time_parsed
+                                    .saturating_duration_since(stats.bwe_epoch)
+                                    .as_secs_f64();
+                                if let Ok(mut bwe_probe) = stats.bwe_probe.lock() {
+                                    bwe_probe.observe_packet(
+                                        unmarshalled.header.payload_type,
+                                        &unmarshalled.payload,
+                                        unmarshalled.header.timestamp,
+                                        unmarshalled.header.marker,
+                                        recv.packet_size as u32,
+                                        arrival_s,
+                                    );
+                                }
+                            }
+                        }
                     }
                     if !audio && matches!(payload, AVSessionPayload::H264 | AVSessionPayload::H265) {
                         video_rx_bytes_1s += recv.packet_size as u64;
@@ -4334,6 +4671,28 @@ impl AudioSender {
 
             let queue_delay_1024 = crate::feedback_delay::pack_queuing_delay(enqueue_time_s, send_time_s);
 
+            let bwe_snapshot = if REPORT_REAL_BWE {
+                let now_s = Instant::now()
+                    .saturating_duration_since(stats.bwe_epoch)
+                    .as_secs_f64();
+                stats
+                    .bwe_probe
+                    .lock()
+                    .map(|probe| probe.snapshot(now_s))
+                    .unwrap_or(BweFeedbackSnapshot {
+                        packed_u16: 0,
+                        raw_kbps: 0,
+                        state: 0,
+                        stable: false,
+                    })
+            } else {
+                BweFeedbackSnapshot {
+                    packed_u16: 0,
+                    raw_kbps: 0,
+                    state: 0,
+                    stable: false,
+                }
+            };
             let feedback_version = self.feedback.configuration() as u8;
             let packed_loss = audio_feedback::loss_stats_enabled(feedback_version);
             let (video_frame_size, video_packet_loss) = audio_feedback::normalize_frame_loss(worst.1, worst.0);
@@ -4350,7 +4709,10 @@ impl AudioSender {
                 video_packet_loss: packed_loss.then_some(video_packet_loss),
                 video_frame_size: packed_loss.then_some(video_frame_size),
                 video_received_packets: (!packed_loss).then(|| self.feedback.video_received()),
-                bandwidth_estimate: Some(0),
+                // Packed per `_VCRateControlSetFeedbackControlInfo` (`0x205eba31c..324`: `strh w8, [sp, #0xa]`),
+                // `__AVCStatisticsCollector_GetVCStatisticsWithType` (`0x205ed38fc..934`: kbps | bit0=stable, 0 before burst or >=30s expiry),
+                // and `_VCMediaControlInfoFaceTimeAudio_SerializeBuffer` (`0x2064c2090..20a8`: clamped u16 `0xffff`).
+                bandwidth_estimate: Some(bwe_snapshot.packed_u16),
                 ect: Some(0),
                 ce: Some(0),
                 ..Default::default()
@@ -4384,7 +4746,14 @@ impl AudioSender {
             // info!("Sending ext {extension:?}");
             let (profile, ext_payload) = extension.to_ext_with_feedback_version(feedback_version).ok_or_else(|| std::io::Error::new(
                 std::io::ErrorKind::InvalidData, "incomplete FaceTime audio feedback"))?;
-            self.last_feedback_tx.maybe_log("FTFeedbackTx", profile, &ext_payload, &extension, Some(owrd_raw));
+            self.last_feedback_tx.maybe_log(
+                "FTFeedbackTx",
+                profile,
+                &ext_payload,
+                &extension,
+                Some(owrd_raw),
+                Some((bwe_snapshot.raw_kbps, bwe_snapshot.state, u8::from(bwe_snapshot.stable))),
+            );
             (profile, ext_payload)
         } else {
             (0, vec![])
