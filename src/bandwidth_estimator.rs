@@ -93,9 +93,9 @@ pub struct VCRateControlBandwidthEstimator {
     pub last_probing_sequence_id: u32,
     /// `_firstDivergeTime` (`+0x50`, `f64`)
     pub first_diverge_time: f64,
-    /// `_bandwidthEstimationState` (`+0x58`, `i32`):
-    /// `0` = steady, `>0` = diverging upward count, `<0` = diverging downward count.
-    pub bandwidth_estimation_state: i32,
+    /// `_bandwidthDivergeCount` (`+0x58`, `i32`, `_OBJC_IVAR_$_VCRateControlBandwidthEstimator._bandwidthDivergeCount`):
+    /// `0` = steady, `>0` = diverging upward count, `<0` = diverging downward count (`0x2063ba314..0x2063ba36c`).
+    pub bandwidth_diverge_count: i32,
     /// `_divergedBandwidthEstimationCount` (`+0x5c`, `i32`), index into `+0x60` (max 30).
     pub diverged_bandwidth_estimation_count: i32,
     /// `_divergedBandwidthEstimations` (`+0x60..+0x150`, `[f64; 30]`).
@@ -122,10 +122,10 @@ pub struct VCRateControlBandwidthEstimator {
     pub radio_access_technology: u32,
     /// `_mode` (`+0x19c`, `u32`)
     pub mode: u32,
-    /// `_suddenChangeState` (`+0x1a0`, `i32`):
-    /// `0` = init, `1` = normal update, `2` = upward ramp, `3` = downward ramp,
+    /// `_bandwidthEstimationState` (`+0x1a0`, `i32`, read at `0x2063baa10`):
+    /// `0` = init, `1` = normal update (`isBWEStable == 1`), `2` = upward ramp, `3` = downward ramp,
     /// `4` = upward sudden change applied, `5` = downward sudden change applied, `6` = ignored (`<= 0`).
-    pub sudden_change_state: i32,
+    pub bandwidth_estimation_state: i32,
     /// `_fastSuddenBandwidthDetectionEnabled` (`+0x1a4`, `bool`)
     pub fast_sudden_bandwidth_detection_enabled: bool,
     /// `_l4sHighDataRateEnabled` (`+0x1a5`, `bool`)
@@ -167,7 +167,7 @@ impl VCRateControlBandwidthEstimator {
             last_probing_packet_timestamp: 0,
             last_probing_sequence_id: 0,
             first_diverge_time: 0.0,
-            bandwidth_estimation_state: 0,
+            bandwidth_diverge_count: 0,
             diverged_bandwidth_estimation_count: 0,
             diverged_bandwidth_estimations: [0.0; 30],
             over_range_count: 0,
@@ -181,7 +181,7 @@ impl VCRateControlBandwidthEstimator {
             estimated_bandwidth_uncapped: 0.0,
             radio_access_technology: 0,
             mode: 0,
-            sudden_change_state: 0,
+            bandwidth_estimation_state: 0,
             fast_sudden_bandwidth_detection_enabled: false,
             l4s_high_data_rate_enabled: false,
             // 0x2063b939c: mov w8, #0xfa; str w8, [x19, #0x1b0]
@@ -282,9 +282,9 @@ impl VCRateControlBandwidthEstimator {
         bandwidth_sample: f64,
         arrival_time: f64,
     ) -> f64 {
-        // 0x2063b9ef8..0x2063b9efc: fcmp d0, #0.0; b.le loc_2063b9fa0
-        if bandwidth_sample <= 0.0 {
-            self.sudden_change_state = 6;
+        // 0x2063b9ef8..0x2063b9efc: fcmp d0, #0.0; b.le loc_2063b9fa0 (ARM64 b.le also takes NaN)
+        if !(bandwidth_sample > 0.0) {
+            self.bandwidth_estimation_state = 6;
             return bandwidth_sample;
         }
 
@@ -304,20 +304,20 @@ impl VCRateControlBandwidthEstimator {
             // 0x2063ba210..0x2063ba21c: d0 holds _maxDetectableBandwidth (`[x19, #0x178]`)
             let half_max = self.max_detectable_bandwidth * 0.5;
             let sample_for_avg = if bwe < half_max { bwe } else { half_max };
-            let prev_state = self.bandwidth_estimation_state;
-            let new_state = prev_state + 1;
-            self.bandwidth_estimation_state = new_state;
+            let prev_diverge = self.bandwidth_diverge_count;
+            let new_diverge = prev_diverge + 1;
+            self.bandwidth_diverge_count = new_diverge;
             let total = self.total_bandwidth + sample_for_avg;
             self.total_bandwidth = total;
 
             // 0x2063ba238..0x2063ba250: cmp w9, #8; b.gt loc_2063ba254; else if (arrival_time - first_diverge_time) >= 7.0 -> loc_2063ba254
-            if prev_state > 8 || (arrival_time - self.first_diverge_time) >= 7.0 {
+            if prev_diverge > 8 || (arrival_time - self.first_diverge_time) >= 7.0 {
                 self.is_first_packet = true;
-                self.estimated_bandwidth = total / (new_state as f64);
+                self.estimated_bandwidth = total / (new_diverge as f64);
                 self.first_diverge_time = 0.0;
-                self.bandwidth_estimation_state = 0;
+                self.bandwidth_diverge_count = 0;
             }
-            self.sudden_change_state = 0;
+            self.bandwidth_estimation_state = 0;
             return bwe;
         }
 
@@ -375,7 +375,7 @@ impl VCRateControlBandwidthEstimator {
             let init_floor = 100_000.0; // 0x2066a3f88
             // 0x2063ba0d8..0x2063ba0dc: fcmp d8, d0; fcsel d0, d0, d8, mi -> MAX(bwe, 100_000.0)
             self.estimated_bandwidth = if bwe < init_floor { init_floor } else { bwe };
-            self.sudden_change_state = 0;
+            self.bandwidth_estimation_state = 0; // 0x2063ba0e4
             if self.forced_initial_bandwidth_estimation != 0 {
                 self.estimated_bandwidth = self.forced_initial_bandwidth_estimation as f64;
             }
@@ -401,9 +401,9 @@ impl VCRateControlBandwidthEstimator {
                 cur_est * 0.925 + bwe * 0.075
             };
             self.estimated_bandwidth = updated;
-            self.bandwidth_estimation_state = 0;
+            self.bandwidth_diverge_count = 0; // 0x2063ba2f8
             self.total_bandwidth = 0.0;
-            self.sudden_change_state = 1;
+            self.bandwidth_estimation_state = 1; // 0x2063ba300 (`isBWEStable == 1`)
             return bwe;
         }
 
@@ -420,7 +420,7 @@ impl VCRateControlBandwidthEstimator {
         let mut duration_ok = true;
         if rat <= 6 && ((0x62u32 >> rat) & 1) != 0 {
             let dt = arrival_time - self.first_diverge_time;
-            let threshold = if self.bandwidth_estimation_state < 0 {
+            let threshold = if self.bandwidth_diverge_count < 0 {
                 self.sudden_change_parameters.duration_threshold_downward
             } else {
                 self.sudden_change_parameters.duration_threshold_upward
@@ -428,54 +428,54 @@ impl VCRateControlBandwidthEstimator {
             duration_ok = dt >= threshold;
         }
 
-        // 0x2063ba314..0x2063ba36c: update _bandwidthEstimationState and _suddenChangeState
-        let mut state = self.bandwidth_estimation_state;
+        // 0x2063ba314..0x2063ba36c: update _bandwidthDivergeCount (+0x58) and _bandwidthEstimationState (+0x1a0)
+        let mut diverge_count = self.bandwidth_diverge_count;
         if is_down {
-            if state < 0 {
-                state -= 1;
+            if diverge_count < 0 {
+                diverge_count -= 1;
             } else {
                 self.total_bandwidth = 0.0;
                 self.first_diverge_time = arrival_time;
-                state = -1;
+                diverge_count = -1;
             }
-            self.bandwidth_estimation_state = state;
-            self.sudden_change_state = 3;
+            self.bandwidth_diverge_count = diverge_count;
+            self.bandwidth_estimation_state = 3; // 0x2063ba328 / 0x2063ba350
         } else if is_up {
-            if state > 0 {
-                state += 1;
+            if diverge_count > 0 {
+                diverge_count += 1;
             } else {
                 self.total_bandwidth = 0.0;
                 self.first_diverge_time = arrival_time;
-                state = 1;
+                diverge_count = 1;
             }
-            self.bandwidth_estimation_state = state;
-            self.sudden_change_state = 2;
+            self.bandwidth_diverge_count = diverge_count;
+            self.bandwidth_estimation_state = 2; // 0x2063ba344 / 0x2063ba360
         }
 
         // 0x2063ba370..0x2063ba378
         self.total_bandwidth += bwe;
-        let abs_state = state.unsigned_abs() as i32;
+        let abs_diverge = diverge_count.unsigned_abs() as i32;
 
         // 0x2063ba384..0x2063ba410: trigger sudden change if count >= minSamplesCount && duration_ok,
         // or if fast_sudden_bandwidth_detection_enabled && count >= minSamplesCountFastBandwidthEstimation
         let normal_trigger =
-            abs_state >= self.sudden_change_parameters.min_samples_count && duration_ok;
+            abs_diverge >= self.sudden_change_parameters.min_samples_count && duration_ok;
         let fast_trigger = self.fast_sudden_bandwidth_detection_enabled
-            && abs_state
+            && abs_diverge
                 >= self
                     .sudden_change_parameters
                     .min_samples_count_fast_bandwidth_estimation;
 
         if normal_trigger || fast_trigger {
-            let mut new_est = self.total_bandwidth / (abs_state as f64);
-            // 0x2063ba3ac..0x2063ba3d0: if RAT 5/6 and state >= 0, blend 0.9 * new_est + 0.1 * est
-            if is_rat_5_or_6 && state >= 0 {
+            let mut new_est = self.total_bandwidth / (abs_diverge as f64);
+            // 0x2063ba3ac..0x2063ba3d0: if RAT 5/6 and diverge_count >= 0, blend 0.9 * new_est + 0.1 * est
+            if is_rat_5_or_6 && diverge_count >= 0 {
                 new_est = self.estimated_bandwidth * 0.1 + new_est * 0.9;
             }
             self.estimated_bandwidth = new_est;
-            // 0x2063ba3d8..0x2063ba3e4: state < 0 -> 5 (down), state >= 0 -> 4 (up)
-            self.sudden_change_state = if state < 0 { 5 } else { 4 };
-            self.bandwidth_estimation_state = 0;
+            // 0x2063ba3d8..0x2063ba3e4: diverge_count < 0 -> 5 (down), diverge_count >= 0 -> 4 (up)
+            self.bandwidth_estimation_state = if diverge_count < 0 { 5 } else { 4 };
+            self.bandwidth_diverge_count = 0;
             self.total_bandwidth = 0.0;
         }
 
@@ -498,7 +498,7 @@ impl VCRateControlBandwidthEstimator {
             self.is_first_packet = false;
             self.last_probing_sequence_id = sequence_id.wrapping_sub(is_probing as u32);
             self.first_diverge_time = arrival_time;
-            self.bandwidth_estimation_state = 0;
+            self.bandwidth_diverge_count = 0;
             self.diverged_bandwidth_estimation_count = 0;
         }
 
@@ -614,7 +614,7 @@ impl VCRateControlBandwidthEstimator {
                 sample_time
             };
             self.first_diverge_time = arrival_time;
-            self.bandwidth_estimation_state = 0;
+            self.bandwidth_diverge_count = 0;
             self.diverged_bandwidth_estimation_count = 0;
         }
 
@@ -723,7 +723,7 @@ impl VCRateControlBandwidthEstimator {
             }
         }
 
-        // 0x2063ba6a4..0x2063ba780
+        // 0x2063ba6a4..0x2063ba780 (`fcmp d10, #0.0; b.le` also skips NaN)
         if bwe > 0.0 {
             self.estimated_bandwidth_uncapped = bwe;
             let passed_bwe = if self.estimated_bandwidth == 0.0 {
@@ -757,7 +757,8 @@ impl VCRateControlBandwidthEstimator {
         bandwidth_sample: f64,
         arrival_time: f64,
     ) {
-        if bandwidth_sample <= 0.0 {
+        // 0x2063ba7a4..0x2063ba7a8: fcmp d0, #0.0; b.le
+        if !(bandwidth_sample > 0.0) {
             return;
         }
         self.estimated_bandwidth_uncapped = bandwidth_sample;
@@ -824,8 +825,9 @@ impl VCRateControlBandwidthEstimatorMap {
         is_last_probing_packet: bool,
     ) -> Option<&mut VCRateControlBandwidthEstimator> {
         // 0x2063bab84..0x2063bab98:
-        // if defaultEstimator != None && (mode != 6 && mode != 7) -> return defaultEstimator
-        if self.default_estimator_id.is_some() && self.mode != 6 && self.mode != 7 {
+        // sub w8, w8, #6; cmp x20, #0; ccmn w8, #2, #2, ne; b.lo -> defaultEstimator
+        // i.e. if defaultEstimator != nil && mode != 4 && mode != 5 -> return defaultEstimator.
+        if self.default_estimator_id.is_some() && self.mode != 4 && self.mode != 5 {
             let def_id = self.default_estimator_id?;
             return self.bandwidth_estimators.get_mut(&def_id);
         }
@@ -890,9 +892,10 @@ impl VCRateControlBandwidthEstimatorMap {
 
     /// `_VCRateControlBandwidthEstimatorMap_EstimatedBandwidthWithArrivalTime` (`0x2063baf84`).
     pub fn estimated_bandwidth_with_arrival_time(&mut self, arrival_time: f64) -> f64 {
-        // 0x2063bafb4..0x2063bafc8: if defaultEstimator != None && (mode < 6 || mode > 8) -> return default.estimatedBandwidth
+        // 0x2063bafb4..0x2063bafc8: sub w8, w8, #6; ccmn w8, #3, #2, ne; b.ls ->
+        // if defaultEstimator != nil && mode != 4 && mode != 5 -> return default.estimatedBandwidth
         if let Some(def_id) = self.default_estimator_id {
-            if self.mode < 6 || self.mode > 8 {
+            if self.mode != 4 && self.mode != 5 {
                 return self
                     .bandwidth_estimators
                     .get(&def_id)
@@ -900,11 +903,12 @@ impl VCRateControlBandwidthEstimatorMap {
             }
         }
 
-        // 0x2063bafcc..0x2063bb02c & 0x2063bb26c: max across active estimators (< 30.0s stale)
+        // 0x2063bafcc..0x2063bb02c & 0x2063bb298 (`lastProbingArrivalTime` -> `[est, #0x20]`):
+        // max across active estimators (< 30.0s stale)
         let mut max_bw = 0.0_f64;
         for est in self.bandwidth_estimators.values() {
             if arrival_time == 0.0
-                || (arrival_time - est.last_probing_sequence_arrival_time) < 30.0
+                || (arrival_time - est.reference_packet_arrival_time) < 30.0
             {
                 if est.estimated_bandwidth > max_bw {
                     max_bw = est.estimated_bandwidth;
@@ -917,8 +921,9 @@ impl VCRateControlBandwidthEstimatorMap {
 
     /// `_VCRateControlBandwidthEstimatorMap_EstimatedBandwidthUncappedWithArrivalTime` (`0x2063bb0f8`).
     pub fn estimated_bandwidth_uncapped_with_arrival_time(&mut self, arrival_time: f64) -> f64 {
+        // 0x2063bb128..0x2063bb13c: fast-path defaultEstimator when mode != 4 && mode != 5
         if let Some(def_id) = self.default_estimator_id {
-            if self.mode < 6 || self.mode > 8 {
+            if self.mode != 4 && self.mode != 5 {
                 return self
                     .bandwidth_estimators
                     .get(&def_id)
@@ -926,10 +931,11 @@ impl VCRateControlBandwidthEstimatorMap {
             }
         }
 
+        // 0x2063bb308 -> 0x2063baa28 (`lastProbingArrivalTime` at `[est, #0x20]`)
         let mut max_bw = 0.0_f64;
         for est in self.bandwidth_estimators.values() {
             if arrival_time == 0.0
-                || (arrival_time - est.last_probing_sequence_arrival_time) < 30.0
+                || (arrival_time - est.reference_packet_arrival_time) < 30.0
             {
                 if est.estimated_bandwidth_uncapped > max_bw {
                     max_bw = est.estimated_bandwidth_uncapped;
@@ -940,7 +946,8 @@ impl VCRateControlBandwidthEstimatorMap {
         max_bw
     }
 
-    /// `_VCRateControlBandwidthEstimatorMap_bandwidthEstimationState` (`0x2063bb800`).
+    /// `-[VCRateControlBandwidthEstimatorMap bandwidthEstimationState]` (`0x2063bb800`)
+    /// -> `-[VCRateControlBandwidthEstimator bandwidthEstimationState]` (`0x2063baa10`: `[est, #0x1a0]`).
     pub fn bandwidth_estimation_state(&self) -> i32 {
         // 0x2063bb808..0x2063bb81c: returns 0 when _defaultEstimator == nil OR _mode in {4, 5}
         if self.mode == 4 || self.mode == 5 {
@@ -1089,4 +1096,95 @@ pub fn bandwidth_estimation_kbps_for_stats(
         kbps = 0;
     }
     kbps
+}
+
+/// Stateful `AVCStatisticsCollector` BWE tracker combining
+/// `__AVCStatisticsCollector_ComputeBWEstimation` (`0x205ed47b4`) and
+/// `__AVCStatisticsCollector_GetVCStatisticsWithType` (`0x205ed3874`).
+#[derive(Debug, Clone)]
+pub struct AVCStatisticsCollectorBwe {
+    /// Underlying `VCRateControlBandwidthEstimatorMap` (`collector + 0x08`).
+    pub map: VCRateControlBandwidthEstimatorMap,
+    /// `_mode` (`collector + 0x4c`).
+    pub collector_mode: u32,
+    /// `_estimatedBandwidthCap` (`collector + 0x70`, `0` = uncapped).
+    pub estimated_bandwidth_cap: u32,
+    /// `_sharedEstimatedBandwidth` (`collector + 0x54`, bps, quantized to 8 kbps + state bit).
+    pub shared_estimated_bandwidth: u32,
+    /// `_sharedEstimatedBandwidthUncapped` (`collector + 0x58`, bps).
+    pub shared_estimated_bandwidth_uncapped: u32,
+    /// `_lastBWEstimationTime` (`collector + 0x5c0`), updated on `type == 4` events (`0x205ed49a8..0x205ed49ac`).
+    pub last_bw_estimation_time: f64,
+}
+
+impl AVCStatisticsCollectorBwe {
+    /// Initialize collector BWE state for `collector_mode` and `radio_access_technology`.
+    pub fn new(collector_mode: u32, radio_access_technology: u32) -> Self {
+        let mut map = VCRateControlBandwidthEstimatorMap::new();
+        map.set_mode(collector_mode);
+        map.set_radio_access_technology(radio_access_technology);
+        Self {
+            map,
+            collector_mode,
+            estimated_bandwidth_cap: 0,
+            shared_estimated_bandwidth: 0,
+            shared_estimated_bandwidth_uncapped: 0,
+            last_bw_estimation_time: 0.0,
+        }
+    }
+
+    /// Process a `VCStatistics` `type == 4` packet (`0x205ed496c..0x205ed49b0` -> `0x205ed4870`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn process_probing_packet(
+        &mut self,
+        sample_time: u32,
+        packet_size: u32,
+        is_probing: bool,
+        packet_id: u32,
+        is_last_probing_packet: bool,
+        arrival_time: f64,
+        estimator_id: u32,
+    ) {
+        if let Some(est) = self.map.bandwidth_estimator_mut(
+            estimator_id,
+            is_probing,
+            is_last_probing_packet,
+        ) {
+            est.calculate_bandwidth_estimation(
+                sample_time,
+                packet_size,
+                is_probing,
+                packet_id,
+                is_last_probing_packet,
+                arrival_time,
+            );
+        }
+        // 0x205ed49a8..0x205ed49ac: _lastBWEstimationTime = statistics.arrivalTime
+        self.last_bw_estimation_time = arrival_time;
+        if let Some(out) = compute_bw_estimation_from_map(
+            &mut self.map,
+            self.collector_mode,
+            self.estimated_bandwidth_cap,
+            arrival_time,
+        ) {
+            self.shared_estimated_bandwidth = out.shared_estimated_bandwidth;
+            self.shared_estimated_bandwidth_uncapped = out.shared_estimated_bandwidth_uncapped;
+        }
+    }
+
+    /// Read current quantized `bandwidthEstimation` in kbps (with `bit 0 = isBWEStable`),
+    /// enforcing the `30.0 s` staleness expiry (`0x205ed38fc..0x205ed3934`).
+    pub fn readout_kbps(&self, current_time: f64) -> u32 {
+        bandwidth_estimation_kbps_for_stats(
+            self.shared_estimated_bandwidth,
+            self.collector_mode,
+            current_time,
+            self.last_bw_estimation_time,
+        )
+    }
+
+    /// Current `-[VCRateControlBandwidthEstimatorMap bandwidthEstimationState]` (`0x2063bb800`).
+    pub fn bandwidth_estimation_state(&self) -> i32 {
+        self.map.bandwidth_estimation_state()
+    }
 }
