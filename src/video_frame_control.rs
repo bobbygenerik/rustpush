@@ -7,6 +7,7 @@ pub struct FrameControlEntry<C> {
     pub ltr_bits: u8,
     pub ltr_timestamp: Option<u32>,
     pub camera_meta: Option<C>,
+    pub frame_sequence_number: Option<u16>,
 }
 
 struct TrackedEntry<C> {
@@ -62,6 +63,7 @@ impl<C: Copy> VideoFrameControlTracker<C> {
         ltr_bits: u8,
         ltr_timestamp: Option<u32>,
         camera_meta: Option<C>,
+        frame_sequence_number: Option<u16>,
     ) {
         if let Some(existing) = self.pending.get_mut(&(ssrc, timestamp)) {
             if existing.control.camera_meta.is_none() {
@@ -69,6 +71,9 @@ impl<C: Copy> VideoFrameControlTracker<C> {
             }
             if existing.control.ltr_timestamp.is_none() {
                 existing.control.ltr_timestamp = ltr_timestamp;
+            }
+            if existing.control.frame_sequence_number.is_none() {
+                existing.control.frame_sequence_number = frame_sequence_number;
             }
             return;
         }
@@ -96,6 +101,7 @@ impl<C: Copy> VideoFrameControlTracker<C> {
                     ltr_bits,
                     ltr_timestamp,
                     camera_meta,
+                    frame_sequence_number,
                 },
                 order,
             },

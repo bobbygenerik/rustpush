@@ -2219,6 +2219,7 @@ impl IncomingFrameHandler {
                                 video_meta.as_ref().map(|v| v.ltr_bits).unwrap_or(0),
                                 video_meta.as_ref().and_then(|v| v.ltr_timestamp),
                                 video_meta.as_ref().map(|v| v.camera_status),
+                                video_meta.as_ref().and_then(|v| v.frame_sequence_number),
                             );
                         }
 
@@ -2267,6 +2268,7 @@ impl IncomingFrameHandler {
                                     camera_meta: config_camera_meta,
                                     ltr_bits: 0,
                                     ltr_timestamp: None,
+                                    frame_sequence_number: None,
                                     media_ssrc: header_ssrc,
                                     frame: ChannelFrame::Configuration(config),
                                 });
@@ -2363,6 +2365,7 @@ impl IncomingFrameHandler {
                                 camera_meta: sample_camera_meta,
                                 ltr_bits: popped_control.map(|c| c.ltr_bits).unwrap_or(0),
                                 ltr_timestamp: popped_control.and_then(|c| c.ltr_timestamp),
+                                frame_sequence_number: popped_control.and_then(|c| c.frame_sequence_number),
                                 media_ssrc: header_ssrc,
                                 frame: ChannelFrame::Sample(data.to_vec()),
                             });
@@ -4456,6 +4459,7 @@ pub enum AVControlCommand {
 mod video_decode_progress;
 #[path = "video_reference_chain.rs"]
 mod video_reference_chain;
+pub use video_reference_chain::FrameSeqGapTracker;
 #[path = "video_receive_recovery.rs"]
 mod video_receive_recovery;
 #[path = "video_no_display.rs"]
@@ -4583,6 +4587,10 @@ impl AVSession {
     pub fn report_video_lagged(&self) -> bool {
         if !self.video_recovery_live.load(Ordering::Acquire) { return false; }
         self.video_receive_recovery.report_lagged() > 0
+    }
+
+    pub fn is_video_chain_not_waiting(&self, participant: u64, stream_id: u32) -> bool {
+        self.video_receive_recovery.is_chain_not_waiting((participant, stream_id))
     }
 
     pub fn report_video_decoder_reset(&self, receipt: u64) -> bool {
@@ -6435,6 +6443,7 @@ pub struct ChannelMessage {
     pub camera_meta: Option<FTVideoCameraStatus>,
     pub ltr_bits: u8,
     pub ltr_timestamp: Option<u32>,
+    pub frame_sequence_number: Option<u16>,
     pub media_ssrc: u32,
     pub timestamp: u32,
     pub receive_timing: Option<FTReceiveTiming>,

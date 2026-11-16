@@ -16,19 +16,21 @@ fn refresh_frame_followed_by_normal_frame_preserves_per_frame_labels() {
     let ssrc = 0x1020_3040;
 
     // Frame 1000: refresh frame (`ltr_bits = 0x02`) across 2 packets, then frame 2000: normal (`0x00`).
-    tracker.record(ssrc, 1000, 0x02, Some(777), None);
-    tracker.record(ssrc, 1000, 0x05, Some(888), Some(0x83));
-    tracker.record(ssrc, 2000, 0x00, None, Some(0x81));
+    tracker.record(ssrc, 1000, 0x02, Some(777), None, Some(10));
+    tracker.record(ssrc, 1000, 0x05, Some(888), Some(0x83), Some(11));
+    tracker.record(ssrc, 2000, 0x00, None, Some(0x81), Some(12));
 
     let refresh = tracker.take(ssrc, 1000).expect("frame 1000 present");
     assert_eq!(refresh.ltr_bits, 0x02);
     assert_eq!(refresh.ltr_timestamp, Some(777));
     assert_eq!(refresh.camera_meta, Some(0x83));
+    assert_eq!(refresh.frame_sequence_number, Some(10));
 
     let normal = tracker.take(ssrc, 2000).expect("frame 2000 present");
     assert_eq!(normal.ltr_bits, 0x00);
     assert_eq!(normal.ltr_timestamp, None);
     assert_eq!(normal.camera_meta, Some(0x81));
+    assert_eq!(normal.frame_sequence_number, Some(12));
 
     // Verify with VideoReferenceChain after loss: frame 1000 clears wait cleanly; frame 2000 is admitted.
     let mut chain = VideoReferenceChain::default();
@@ -45,9 +47,9 @@ fn late_popped_frame_keeps_its_own_control_info_after_later_packets() {
 
     // Frame 100 (LTR refresh + ACK candidate: 0x03) arrives, then packets for frames 200 & 300 arrive
     // before SampleBuilder pops frame 100.
-    tracker.record(ssrc, 100, 0x03, Some(0x1111_2222), Some(0x82));
-    tracker.record(ssrc, 200, 0x00, None, Some(0x84));
-    tracker.record(ssrc, 300, 0x01, Some(0x3333_4444), Some(0x85));
+    tracker.record(ssrc, 100, 0x03, Some(0x1111_2222), Some(0x82), Some(1));
+    tracker.record(ssrc, 200, 0x00, None, Some(0x84), Some(2));
+    tracker.record(ssrc, 300, 0x01, Some(0x3333_4444), Some(0x85), Some(3));
 
     let f100 = tracker.take(ssrc, 100).expect("frame 100 popped late");
     assert_eq!(f100.ltr_bits, 0x03);
@@ -75,10 +77,10 @@ fn rtp_timestamp_wraparound_evicts_older_and_preserves_newer() {
     let ts_pop = 5;
     let ts_new = 20;
 
-    tracker.record(ssrc, ts_old, 0x01, Some(10), Some(0x80));
-    tracker.record(ssrc, ts_pop, 0x02, Some(20), Some(0x81));
-    tracker.record(ssrc, ts_new, 0x00, Some(30), Some(0x82));
-    tracker.record(other_ssrc, ts_old, 0x03, Some(40), Some(0x83));
+    tracker.record(ssrc, ts_old, 0x01, Some(10), Some(0x80), None);
+    tracker.record(ssrc, ts_pop, 0x02, Some(20), Some(0x81), None);
+    tracker.record(ssrc, ts_new, 0x00, Some(30), Some(0x82), None);
+    tracker.record(other_ssrc, ts_old, 0x03, Some(40), Some(0x83), None);
 
     // Popping ts_pop = 5 must evict ts_old = u32::MAX - 10 for ssrc, preserve ts_new = 20,
     // and leave other_ssrc untouched.
@@ -100,7 +102,7 @@ fn attribution_map_stays_bounded_without_pops() {
     let ssrc = 7;
 
     for i in 0..(MAX_TRACKED_FRAMES as u32 + 128) {
-        tracker.record(ssrc, i * 3000, (i & 0xf) as u8, Some(i), Some(0x80));
+        tracker.record(ssrc, i * 3000, (i & 0xf) as u8, Some(i), Some(0x80), Some(i as u16));
         assert!(tracker.len() <= MAX_TRACKED_FRAMES);
     }
     assert_eq!(tracker.len(), MAX_TRACKED_FRAMES);

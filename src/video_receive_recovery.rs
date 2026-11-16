@@ -241,6 +241,10 @@ impl VideoReceiveRecovery {
     pub(super) fn stream_incarnation(&self, stream: Stream) -> Option<u64> {
         self.0.lock().unwrap().streams.get(&stream).map(|state| state.incarnation)
     }
+
+    pub(super) fn is_chain_not_waiting(&self, stream: Stream) -> bool {
+        self.0.lock().unwrap().chain.is_not_waiting(stream)
+    }
 }
 
 impl State {

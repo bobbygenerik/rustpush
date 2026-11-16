@@ -679,6 +679,7 @@ impl FTClient {
         let conn_for_fir = Arc::downgrade(session.connection.as_ref().unwrap());
         let rt_handle = tokio::runtime::Handle::current();
         let fir_loss_log_count = AtomicU64::new(0);
+        let frame_seq_gaps = std::sync::Mutex::new(crate::avconference::FrameSeqGapTracker::default());
         let video_loss_gate = std::sync::Mutex::new(crate::ltr_ack::VideoLossRecoveryGate::default());
         #[cfg(not(target_arch = "wasm32"))]
         let evs_decoders = std::sync::Mutex::new(HashMap::new());
@@ -721,6 +722,16 @@ impl FTClient {
             if is_video {
                 conn_for_fir.observe_video_receive_target(msg.participant, msg.stream_id,
                     msg.keyframe_target, msg.camera_meta.map(|status| status.source));
+                if !configuration {
+                    if let Some(cur) = msg.frame_sequence_number {
+                        let not_waiting = conn_for_fir.is_video_chain_not_waiting(msg.participant, msg.stream_id);
+                        let is_refresh = is_keyframe || ltr_refresh;
+                        if let Some((prev, cur, true)) = frame_seq_gaps.lock().unwrap().observe(
+                            (msg.participant, msg.stream_id), cur, not_waiting, is_refresh) {
+                            info!("[FTVideoRx] frame_seq_gap prev={} cur={} would_withhold=true", prev, cur);
+                        }
+                    }
+                }
             }
             let deliver = !is_video || decode_receipt.is_some();
             let mut frame = frame;
