@@ -11,6 +11,9 @@ pub(super) struct VideoDecodeProgress {
 struct DecodeState {
     last_healthy_output: Option<Instant>,
     waiting_for_random_access: bool,
+    // Set on decoderFailed/decoderReset: decoder holds no references, so only a keyframe clears it
+    // and FIR recovery must request type 0 (IDR) rather than 2 (LTR refresh).
+    needs_intraframe: bool,
     // Distinct from recency: loss rearms recovery but is not stream startup.
     has_output: bool,
     loss_recovery_started: Option<Instant>,
@@ -18,8 +21,12 @@ struct DecodeState {
 
 impl VideoDecodeProgress {
     pub(super) fn record_output(&self, keyframe: bool) {
+        self.record_output_kind(keyframe, keyframe);
+    }
+
+    pub(super) fn record_output_kind(&self, is_keyframe: bool, is_refresh: bool) {
         let mut state = self.state.lock().unwrap();
-        state.record_output_at(keyframe, Instant::now());
+        state.record_output_kind_at(is_keyframe, is_refresh, Instant::now());
     }
 
     pub(super) fn is_recent(&self) -> bool {
@@ -31,6 +38,11 @@ impl VideoDecodeProgress {
     pub(super) fn rearm(&self) {
         let mut state = self.state.lock().unwrap();
         state.rearm_at(Instant::now());
+    }
+
+    pub(super) fn rearm_intraframe(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.rearm_intraframe_at(Instant::now());
     }
 
     pub(super) fn request_type(&self, requested: u32, one_to_one: bool) -> u32 {
@@ -50,12 +62,24 @@ impl VideoDecodeProgress {
 
 impl DecodeState {
     fn record_output_at(&mut self, keyframe: bool, now: Instant) {
+        self.record_output_kind_at(keyframe, keyframe, now);
+    }
+
+    fn record_output_kind_at(&mut self, is_keyframe: bool, is_refresh: bool, now: Instant) {
         self.has_output = true;
-        // Concealment output from an old damaged chain cannot finish recovery.
-        if self.waiting_for_random_access && !keyframe { return; }
+        // Concealment output from an old damaged chain cannot finish recovery,
+        // and after decoder reset/failure only a real keyframe clears needs_intraframe.
+        if self.needs_intraframe && !is_keyframe { return; }
+        if self.waiting_for_random_access && !is_refresh { return; }
+        self.needs_intraframe = false;
         self.waiting_for_random_access = false;
         self.loss_recovery_started = None;
         self.last_healthy_output = Some(now);
+    }
+
+    fn rearm_intraframe_at(&mut self, now: Instant) {
+        self.needs_intraframe = true;
+        self.rearm_at(now);
     }
 
     fn rearm_at(&mut self, now: Instant) {
@@ -69,6 +93,9 @@ impl DecodeState {
     }
 
     fn request_type_at(&self, requested: u32, one_to_one: bool, now: Instant) -> u32 {
+        // After decoder reset/failure the decoder holds no reference frames, so
+        // an LTR refresh cannot decode; request keyframe (fir_type 0) instead of type 2.
+        if self.needs_intraframe && requested == 2 { return 0; }
         // iOS27 VCVideoStream coerces requests to type4 while
         // _lastDecodedVideoFrameTime is zero. Our output state is per session,
         // so apply this only to 1:1 startup; group/stream resets need per-stream

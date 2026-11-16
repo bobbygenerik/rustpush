@@ -4967,6 +4967,11 @@ impl AVSession {
         self.video_receive_recovery.decoder_reset(receipt)
     }
 
+    pub fn report_video_decoder_failed(&self) -> bool {
+        if !self.video_recovery_live.load(Ordering::Acquire) { return false; }
+        self.video_receive_recovery.decoder_failed()
+    }
+
     pub fn video_decoder_is_recent(&self, participant: u64, stream_id: u32) -> bool {
         self.video_receive_recovery.decoder_is_recent((participant, stream_id))
     }

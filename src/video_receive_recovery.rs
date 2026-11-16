@@ -36,6 +36,7 @@ struct State {
     pending: BTreeMap<u64, FrameReceipt>,
     streams: HashMap<Stream, StreamState>,
     chain: VideoReferenceChain,
+    global_needs_intraframe: bool,
 }
 
 /// App-local receipts bind decoder feedback to the actual input stream/frame.
@@ -90,7 +91,14 @@ impl VideoReceiveRecovery {
         // Never reuse a receipt in this session, including at integer exhaustion.
         let receipt = state.next_receipt.checked_add(1).filter(|id| *id <= i64::MAX as u64)?;
         state.next_receipt = receipt;
-        state.streams.entry(stream).or_insert_with(|| StreamState { incarnation: receipt, ..Default::default() });
+        let global_needs_intraframe = state.global_needs_intraframe;
+        state.streams.entry(stream).or_insert_with(|| {
+            let s = StreamState { incarnation: receipt, ..Default::default() };
+            if global_needs_intraframe {
+                s.progress.rearm_intraframe();
+            }
+            s
+        });
         if lost > 0 {
             // prev_dropped describes loss before this reassembled frame. An
             // intact random-access frame at this receipt can still recover it.
@@ -122,15 +130,19 @@ impl VideoReceiveRecovery {
     fn decoded_at(&self, receipt: u64, now: Instant) -> Option<FrameReceipt> {
         let mut state = self.0.lock().unwrap();
         let frame = state.pending.remove(&receipt)?;
+        let global_needs_intraframe = state.global_needs_intraframe;
         let stream = state.streams.get_mut(&frame.stream)?;
         if frame.configuration || receipt <= stream.damaged_through { return None; }
         let is_refresh = frame.keyframe || (frame.ltr_bits & 0x02) != 0;
-        stream.progress.record_output(is_refresh);
+        stream.progress.record_output_kind(frame.keyframe, is_refresh);
         if !stream.progress.is_recent() { return None; }
         stream.no_display.progress(now);
         // Outputs may be reordered. Retire older receipts without accepting
         // them as later progress or allowing duplicate callbacks to heal loss.
         state.pending.retain(|id, item| item.stream != frame.stream || *id > receipt);
+        if frame.keyframe && global_needs_intraframe {
+            state.global_needs_intraframe = false;
+        }
         Some(frame)
     }
 
@@ -167,11 +179,29 @@ impl VideoReceiveRecovery {
         // This frame belongs to the new decoder. Invalidate earlier outputs,
         // while allowing this frame itself to establish a new reference.
         state.damage(frame.stream, receipt - 1);
+        if let Some(entry) = state.streams.get_mut(&frame.stream) {
+            entry.progress.rearm_intraframe();
+        }
         state.chain.invalidate(frame.stream);
         if frame.keyframe && !frame.configuration {
             state.chain.accept(frame.stream, false, true, 0);
         }
         true
+    }
+
+    pub(super) fn decoder_failed(&self) -> bool {
+        let mut state = self.0.lock().unwrap();
+        state.global_needs_intraframe = true;
+        let through = state.next_receipt;
+        let streams: Vec<Stream> = state.streams.keys().copied().collect();
+        for &stream in &streams {
+            state.damage(stream, through);
+            if let Some(entry) = state.streams.get_mut(&stream) {
+                entry.progress.rearm_intraframe();
+            }
+            state.chain.invalidate(stream);
+        }
+        !streams.is_empty()
     }
 
     pub(super) fn observe_target(&self, stream: Stream, target: Option<(u32, u32)>, source: Option<u8>) {
