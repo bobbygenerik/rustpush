@@ -15,6 +15,7 @@ pub mod sharedstreams;
 pub mod findmy;
 pub mod facetime;
 pub mod feedback_delay;
+pub mod jlag_processor;
 pub mod ltr_ack;
 #[cfg(not(target_arch = "wasm32"))]
 mod evs_decoder;
