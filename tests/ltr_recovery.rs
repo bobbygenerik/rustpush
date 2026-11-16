@@ -64,3 +64,19 @@ fn video_decode_progress_15s_fallback_via_ltr_refresh() {
     progress.rearm();
     assert_eq!(progress.random_access_request_type(true), 2);
 }
+
+#[test]
+fn accept_with_ltr_decision_marks_refresh_only_for_started_stream() {
+    let mut chain = VideoReferenceChain::default();
+    let stream = (1, 0);
+
+    // Unstarted stream with LTR bit 1 is rejected and ltr_refresh = false.
+    assert_eq!(chain.accept_with_ltr_decision(stream, false, false, 0x02, 0), (false, false));
+    // Startup keyframe is accepted with ltr_refresh = false.
+    assert_eq!(chain.accept_with_ltr_decision(stream, false, true, 0x00, 0), (true, false));
+    // Configuration frame never marks ltr_refresh.
+    assert_eq!(chain.accept_with_ltr_decision(stream, true, false, 0x02, 0), (true, false));
+    // After loss, LTR bit 1 clears waiting and reports ltr_refresh = true.
+    assert_eq!(chain.accept_with_ltr_decision(stream, false, false, 0x00, 1), (false, false));
+    assert_eq!(chain.accept_with_ltr_decision(stream, false, false, 0x02, 0), (true, true));
+}

@@ -706,8 +706,15 @@ impl FTClient {
                     }
                 };
             let configuration = matches!(msg.frame, ChannelFrame::Configuration(_));
-            let decode_receipt = is_video.then(|| conn_for_fir.receive_video_frame_with_ltr(
-                msg.participant, msg.stream_id, msg.timestamp, configuration, is_keyframe, msg.ltr_bits, msg.prev_dropped)).flatten();
+            let (decode_receipt, ltr_refresh) = if is_video {
+                match conn_for_fir.receive_video_frame_with_ltr_decision(
+                    msg.participant, msg.stream_id, msg.timestamp, configuration, is_keyframe, msg.ltr_bits, msg.prev_dropped) {
+                    Some((receipt, refresh)) => (Some(receipt), refresh),
+                    None => (None, false),
+                }
+            } else {
+                (None, false)
+            };
             if let Some(receipt) = decode_receipt {
                 conn_for_fir.set_video_frame_ltr(receipt, msg.ltr_bits, msg.ltr_timestamp, msg.media_ssrc);
             }
@@ -738,6 +745,7 @@ impl FTClient {
                     stream_id: msg.stream_id,
                     codec,
                     is_configuration: matches!(msg.frame, ChannelFrame::Configuration(_)),
+                    ltr_refresh,
                     timestamp: msg.timestamp,
                     decode_receipt,
                     width,
@@ -1615,6 +1623,16 @@ impl FTClient {
         let targets = self.identity.cache.lock().await.get_participants_targets(&topic, handle, targets);
         self.identity.send_message(topic, send_for_message(handle.clone(), message, None), targets).await?;
         Ok(())
+    }
+
+    pub async fn report_video_frames_lagged(&self) {
+        let connections: Vec<_> = {
+            let state = self.state.read().await;
+            state.sessions.values().filter_map(|s| s.connection.clone()).collect()
+        };
+        for conn in connections {
+            conn.report_video_lagged();
+        }
     }
 
     pub async fn handle(&self, msg: APSMessage) -> Result<Option<FTMessage>, PushError> {

@@ -4534,8 +4534,15 @@ impl AVSession {
 
     pub fn receive_video_frame_with_ltr(&self, participant: u64, stream_id: u32,
         timestamp: u32, configuration: bool, keyframe: bool, ltr_bits: u8, lost: u16) -> Option<u64> {
+        self.receive_video_frame_with_ltr_decision(
+            participant, stream_id, timestamp, configuration, keyframe, ltr_bits, lost,
+        ).map(|(receipt, _)| receipt)
+    }
+
+    pub fn receive_video_frame_with_ltr_decision(&self, participant: u64, stream_id: u32,
+        timestamp: u32, configuration: bool, keyframe: bool, ltr_bits: u8, lost: u16) -> Option<(u64, bool)> {
         if !self.video_recovery_live.load(Ordering::Acquire) { return None; }
-        self.video_receive_recovery.receive_with_ltr((participant, stream_id), timestamp, configuration, keyframe, ltr_bits, lost)
+        self.video_receive_recovery.receive_with_ltr_decision((participant, stream_id), timestamp, configuration, keyframe, ltr_bits, lost)
     }
 
     pub fn set_video_frame_ltr(&self, receipt: u64, ltr_bits: u8, ltr_timestamp: Option<u32>, media_ssrc: u32) {
@@ -4571,6 +4578,11 @@ impl AVSession {
     pub fn report_video_dropped(&self, receipt: u64) -> bool {
         if !self.video_recovery_live.load(Ordering::Acquire) { return false; }
         self.video_receive_recovery.dropped(receipt)
+    }
+
+    pub fn report_video_lagged(&self) -> bool {
+        if !self.video_recovery_live.load(Ordering::Acquire) { return false; }
+        self.video_receive_recovery.report_lagged() > 0
     }
 
     pub fn report_video_decoder_reset(&self, receipt: u64) -> bool {
@@ -6453,6 +6465,8 @@ pub struct FTMediaFrameEnvelope {
     pub stream_id: u32,
     pub codec: String,
     pub is_configuration: bool,
+    #[serde(default)]
+    pub ltr_refresh: bool,
     pub timestamp: u32,
     pub width: Option<i32>,
     /// App-local decoder ownership token; never part of RTP or hosted signaling.

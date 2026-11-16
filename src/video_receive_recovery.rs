@@ -77,6 +77,12 @@ impl VideoReceiveRecovery {
 
     pub(super) fn receive_with_ltr(&self, stream: Stream, timestamp: u32,
         configuration: bool, keyframe: bool, ltr_bits: u8, lost: u16) -> Option<u64> {
+        self.receive_with_ltr_decision(stream, timestamp, configuration, keyframe, ltr_bits, lost)
+            .map(|(receipt, _)| receipt)
+    }
+
+    pub(super) fn receive_with_ltr_decision(&self, stream: Stream, timestamp: u32,
+        configuration: bool, keyframe: bool, ltr_bits: u8, lost: u16) -> Option<(u64, bool)> {
         let mut state = self.0.lock().unwrap();
         if state.active_participants.as_ref().is_some_and(|active| !active.contains(&stream.0)) {
             return None;
@@ -91,13 +97,14 @@ impl VideoReceiveRecovery {
             state.damage(stream, receipt - 1);
             state.chain.invalidate(stream);
         }
-        if !state.chain.accept_with_ltr(stream, configuration, keyframe, ltr_bits, lost) { return None; }
+        let (accepted, ltr_refresh) = state.chain.accept_with_ltr_decision(stream, configuration, keyframe, ltr_bits, lost);
+        if !accepted { return None; }
         if state.pending.len() == Self::MAX_PENDING { state.pending.pop_first(); }
         state.pending.insert(receipt, FrameReceipt {
             stream, timestamp, configuration, keyframe,
             ltr_bits, ltr_timestamp: None, media_ssrc: 0,
         });
-        Some(receipt)
+        Some((receipt, ltr_refresh))
     }
 
     pub(super) fn set_ltr_metadata(&self, receipt: u64, ltr_bits: u8, ltr_timestamp: Option<u32>, media_ssrc: u32) {
@@ -141,6 +148,17 @@ impl VideoReceiveRecovery {
             state.chain.accept(frame.stream, false, true, 0);
         }
         true
+    }
+
+    pub(super) fn report_lagged(&self) -> usize {
+        let mut state = self.0.lock().unwrap();
+        let through = state.next_receipt;
+        let streams: Vec<Stream> = state.streams.keys().copied().collect();
+        for &stream in &streams {
+            state.damage(stream, through);
+            state.chain.invalidate(stream);
+        }
+        streams.len()
     }
 
     pub(super) fn decoder_reset(&self, receipt: u64) -> bool {
@@ -453,5 +471,23 @@ mod tests {
         let r = VideoReceiveRecovery::default();
         r.0.lock().unwrap().next_receipt = u64::MAX;
         assert!(r.receive(A, 1, false, true, 0).is_none());
+    }
+    #[test]
+    fn lagged_frames_invalidate_reference_chain_and_rearm_recovery() {
+        let r = VideoReceiveRecovery::default();
+        let key = frame(&r, A, true);
+        assert!(r.decoded(key).is_some());
+        assert!(r.decoder_is_recent(A));
+
+        assert_eq!(r.report_lagged(), 1);
+        assert!(!r.decoder_is_recent(A));
+        assert_eq!(r.request_type(A, true), 2);
+        // Dependent frames are withheld until keyframe or LTR refresh.
+        assert!(r.receive_with_ltr_decision(A, 130, false, false, 0, 0).is_none());
+        let (refresh_receipt, is_refresh) =
+            r.receive_with_ltr_decision(A, 131, false, false, 0x02, 0).unwrap();
+        assert!(is_refresh);
+        assert!(r.decoded(refresh_receipt).is_some());
+        assert!(r.decoder_is_recent(A));
     }
 }
