@@ -10,6 +10,8 @@ mod control_retry;
 mod video_receive_diagnostics;
 #[path = "video_receive_timing.rs"]
 mod video_receive_timing;
+#[path = "video_frame_control.rs"]
+mod video_frame_control;
 #[path = "avconference_nack.rs"]
 mod video_nack;
 #[path = "avconference_audio_offer.rs"]
@@ -1887,6 +1889,7 @@ impl IncomingFrameHandler {
         let diagnostic_epoch = Instant::now();
         let diagnostic_unix_us = duration_since_epoch().as_micros() as u64;
         let mut video_timing = HashMap::<(u32, u8), video_receive_timing::VideoReceiveTiming>::new();
+        let mut video_frame_control = video_frame_control::VideoFrameControlTracker::<FTVideoCameraStatus>::default();
         let mut video_windows = HashMap::<(u32, u8), video_receive_diagnostics::VideoReceiveWindow>::new();
         let mut video_nacks = HashMap::<u32, (i64, video_nack::VideoNackGenerator)>::new();
         let mut last_config_camera_meta: Option<FTVideoCameraStatus> = None;
@@ -2209,10 +2212,24 @@ impl IncomingFrameHandler {
                             continue
                         };
                         let header_ssrc = unmarshalled.header.ssrc;
+                        if matches!(channel_type, ChannelType::H264 | ChannelType::H265) {
+                            video_frame_control.record(
+                                header_ssrc,
+                                unmarshalled.header.timestamp,
+                                video_meta.as_ref().map(|v| v.ltr_bits).unwrap_or(0),
+                                video_meta.as_ref().and_then(|v| v.ltr_timestamp),
+                                video_meta.as_ref().map(|v| v.camera_status),
+                            );
+                        }
 
                         codec.push(unmarshalled);
                         
                         while let Some((sample, orig_dropped)) = codec.pop() {
+                            let popped_control = if matches!(channel_type, ChannelType::H264 | ChannelType::H265) {
+                                video_frame_control.take(header_ssrc, sample.packet_timestamp)
+                            } else {
+                                None
+                            };
                             let net_dropped = orig_dropped.saturating_sub(sample.prev_padding_packets);
                             if net_dropped > 0 {
                                 stat_tracker.register_loss(net_dropped as usize);
@@ -2226,7 +2243,7 @@ impl IncomingFrameHandler {
                             }
                             if let Some((remaining, config)) = DecoderConfiguration::parse(data, channel_type) {
                                 info!("mediainfo {:?}", config);
-                                let config_camera_meta = video_meta.as_ref().map(|i| i.camera_status);
+                                let config_camera_meta = popped_control.and_then(|c| c.camera_meta);
                                 if config_camera_meta != last_config_camera_meta {
                                     last_config_camera_meta = config_camera_meta;
                                     info!(
@@ -2247,7 +2264,7 @@ impl IncomingFrameHandler {
                                     receive_timing: None,
                                     prev_dropped: 0,
                                     metadata: HashMap::new(),
-                                    camera_meta: video_meta.as_ref().map(|i| i.camera_status),
+                                    camera_meta: config_camera_meta,
                                     ltr_bits: 0,
                                     ltr_timestamp: None,
                                     media_ssrc: header_ssrc,
@@ -2319,7 +2336,7 @@ impl IncomingFrameHandler {
                                         }
                                     })
                             } else { None };
-                            let sample_camera_meta = video_meta.as_ref().map(|i| i.camera_status);
+                            let sample_camera_meta = popped_control.and_then(|c| c.camera_meta);
                             if matches!(channel_type, ChannelType::H264 | ChannelType::H265)
                                 && sample_camera_meta != last_sample_camera_meta
                             {
@@ -2343,9 +2360,9 @@ impl IncomingFrameHandler {
                                 receive_timing,
                                 prev_dropped: sample.prev_dropped_packets.saturating_sub(sample.prev_padding_packets),
                                 metadata: frame_meta,
-                                camera_meta: video_meta.as_ref().map(|i| i.camera_status),
-                                ltr_bits: video_meta.as_ref().map(|v| v.ltr_bits).unwrap_or(0),
-                                ltr_timestamp: video_meta.as_ref().and_then(|v| v.ltr_timestamp),
+                                camera_meta: sample_camera_meta,
+                                ltr_bits: popped_control.map(|c| c.ltr_bits).unwrap_or(0),
+                                ltr_timestamp: popped_control.and_then(|c| c.ltr_timestamp),
                                 media_ssrc: header_ssrc,
                                 frame: ChannelFrame::Sample(data.to_vec()),
                             });
