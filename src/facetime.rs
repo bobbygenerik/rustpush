@@ -175,6 +175,28 @@ fn default_enabled() -> bool {
     true
 }
 
+/// Clears every participant's `active` state when the session is a one-to-one call (at most one
+/// distinct remote handle). Returns true if a remote participant was cleared. Group calls are left
+/// untouched: other members may still be in the call and it must stay joinable.
+pub(crate) fn mark_one_to_one_ended(session: &mut FTSession, my_token: &Option<String>) -> bool {
+    let remote_handles: HashSet<&String> = session.participants.values()
+        .filter(|p| &p.token != my_token && !session.my_handles.contains(&p.handle))
+        .map(|p| &p.handle)
+        .collect();
+    let remote_members = session.members.iter()
+        .filter(|m| !session.my_handles.contains(&m.handle))
+        .count();
+    if remote_handles.len() > 1 || remote_members > 1 { return false; }
+    let mut cleared = false;
+    for participant in session.participants.values_mut() {
+        if participant.active.is_some() {
+            cleared |= &participant.token != my_token;
+            participant.active = None;
+        }
+    }
+    cleared
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct FTSession {
     pub group_id: String,
@@ -1293,6 +1315,15 @@ impl FTClient {
 
     pub async fn leave(&self, session: &mut FTSession) -> Result<(), PushError> {
         info!("Leaving now!");
+
+        // Local UI state, not wire behaviour: when we hang up a one-to-one call the call is over
+        // for both sides. The peer's own leave (208) can arrive late or not at all, which left the
+        // peer marked active and the conversation showing as joinable. Done first so a failure
+        // further down cannot leave the stale state behind.
+        let my_token = Some(base64_encode(&self.conn.get_token().await));
+        if mark_one_to_one_ended(session, &my_token) {
+            info!("[FTCall] one-to-one hangup: cleared remote active state for {}", session.group_id);
+        }
 
         if let Some(session) = session.connection.take() {
             session.stop_video_recovery();
