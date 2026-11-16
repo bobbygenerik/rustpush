@@ -1,5 +1,5 @@
 use rustpush::avconference::{
-    is_probing_slice_payload, pack_bandwidth_estimate_u16, VideoBweProbeReceiver, REPORT_REAL_BWE,
+    is_probing_slice_payload, pack_bandwidth_estimate_u16, VideoBweProbeReceiver,
 };
 
 fn hevc_fu_payload(start: bool, len: usize) -> Vec<u8> {
@@ -21,11 +21,6 @@ fn hevc_single_p_payload(len: usize) -> Vec<u8> {
     p[2] = 0xe0;
     p[3] = 0x00;
     p
-}
-
-#[test]
-fn report_real_bwe_flag_is_enabled() {
-    assert!(REPORT_REAL_BWE);
 }
 
 #[test]
