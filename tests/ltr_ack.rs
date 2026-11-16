@@ -1,4 +1,4 @@
-use rustpush::ltr_ack::{encode_psfb_loss, encode_psfb_ltr_ack};
+use rustpush::ltr_ack::{encode_psfb_loss, encode_psfb_ltr_ack, should_send_ltr_ack};
 
 /// Golden-byte test for PSFB AFB Type 5 (LTR ACK) derived by hand from
 /// `__RTCPAddPSFBAlfbPacket` (`0x205f6a9ec`) & `__RTCPFinalizePacket` (`0x205f6a954`).
@@ -31,4 +31,21 @@ fn psfb_type6_loss_golden_bytes() {
         0x03,                   // lostPackets (0x205f6aaa4..b0)
     ];
     assert_eq!(bytes.as_slice(), &expected);
+}
+
+/// Admission rules from `_VideoPacketBuffer_GetNextFrame` (`0x205fdd47c..49c`) and
+/// `__VideoReceiver_DecoderCallback` (`0x205fefa88..fcb4`).
+#[test]
+fn ltr_ack_admission_and_withhold_rules() {
+    // 1:1 + bit0 of ltr_bits set + nonzero ltr_timestamp + decoded ok -> Some(token)
+    assert_eq!(should_send_ltr_ack(true, 0x1, Some(0x1234_5678), true), Some(0x1234_5678));
+    // Withheld when decode failed / dropped (`0x205fefaa4`, `0x205fefa90`)
+    assert_eq!(should_send_ltr_ack(true, 0x1, Some(0x1234_5678), false), None);
+    // Withheld when ltr_timestamp == 0 (`0x205fefcb4`)
+    assert_eq!(should_send_ltr_ack(true, 0x1, Some(0), true), None);
+    assert_eq!(should_send_ltr_ack(true, 0x1, None, true), None);
+    // Withheld when ltr_bits bit0 is clear (`0x205fdd488`)
+    assert_eq!(should_send_ltr_ack(true, 0x2, Some(0x1234_5678), true), None);
+    // Withheld when not 1:1
+    assert_eq!(should_send_ltr_ack(false, 0x1, Some(0x1234_5678), true), None);
 }

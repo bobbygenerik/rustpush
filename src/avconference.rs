@@ -2233,6 +2233,9 @@ impl IncomingFrameHandler {
                                     prev_dropped: 0,
                                     metadata: HashMap::new(),
                                     camera_meta: video_meta.as_ref().map(|i| i.camera_status),
+                                    ltr_bits: 0,
+                                    ltr_timestamp: None,
+                                    media_ssrc: header_ssrc,
                                     frame: ChannelFrame::Configuration(config),
                                 });
 
@@ -2326,6 +2329,9 @@ impl IncomingFrameHandler {
                                 prev_dropped: sample.prev_dropped_packets.saturating_sub(sample.prev_padding_packets),
                                 metadata: frame_meta,
                                 camera_meta: video_meta.as_ref().map(|i| i.camera_status),
+                                ltr_bits: video_meta.as_ref().map(|v| v.ltr_bits).unwrap_or(0),
+                                ltr_timestamp: video_meta.as_ref().and_then(|v| v.ltr_timestamp),
+                                media_ssrc: header_ssrc,
                                 frame: ChannelFrame::Sample(data.to_vec()),
                             });
                         }
@@ -4485,6 +4491,8 @@ pub struct AVSession {
     video_recovery_pacing: video_recovery_pacing::VideoRecoveryPacing,
     video_recovery_live: AtomicBool,
     video_receiver_visible: AtomicBool,
+    ltr_ack_sender_ssrc: u32,
+    ltr_ack_log_count: AtomicU64,
 }
 
 impl AVSession {
@@ -4494,11 +4502,33 @@ impl AVSession {
         self.video_receive_recovery.receive((participant, stream_id), timestamp, configuration, keyframe, lost)
     }
 
+    pub fn set_video_frame_ltr(&self, receipt: u64, ltr_bits: u8, ltr_timestamp: Option<u32>, media_ssrc: u32) {
+        self.video_receive_recovery.set_ltr_metadata(receipt, ltr_bits, ltr_timestamp, media_ssrc);
+    }
+
     pub fn report_video_decoded(&self, receipt: u64) -> bool {
         if !self.video_recovery_live.load(Ordering::Acquire) { return false; }
         let Some(frame) = self.video_receive_recovery.decoded(receipt) else { return false; };
         debug!("Decoder output confirmed: participant={} stream={} timestamp={} receipt={receipt}",
             frame.stream.0, frame.stream.1, frame.timestamp);
+        if let Some(token) = crate::ltr_ack::should_send_ltr_ack(
+            self.u1.load(Ordering::Relaxed),
+            frame.ltr_bits,
+            frame.ltr_timestamp,
+            true,
+        ) {
+            if let Ok(pkt) = encode_psfb_ltr_ack(self.ltr_ack_sender_ssrc, frame.media_ssrc, token) {
+                match self.link.send_rtcp(frame.stream.0 as i64, &pkt) {
+                    Ok(()) => {
+                        let n = self.ltr_ack_log_count.fetch_add(1, Ordering::Relaxed);
+                        if n < 10 || n % 100 == 0 {
+                            info!("[FTLtrAck] token={token} frame_id={}", frame.timestamp);
+                        }
+                    }
+                    Err(e) => warn!("Failed to send PSFB LTR ACK token={token}: {e}"),
+                }
+            }
+        }
         true
     }
 
@@ -4668,6 +4698,8 @@ impl AVSession {
             video_recovery_pacing: Default::default(),
             video_recovery_live: AtomicBool::new(true),
             video_receiver_visible: AtomicBool::new(false),
+            ltr_ack_sender_ssrc: rand::random(),
+            ltr_ack_log_count: AtomicU64::new(0),
         });
 
         let avc_mat_id: [u8; 20] = rand::random();
@@ -6353,6 +6385,9 @@ pub struct ChannelMessage {
     pub prev_dropped: u16,
     pub metadata: HashMap::<&'static str, Vec<u8>>,
     pub camera_meta: Option<FTVideoCameraStatus>,
+    pub ltr_bits: u8,
+    pub ltr_timestamp: Option<u32>,
+    pub media_ssrc: u32,
     pub timestamp: u32,
     pub receive_timing: Option<FTReceiveTiming>,
 }

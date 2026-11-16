@@ -14,6 +14,9 @@ pub(super) struct FrameReceipt {
     pub timestamp: u32,
     configuration: bool,
     keyframe: bool,
+    pub ltr_bits: u8,
+    pub ltr_timestamp: Option<u32>,
+    pub media_ssrc: u32,
 }
 
 #[derive(Default)]
@@ -85,8 +88,19 @@ impl VideoReceiveRecovery {
         }
         if !state.chain.accept(stream, configuration, keyframe, lost) { return None; }
         if state.pending.len() == Self::MAX_PENDING { state.pending.pop_first(); }
-        state.pending.insert(receipt, FrameReceipt { stream, timestamp, configuration, keyframe });
+        state.pending.insert(receipt, FrameReceipt {
+            stream, timestamp, configuration, keyframe,
+            ltr_bits: 0, ltr_timestamp: None, media_ssrc: 0,
+        });
         Some(receipt)
+    }
+
+    pub(super) fn set_ltr_metadata(&self, receipt: u64, ltr_bits: u8, ltr_timestamp: Option<u32>, media_ssrc: u32) {
+        if let Some(frame) = self.0.lock().unwrap().pending.get_mut(&receipt) {
+            frame.ltr_bits = ltr_bits;
+            frame.ltr_timestamp = ltr_timestamp;
+            frame.media_ssrc = media_ssrc;
+        }
     }
 
     pub(super) fn decoded(&self, receipt: u64) -> Option<FrameReceipt> {

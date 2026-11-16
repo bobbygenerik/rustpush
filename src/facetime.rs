@@ -707,6 +707,9 @@ impl FTClient {
             let configuration = matches!(msg.frame, ChannelFrame::Configuration(_));
             let decode_receipt = is_video.then(|| conn_for_fir.receive_video_frame(
                 msg.participant, msg.stream_id, msg.timestamp, configuration, is_keyframe, msg.prev_dropped)).flatten();
+            if let Some(receipt) = decode_receipt {
+                conn_for_fir.set_video_frame_ltr(receipt, msg.ltr_bits, msg.ltr_timestamp, msg.media_ssrc);
+            }
             if is_video {
                 conn_for_fir.observe_video_receive_target(msg.participant, msg.stream_id,
                     msg.keyframe_target, msg.camera_meta.map(|status| status.source));
