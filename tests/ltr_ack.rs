@@ -1,4 +1,8 @@
-use rustpush::ltr_ack::{encode_psfb_loss, encode_psfb_ltr_ack, should_send_ltr_ack};
+use std::time::{Duration, Instant};
+
+use rustpush::ltr_ack::{
+    encode_psfb_loss, encode_psfb_ltr_ack, should_send_ltr_ack, VideoLossRecoveryGate,
+};
 
 /// Golden-byte test for PSFB AFB Type 5 (LTR ACK) derived by hand from
 /// `__RTCPAddPSFBAlfbPacket` (`0x205f6a9ec`) & `__RTCPFinalizePacket` (`0x205f6a954`).
@@ -48,4 +52,27 @@ fn ltr_ack_admission_and_withhold_rules() {
     assert_eq!(should_send_ltr_ack(true, 0x2, Some(0x1234_5678), true), None);
     // Withheld when not 1:1
     assert_eq!(should_send_ltr_ack(false, 0x1, Some(0x1234_5678), true), None);
+}
+
+/// Loss recovery wait before FIR (`_VideoPacketBuffer_GetNextFrame` `0x205fddc68..0x205fddc78`:
+/// `(now - last_refresh_req) > 0.25` s) and FIR repeat throttle (`0x2060e7328`: `0.5` s).
+#[test]
+fn loss_recovery_waits_250ms_before_fir_then_throttles_500ms() {
+    let mut gate = VideoLossRecoveryGate::default();
+    let t0 = Instant::now();
+    // First loss event arms the 250 ms wait (NACK runs first; FIR withheld)
+    assert!(!gate.allow_fir_after_loss(t0));
+    // At exactly 250 ms (`b.le` at 0x205fddc78), still withheld
+    assert!(!gate.allow_fir_after_loss(t0 + Duration::from_millis(250)));
+    // Strictly > 250 ms -> FIR admitted
+    assert!(gate.allow_fir_after_loss(t0 + Duration::from_millis(251)));
+    // Immediately or at 499 ms after FIR -> throttled by 500 ms (`0x2060e7328`)
+    assert!(!gate.allow_fir_after_loss(t0 + Duration::from_millis(251) + Duration::from_millis(499)));
+    // At >= 500 ms -> admitted again
+    assert!(gate.allow_fir_after_loss(t0 + Duration::from_millis(251) + Duration::from_millis(500)));
+    // Reset on recovery restarts the 250 ms wait on the next loss
+    gate.reset();
+    let t1 = t0 + Duration::from_secs(2);
+    assert!(!gate.allow_fir_after_loss(t1));
+    assert!(gate.allow_fir_after_loss(t1 + Duration::from_millis(251)));
 }

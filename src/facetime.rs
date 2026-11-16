@@ -679,6 +679,7 @@ impl FTClient {
         let conn_for_fir = Arc::downgrade(session.connection.as_ref().unwrap());
         let rt_handle = tokio::runtime::Handle::current();
         let fir_loss_log_count = AtomicU64::new(0);
+        let video_loss_gate = std::sync::Mutex::new(crate::ltr_ack::VideoLossRecoveryGate::default());
         #[cfg(not(target_arch = "wasm32"))]
         let evs_decoders = std::sync::Mutex::new(HashMap::new());
         media_handler.configure_handler(Box::new(move |msg: ChannelMessage| {
@@ -751,14 +752,12 @@ impl FTClient {
             // FIR retries continue while a damaged reference chain is withheld.
             if is_video {
                 if is_keyframe {
+                    video_loss_gate.lock().unwrap().reset();
                     info!(
                         "Incoming video keyframe: participant={} ts={} prev_dropped={}",
                         msg.participant, msg.timestamp, msg.prev_dropped
                     );
                 } else if msg.prev_dropped > 0 {
-                    // Rate-limited loss log for correlating with Dart tx stats:
-                    // first 5 events, then every 50th (a burst can report loss
-                    // on thousands of consecutive frames).
                     let n = fir_loss_log_count.fetch_add(1, Ordering::Relaxed);
                     if n < 5 || n % 50 == 0 {
                         info!(
@@ -767,22 +766,27 @@ impl FTClient {
                             n + 1
                         );
                     }
-                    // receive_video_frame has already invalidated older
-                    // receipts for this stream. Output from the damaged chain
-                    // must not complete a later loss recovery.
                 }
 
                 let decoded_recently = conn_for_fir.video_decoder_is_recent(msg.participant, msg.stream_id);
-                if !decoded_recently {
-                    if let Some(incarnation) = conn_for_fir.reserve_video_recovery(msg.participant, msg.stream_id, msg.keyframe_target) {
-                        let conn = conn_for_fir.clone();
-                        let target = msg.participant;
-                        let fallback_stream_id = msg.stream_id;
-                        let receive_target = msg.keyframe_target;
-                        rt_handle.spawn(async move {
-                            conn.request_video_recovery(target, fallback_stream_id, receive_target, incarnation).await;
-                        });
-                    }
+                let action = if decoded_recently {
+                    "decoder_recent"
+                } else if !video_loss_gate.lock().unwrap().allow_fir_after_loss(std::time::Instant::now()) {
+                    "wait_nack_or_throttle"
+                } else if let Some(incarnation) = conn_for_fir.reserve_video_recovery(msg.participant, msg.stream_id, msg.keyframe_target) {
+                    let conn = conn_for_fir.clone();
+                    let target = msg.participant;
+                    let fallback_stream_id = msg.stream_id;
+                    let receive_target = msg.keyframe_target;
+                    rt_handle.spawn(async move {
+                        conn.request_video_recovery(target, fallback_stream_id, receive_target, incarnation).await;
+                    });
+                    "fir_requested"
+                } else {
+                    "fir_throttled_500ms"
+                };
+                if msg.prev_dropped > 0 {
+                    info!("[FTVideoLoss] prev_dropped={} action={action}", msg.prev_dropped);
                 }
             }
         }));
