@@ -3,7 +3,7 @@ mod quality_feedback;
 #[path = "avconference_feedback.rs"]
 mod audio_feedback;
 #[path = "avconference_receive_clock.rs"]
-mod receive_clock;
+pub mod receive_clock;
 #[path = "avconference_control.rs"]
 mod control_retry;
 #[path = "video_receive_diagnostics.rs"]
@@ -1334,7 +1334,7 @@ pub struct RecvStatTracker {
     last_bucket: u64,
     last_report: Option<Instant>,
 
-    audio_clocks: HashMap<(u64, u32), (Instant, receive_clock::ReceiveClock)>,
+    audio_clocks: HashMap<(u64, u32), (Instant, receive_clock::AudioOwrdTracker)>,
     audio_history: Vec<FTAudioControlData>,
     audio_history_context: Option<(u64, u64)>, // participant, negotiation generation
     video_receive_counter: CumulativeCounter12,
@@ -1360,7 +1360,7 @@ struct FeedbackLogState {
 }
 
 impl FeedbackLogState {
-    fn maybe_log(&mut self, tag: &str, profile: u16, payload: &[u8], data: &FTAudioControlData) {
+    fn maybe_log(&mut self, tag: &str, profile: u16, payload: &[u8], data: &FTAudioControlData, owrd_raw: Option<f64>) {
         let raw_flags = if data.version == 2 {
             (profile >> 8) as u8
         } else {
@@ -1392,7 +1392,7 @@ impl FeedbackLogState {
         let raw_hex = encode_hex(&raw[..raw.len().min(24)]);
 
         info!(
-            "[{tag}] ver={} flags=0x{:02x} rqt_bucket={} (rqt={}) seq={} total_kb={} audio_burst={} audio_pkts={} qdelay={:?} send_ts={:?} owrd={:?} video_burst={:?} video_size={:?} video_loss={:?} video_pkts={:?} bwe={:?} ect={:?} ce={:?} conn_stats={:?} raw={}",
+            "[{tag}] ver={} flags=0x{:02x} rqt_bucket={} (rqt={}) seq={} total_kb={} audio_burst={} audio_pkts={} qdelay={:?} send_ts={:?} owrd_raw={:?} owrd={:?} video_burst={:?} video_size={:?} video_loss={:?} video_pkts={:?} bwe={:?} ect={:?} ce={:?} conn_stats={:?} raw={}",
             data.version,
             raw_flags,
             data.receive_queue_target_bucket,
@@ -1403,6 +1403,7 @@ impl FeedbackLogState {
             data.audio_received_packets,
             data.queuing_delay,
             data.current_send_timestamp,
+            owrd_raw,
             data.q13_one_way_delay,
             data.video_burst_loss,
             data.video_frame_size,
@@ -1506,7 +1507,7 @@ impl RecvStatTracker {
         Some(buf)
     }
 
-    fn track(&mut self, recv: &GlobalPacket, header: &Header, elapsed_packets: u16, callback: &tokio::sync::mpsc::Sender<AVInternalMessage>, ssrc: &AVSessionSSRC) -> Result<Option<FTVideoControlData>, ()> {
+    fn track(&mut self, recv: &GlobalPacket, header: &Header, elapsed_packets: u16, callback: &tokio::sync::mpsc::Sender<AVInternalMessage>, ssrc: &AVSessionSSRC, is_group: bool) -> Result<Option<FTVideoControlData>, ()> {
         let payload = AVSessionPayload::from_id(header.payload_type as u32).ok_or(())?;
         // Reject malformed video metadata before frame accounting. The caller
         // must drop the packet, not mistake a failed FEC parse for plain video.
@@ -1637,6 +1638,7 @@ impl RecvStatTracker {
                             header.extension_profile,
                             &header.extensions[0].payload,
                             &data,
+                            None,
                         );
                         // info!("Audio data {data:?}");
                         if let Some(time) = data.current_send_timestamp {
@@ -1697,44 +1699,22 @@ impl RecvStatTracker {
         }
 
         
-        if let Some(lag) = payload.is_audio().then(|| {
-            let (origin, clock) = self.audio_clocks.entry((ssrc.owner, header.ssrc))
-                .or_insert_with(|| (recv.time_parsed, Default::default()));
-            clock.lag(header.timestamp, recv.time_parsed.saturating_duration_since(*origin))
-        }).flatten() {
-            
-            let mut short_lag = 0.0;
-            self.stats.short_q13_lag.update(
-                Ordering::Relaxed, 
-                Ordering::Relaxed, 
-                |i| {
-                let old = f64::from_bits(i);
-                short_lag = if i == 0 {
-                    lag
-                } else {
-                    0.9 * old + 0.1 * lag
-                };
-                short_lag.to_bits()
-            });
-
-            self.stats.long_q13_lag.update(
-                Ordering::Relaxed, 
-                Ordering::Relaxed, 
-                |i| {
-                let old = f64::from_bits(i);
-                let mut long_lag = 0.9999 * old + 0.0001 * lag;
-                if i == 0 {
-                    long_lag = lag;
-                } else if short_lag < long_lag {
-                    long_lag = short_lag;
-                } else if short_lag - long_lag > 0.25 {
-                    // Retained local baseline cap; Apple's full spike/reset
-                    // ownership is still being mapped. Zero packet loss alone
-                    // does not establish that a delay measurement is false.
-                    long_lag = short_lag - 0.25;
-                }
-                long_lag.to_bits()
-            });
+        if !is_group && payload.is_audio() {
+            let (origin, tracker) = self
+                .audio_clocks
+                .entry((ssrc.owner, header.ssrc))
+                .or_insert_with(|| {
+                    // Negotiated 1:1 FaceTime audio RTP clock is 24 kHz, 480 samples per 20 ms frame.
+                    (recv.time_parsed, receive_clock::AudioOwrdTracker::new(24_000, 480))
+                });
+            let arrival_sec = recv.time_parsed.saturating_duration_since(*origin).as_secs_f64();
+            let owrd_raw = tracker.observe_packet(
+                header.sequence_number,
+                header.timestamp,
+                arrival_sec,
+                payload == AVSessionPayload::Red,
+            );
+            self.stats.owrd_seconds.store(owrd_raw.to_bits(), Ordering::Relaxed);
         }
 
         Ok(result)
@@ -1809,7 +1789,6 @@ pub trait TimingTarget: Send + Sync {
     fn presentation_for(&self, timestamp: u32) -> Instant;
 }
 
-#[derive(Default)]
 struct IncomingFrameStats {
     last_feedback: AtomicU16,
     total_recv_count: AtomicU16,
@@ -1819,12 +1798,29 @@ struct IncomingFrameStats {
     // right now only used for U1 mode, but for non-u1 mode use a rwlock hashmap or dashmap
     records: std::sync::RwLock<HashMap<(u64, u32), [IncomingFrameRecord; 128]>>,
     timing_targets: std::sync::RwLock<HashMap<u64, Arc<dyn TimingTarget>>>,
-    
-    short_q13_lag: AtomicU64,
-    long_q13_lag: AtomicU64,
+
+    /// Raw OWRD in seconds (`f64::NAN` until `JLagProcessor::record_owrd` has run).
+    owrd_seconds: AtomicU64,
 
     outgoing_send_time: AtomicU16,
     frame_change_time: AtomicU16,
+}
+
+impl Default for IncomingFrameStats {
+    fn default() -> Self {
+        Self {
+            last_feedback: AtomicU16::default(),
+            total_recv_count: AtomicU16::default(),
+            total_recv_bytes: AtomicU64::default(),
+            audio_burst_loss: AtomicU8::default(),
+            video_burst_loss: AtomicU8::default(),
+            records: std::sync::RwLock::default(),
+            timing_targets: std::sync::RwLock::default(),
+            owrd_seconds: AtomicU64::new(f64::NAN.to_bits()),
+            outgoing_send_time: AtomicU16::default(),
+            frame_change_time: AtomicU16::default(),
+        }
+    }
 }
 
 pub enum AVInternalMessage {
@@ -2082,7 +2078,7 @@ impl IncomingFrameHandler {
                         }
                     }
                     // Feedback and receive accounting must not trust an unauthenticated extension.
-                    let video_meta = match stat_tracker.track(&recv, &header, tracked_packets, &control, &ssrc) {
+                    let video_meta = match stat_tracker.track(&recv, &header, tracked_packets, &control, &ssrc, is_group) {
                         Ok(data) => data,
                         Err(()) => {
                             warn!("Dropping malformed video control extension for SSRC {}", header.ssrc);
@@ -4309,9 +4305,8 @@ impl AudioSender {
 
             self.last_worst = worst;
 
-            let q13_timestamp_int = receive_clock::pack_q13_delay(
-                f64::from_bits(stats.short_q13_lag.load(Ordering::Relaxed)) -
-                f64::from_bits(stats.long_q13_lag.load(Ordering::Relaxed)));
+            let owrd_raw = f64::from_bits(stats.owrd_seconds.load(Ordering::Relaxed));
+            let q13_timestamp_int = receive_clock::pack_q13_delay(owrd_raw);
 
             let send_time_s = duration_since_epoch().as_secs_f64();
             let current_send = crate::feedback_delay::ntp_send_timestamp(send_time_s);
@@ -4369,7 +4364,7 @@ impl AudioSender {
             // info!("Sending ext {extension:?}");
             let (profile, ext_payload) = extension.to_ext_with_feedback_version(feedback_version).ok_or_else(|| std::io::Error::new(
                 std::io::ErrorKind::InvalidData, "incomplete FaceTime audio feedback"))?;
-            self.last_feedback_tx.maybe_log("FTFeedbackTx", profile, &ext_payload, &extension);
+            self.last_feedback_tx.maybe_log("FTFeedbackTx", profile, &ext_payload, &extension, Some(owrd_raw));
             (profile, ext_payload)
         } else {
             (0, vec![])
