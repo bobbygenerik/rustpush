@@ -19,9 +19,21 @@ impl VideoReferenceChain {
     }
 
     pub(super) fn accept(&mut self, stream: (u64, u32), configuration: bool, keyframe: bool, lost: u16) -> bool {
+        self.accept_with_ltr(stream, configuration, keyframe, 0, lost)
+    }
+
+    pub(super) fn accept_with_ltr(
+        &mut self,
+        stream: (u64, u32),
+        configuration: bool,
+        keyframe: bool,
+        ltr_bits: u8,
+        lost: u16,
+    ) -> bool {
         if configuration { return true; }
         if lost > 0 || !self.started.contains(&stream) { self.waiting.insert(stream); }
-        if keyframe {
+        let is_ltr_refresh = (ltr_bits & 0x02) != 0 && self.started.contains(&stream);
+        if keyframe || is_ltr_refresh {
             self.started.insert(stream);
             self.waiting.remove(&stream);
         }

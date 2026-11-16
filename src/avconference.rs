@@ -1349,6 +1349,8 @@ pub struct RecvStatTracker {
     /// Last received camera status byte from RTP header extension `(profile >> 8) as u8`.
     last_camera_status_byte: Option<u8>,
     last_feedback_rx: FeedbackLogState,
+    video_ctrl_log_count: u64,
+    last_video_ctrl_key: Option<(u8, bool)>,
 }
 
 #[derive(Default)]
@@ -1436,6 +1438,8 @@ impl RecvStatTracker {
             last_rr_send: None,
             last_camera_status_byte: None,
             last_feedback_rx: FeedbackLogState::default(),
+            video_ctrl_log_count: 0,
+            last_video_ctrl_key: None,
         }
     }
 
@@ -1605,7 +1609,22 @@ impl RecvStatTracker {
 
                         slot.observe(sequence, packets, header.timestamp, duration_since_epoch().as_millis() as u64);
                     }
-                    // info!("Control data {data:?}");
+                    let ctrl_key = (data.ltr_bits, data.ltr_timestamp.is_some());
+                    let count = self.video_ctrl_log_count;
+                    self.video_ctrl_log_count = count.wrapping_add(1);
+                    if self.last_video_ctrl_key != Some(ctrl_key) || count < 10 || count % 100 == 0 {
+                        self.last_video_ctrl_key = Some(ctrl_key);
+                        info!(
+                            "[FTVideoCtrl] pkt={} profile=0x{:04x} ver={} ltr_bits=0x{:x} ltr_ts={:?} seq={:?} pkts={:?}",
+                            count,
+                            header.extension_profile,
+                            data.version,
+                            data.ltr_bits,
+                            data.ltr_timestamp,
+                            data.frame_sequence_number,
+                            data.total_packets_per_frame
+                        );
+                    }
                     Some(data)
                 },
                 AVSessionPayload::Aac | AVSessionPayload::Evs | AVSessionPayload::Red => {
@@ -4498,8 +4517,13 @@ pub struct AVSession {
 impl AVSession {
     pub fn receive_video_frame(&self, participant: u64, stream_id: u32,
         timestamp: u32, configuration: bool, keyframe: bool, lost: u16) -> Option<u64> {
+        self.receive_video_frame_with_ltr(participant, stream_id, timestamp, configuration, keyframe, 0, lost)
+    }
+
+    pub fn receive_video_frame_with_ltr(&self, participant: u64, stream_id: u32,
+        timestamp: u32, configuration: bool, keyframe: bool, ltr_bits: u8, lost: u16) -> Option<u64> {
         if !self.video_recovery_live.load(Ordering::Acquire) { return None; }
-        self.video_receive_recovery.receive((participant, stream_id), timestamp, configuration, keyframe, lost)
+        self.video_receive_recovery.receive_with_ltr((participant, stream_id), timestamp, configuration, keyframe, ltr_bits, lost)
     }
 
     pub fn set_video_frame_ltr(&self, receipt: u64, ltr_bits: u8, ltr_timestamp: Option<u32>, media_ssrc: u32) {

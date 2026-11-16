@@ -39,13 +39,12 @@ impl VideoDecodeProgress {
     }
 
     pub(super) fn random_access_request_type(&self, one_to_one: bool) -> u32 {
-        // iOS27 distinguishes ordinary refresh (type0) from LTR repair (type2).
-        // Our 1:1 loss gate requires random access, but no decoded LTR anchor
-        // is acknowledged/tracked end to end. Request the ordinary mode now;
-        // waiting 15 seconds on type2 cannot satisfy that local gate reliably.
-        // See FACETIME_LTR_ACK_2026-10-24.md for the native callback/wire trace.
-        // Preserve the separate group path until its ownership is mapped.
-        self.request_type(if one_to_one { 0 } else { 2 }, one_to_one)
+        // iOS27 __VideoReceiver_SendFIR (0x206562bd0..0x206562c50) requests
+        // LTR repair (type 2) on 1:1 while stall_elapsed <= 15.0s, falling back
+        // to ordinary IDR (type 0) after 15s (and type 4 before first decode).
+        // __VCVideoPacketBuffer_AssembleFrame (0x205fde0e4) accepts (iLTRBits & 2) != 0
+        // as a refresh frame to clear loss wait.
+        self.request_type(2, one_to_one)
     }
 }
 
@@ -94,22 +93,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn random_access_recovery_requests_ordinary_refresh_immediately() {
+    fn random_access_recovery_requests_ltr_refresh_first() {
         let progress = VideoDecodeProgress::default();
         progress.record_output(true);
         progress.rearm();
-        assert_eq!(progress.random_access_request_type(true), 0);
+        assert_eq!(progress.random_access_request_type(true), 2);
         assert!(!progress.is_recent());
     }
 
     #[test]
-    fn random_access_retries_do_not_switch_back_to_ltr() {
+    fn non_refresh_output_does_not_clear_loss_recovery() {
         let progress = VideoDecodeProgress::default();
         progress.record_output(true);
         progress.rearm();
         progress.record_output(false);
         for _ in 0..3 {
-            assert_eq!(progress.random_access_request_type(true), 0);
+            assert_eq!(progress.random_access_request_type(true), 2);
         }
         assert!(!progress.is_recent());
     }

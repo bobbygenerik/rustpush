@@ -706,8 +706,8 @@ impl FTClient {
                     }
                 };
             let configuration = matches!(msg.frame, ChannelFrame::Configuration(_));
-            let decode_receipt = is_video.then(|| conn_for_fir.receive_video_frame(
-                msg.participant, msg.stream_id, msg.timestamp, configuration, is_keyframe, msg.prev_dropped)).flatten();
+            let decode_receipt = is_video.then(|| conn_for_fir.receive_video_frame_with_ltr(
+                msg.participant, msg.stream_id, msg.timestamp, configuration, is_keyframe, msg.ltr_bits, msg.prev_dropped)).flatten();
             if let Some(receipt) = decode_receipt {
                 conn_for_fir.set_video_frame_ltr(receipt, msg.ltr_bits, msg.ltr_timestamp, msg.media_ssrc);
             }
@@ -751,11 +751,12 @@ impl FTClient {
 
             // FIR retries continue while a damaged reference chain is withheld.
             if is_video {
-                if is_keyframe {
+                let is_ltr_refresh = (msg.ltr_bits & 0x02) != 0;
+                if is_keyframe || is_ltr_refresh {
                     video_loss_gate.lock().unwrap().reset();
                     info!(
-                        "Incoming video keyframe: participant={} ts={} prev_dropped={}",
-                        msg.participant, msg.timestamp, msg.prev_dropped
+                        "Incoming video keyframe: participant={} ts={} prev_dropped={} ltr_refresh={}",
+                        msg.participant, msg.timestamp, msg.prev_dropped, is_ltr_refresh
                     );
                 } else if msg.prev_dropped > 0 {
                     let n = fir_loss_log_count.fetch_add(1, Ordering::Relaxed);

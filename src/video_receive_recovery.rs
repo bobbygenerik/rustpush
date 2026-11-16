@@ -72,6 +72,11 @@ impl VideoReceiveRecovery {
 
     pub(super) fn receive(&self, stream: Stream, timestamp: u32,
         configuration: bool, keyframe: bool, lost: u16) -> Option<u64> {
+        self.receive_with_ltr(stream, timestamp, configuration, keyframe, 0, lost)
+    }
+
+    pub(super) fn receive_with_ltr(&self, stream: Stream, timestamp: u32,
+        configuration: bool, keyframe: bool, ltr_bits: u8, lost: u16) -> Option<u64> {
         let mut state = self.0.lock().unwrap();
         if state.active_participants.as_ref().is_some_and(|active| !active.contains(&stream.0)) {
             return None;
@@ -86,11 +91,11 @@ impl VideoReceiveRecovery {
             state.damage(stream, receipt - 1);
             state.chain.invalidate(stream);
         }
-        if !state.chain.accept(stream, configuration, keyframe, lost) { return None; }
+        if !state.chain.accept_with_ltr(stream, configuration, keyframe, ltr_bits, lost) { return None; }
         if state.pending.len() == Self::MAX_PENDING { state.pending.pop_first(); }
         state.pending.insert(receipt, FrameReceipt {
             stream, timestamp, configuration, keyframe,
-            ltr_bits: 0, ltr_timestamp: None, media_ssrc: 0,
+            ltr_bits, ltr_timestamp: None, media_ssrc: 0,
         });
         Some(receipt)
     }
@@ -112,7 +117,8 @@ impl VideoReceiveRecovery {
         let frame = state.pending.remove(&receipt)?;
         let stream = state.streams.get_mut(&frame.stream)?;
         if frame.configuration || receipt <= stream.damaged_through { return None; }
-        stream.progress.record_output(frame.keyframe);
+        let is_refresh = frame.keyframe || (frame.ltr_bits & 0x02) != 0;
+        stream.progress.record_output(is_refresh);
         if !stream.progress.is_recent() { return None; }
         stream.no_display.progress(now);
         // Outputs may be reordered. Retire older receipts without accepting
@@ -131,7 +137,7 @@ impl VideoReceiveRecovery {
         // Keep its receipt usable; late notification of an earlier drop must
         // not invalidate that newer repair or stall packets queued behind it.
         if state.pending.iter().any(|(id, item)| *id > through
-            && item.stream == frame.stream && item.keyframe && !item.configuration) {
+            && item.stream == frame.stream && (item.keyframe || (item.ltr_bits & 0x02) != 0) && !item.configuration) {
             state.chain.accept(frame.stream, false, true, 0);
         }
         true
