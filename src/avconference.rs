@@ -4430,6 +4430,34 @@ mod video_stream_group_state;
 #[path = "facetime_rtcp.rs"]
 mod facetime_rtcp;
 
+pub fn encode_psfb_ltr_ack(sender_ssrc: u32, media_ssrc: u32, ltr_timestamp: u32) -> rtc_shared::error::Result<Vec<u8>> {
+    facetime_rtcp::encode_application_feedback(
+        sender_ssrc,
+        media_ssrc,
+        facetime_rtcp::ApplicationFeedback::LtrAck { timestamp: ltr_timestamp },
+    )
+}
+
+pub fn encode_psfb_loss(
+    sender_ssrc: u32,
+    media_ssrc: u32,
+    timestamp: u32,
+    received_packets: u16,
+    frame_packet_count: u8,
+    lost_packets: u8,
+) -> rtc_shared::error::Result<Vec<u8>> {
+    facetime_rtcp::encode_application_feedback(
+        sender_ssrc,
+        media_ssrc,
+        facetime_rtcp::ApplicationFeedback::Loss {
+            timestamp,
+            received_packets,
+            frame_packet_count,
+            lost_packets,
+        },
+    )
+}
+
 pub struct AVSession {
     pub link: Arc<GlobalLink>,
     pub state: DebugMutex<AVSessionState>,

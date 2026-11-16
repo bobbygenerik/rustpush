@@ -48,7 +48,6 @@ pub(super) fn application_feedback(packet: &[u8]) -> Result<ApplicationFeedback>
 /// Wire serializer for iOS 27 PSFB AFB (PT=206, FMT=15) Type-5 LTR ACK and
 /// Type-6 FEC loss feedback (`__RTCPAddPSFBAlfbPacket` 0x205f6a9ec /
 /// `__VideoReceiver_SendRTCPResiliencyInfo` 0x205ffe5cc).
-#[allow(dead_code)]
 pub(super) fn encode_application_feedback(
     sender_ssrc: u32,
     media_ssrc: u32,
