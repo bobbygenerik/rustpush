@@ -25,8 +25,7 @@ pub const TIER_BITRATES: [u32; 66] = [
 
 /// Config offsets whose final effective value remains UNKNOWN.
 pub const EFFECTIVE_VALUE_UNKNOWNS: &[u16] = &[
-    0x10, 0x54, 0x186, 0x18e, 0x2e8, 0x2f0, 0x2f8, 0x300, 0x308, 0x310, 0x330, 0x338,
-    0x340, 0x348, 0x34c, 0x350, 0x358, 0x360, 0x368, 0x370, 0x428,
+    0x10, 0x54, 0x186, 0x18e, 0x370, 0x428,
 ];
 
 /// Named by native config-relative offset; this is not a C ABI memory layout.
@@ -525,77 +524,92 @@ pub struct VcrcConfig {
     /// Config +0x2e8.
     /// 0x205eaab64..6c, sp+0x330.
     /// Builder zero/copy coordinates: 0x205eaa560..568; 0x2061fb4e8..500.
-    /// Effective value UNKNOWN; initializer uses an inspected builder default or binary zero.
+    /// Later-write audit: No later write on the specified no-override path; unchanged. All X/S/V-forced stores excluded. No post-copy write.
+    /// Potential writers: 0x205eaab6c, 0x205eb1094, 0x205eb106c.
     pub o_2e8: f64,
     /// Config +0x2f0.
     /// 0x205eaab74 loads q0 from 0x2066a3a70; 0x205eaaba0..ba4 stores at sp+0x338, low lane.
     /// Builder zero/copy coordinates: 0x205eaa560..568; 0x2061fb4e8..500.
-    /// Effective value UNKNOWN; initializer uses an inspected builder default or binary zero.
+    /// Later-write audit: No later write on the specified no-override path; unchanged. All X/S/V-forced stores excluded. No post-copy write.
+    /// Potential writers: 0x205eaaba4, 0x205eb10b4, 0x205eb106c.
     pub o_2f0: f64,
     /// Config +0x2f8.
     /// Same q0 store, high lane from 0x2066a3a78 at sp+0x340.
     /// Builder zero/copy coordinates: 0x205eaa560..568; 0x2061fb4e8..500.
-    /// Effective value UNKNOWN; initializer uses an inspected builder default or binary zero.
+    /// Later-write audit: No later write on the specified no-override path; unchanged. All X/S/V-forced stores excluded. No post-copy write.
+    /// Potential writers: 0x205eaaba4, 0x205eb10d4, 0x205eb106c.
     pub o_2f8: f64,
     /// Config +0x300.
     /// 0x205eaab7c loads q1 from 0x2066a3a80; 0x205eaaba8..bac stores at sp+0x348, low lane.
     /// Builder zero/copy coordinates: 0x205eaa560..568; 0x2061fb4e8..500.
-    /// Effective value UNKNOWN; initializer uses an inspected builder default or binary zero.
+    /// Later-write audit: No later write on the specified no-override path; unchanged. All X/S/V-forced stores excluded. No post-copy write.
+    /// Potential writers: 0x205eaabac, 0x205eb10f4, 0x205eb106c.
     pub o_300: f64,
     /// Config +0x308.
     /// Same q1 store, high lane from 0x2066a3a88 at sp+0x350.
     /// Builder zero/copy coordinates: 0x205eaa560..568; 0x2061fb4e8..500.
-    /// Effective value UNKNOWN; initializer uses an inspected builder default or binary zero.
+    /// Later-write audit: No later write on the specified no-override path; unchanged. All X/S/V-forced stores excluded. No post-copy write.
+    /// Potential writers: 0x205eaabac, 0x205eb1114, 0x205eb106c.
     pub o_308: f64,
     /// Config +0x310.
     /// 0x205eaab80..b90 assembles bits 0x3f9eb851eb851eb8 and stores at sp+0x358.
     /// Builder zero/copy coordinates: 0x205eaa560..568; 0x2061fb4e8..500.
-    /// Effective value UNKNOWN; initializer uses an inspected builder default or binary zero.
+    /// Later-write audit: No later write on the specified no-override path; unchanged. All X/S/V-forced stores excluded. No post-copy write.
+    /// Potential writers: 0x205eaab90, 0x205eb1134, 0x205eb106c.
     pub o_310: f64,
     /// Config +0x330.
     /// 0x205eaac0c..c14: q0 from 0x2066a3a90, low lane stored at sp+0x378.
     /// Builder zero/copy coordinates: 0x205eaa560..568; 0x2061fb4e8..500.
-    /// Effective value UNKNOWN; initializer uses an inspected builder default or binary zero.
+    /// Later-write audit: No later write on the specified no-override path; unchanged. All X/S/V-forced stores excluded. No post-copy write.
+    /// Potential writers: 0x205eaac14.
     pub o_330: f64,
     /// Config +0x338.
     /// Same q0 store, high lane from 0x2066a3a98, sp+0x380.
     /// Builder zero/copy coordinates: 0x205eaa560..568; 0x2061fb4e8..500.
-    /// Effective value UNKNOWN; initializer uses an inspected builder default or binary zero.
+    /// Later-write audit: No later write on the specified no-override path; unchanged. All X/S/V-forced stores excluded. No post-copy write.
+    /// Potential writers: 0x205eaac14.
     pub o_338: f64,
     /// Config +0x340.
     /// 0x205eaac18..c24: bits 0x3fb999999999999a at sp+0x388.
     /// Builder zero/copy coordinates: 0x205eaa560..568; 0x2061fb4e8..500.
-    /// Effective value UNKNOWN; initializer uses an inspected builder default or binary zero.
+    /// Later-write audit: No later write on the specified no-override path; unchanged. All X/S/V-forced stores excluded. No post-copy write.
+    /// Potential writers: 0x205eaac24.
     pub o_340: f64,
     /// Config +0x348.
     /// 0x205eaac38..c3c: eight-byte load at 0x2066a3920, low word bytes 80 4f 12 00, sp+0x390.
     /// Builder zero/copy coordinates: 0x205eaa560..568; 0x2061fb4e8..500.
-    /// Effective value UNKNOWN; initializer uses an inspected builder default or binary zero.
+    /// Later-write audit: No later write on the specified no-override path; unchanged. All X/S/V-forced stores excluded. No post-copy write.
+    /// Potential writers: 0x205eaac3c, 0x205eb16a8, 0x205eb1630.
     pub o_348: u32,
     /// Config +0x34c.
     /// Same copy, high word at 0x2066a3924, bytes c0 27 09 00, sp+0x394.
     /// Builder zero/copy coordinates: 0x205eaa560..568; 0x2061fb4e8..500.
-    /// Effective value UNKNOWN; initializer uses an inspected builder default or binary zero.
+    /// Later-write audit: No later write on the specified no-override path; unchanged. All X/S/V-forced stores excluded. No post-copy write.
+    /// Potential writers: 0x205eaac3c, 0x205eb1684, 0x205eb1630.
     pub o_34c: u32,
     /// Config +0x350.
     /// 0x205eaac28..c30: w8=0x00037aa0, sp+0x398.
     /// Builder zero/copy coordinates: 0x205eaa560..568; 0x2061fb4e8..500.
-    /// Effective value UNKNOWN; initializer uses an inspected builder default or binary zero.
+    /// Later-write audit: No later write on the specified no-override path; unchanged. All X/S/V-forced stores excluded. No post-copy write.
+    /// Potential writers: 0x205eaac30, 0x205eb1660, 0x205eb1630.
     pub o_350: u32,
     /// Config +0x358.
     /// 0x205eaac50..c54: bits 0x4008000000000000 at sp+0x3a0.
     /// Builder zero/copy coordinates: 0x205eaa560..568; 0x2061fb4e8..500.
-    /// Effective value UNKNOWN; initializer uses an inspected builder default or binary zero.
+    /// Later-write audit: No later write on the specified no-override path; unchanged. All X/S/V-forced stores excluded. No post-copy write.
+    /// Potential writers: 0x205eaac54, 0x205eb16cc, 0x205eb1630.
     pub o_358: f64,
     /// Config +0x360.
     /// 0x205eaac44..c4c: q0 from 0x2066a3aa0, low lane stored at sp+0x3a8.
     /// Builder zero/copy coordinates: 0x205eaa560..568; 0x2061fb4e8..500.
-    /// Effective value UNKNOWN; initializer uses an inspected builder default or binary zero.
+    /// Later-write audit: No later write on the specified no-override path; unchanged. All X/S/V-forced stores excluded. No post-copy write.
+    /// Potential writers: 0x205eaac4c.
     pub o_360: f64,
     /// Config +0x368.
     /// Same q0 store, high lane from 0x2066a3aa8, sp+0x3b0.
     /// Builder zero/copy coordinates: 0x205eaa560..568; 0x2061fb4e8..500.
-    /// Effective value UNKNOWN; initializer uses an inspected builder default or binary zero.
+    /// Later-write audit: No later write on the specified no-override path; unchanged. All X/S/V-forced stores excluded. No post-copy write.
+    /// Potential writers: 0x205eaac4c.
     pub o_368: f64,
     /// Config +0x370; smartBrakeRateControlStrategy.
     /// Zero at sp+0x3b8; 0x205eac7d0..804 can set 2 when the hardware predicate and UseSmartBrake feature allow it; 0x205eac874 writes 0 otherwise; stabilized configure can also reset it to 0 if initialization fails.
