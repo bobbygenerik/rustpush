@@ -20,6 +20,7 @@ pub mod ramp_down;
 pub mod ramp_up;
 pub mod state;
 pub mod stats;
+pub mod tx_history;
 
 pub use media::{MediaController, PacketLossInput, PacketLossOutput};
 pub use state::VcrcState;

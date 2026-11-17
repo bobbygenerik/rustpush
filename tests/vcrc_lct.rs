@@ -10,7 +10,7 @@ impl MediaController for Mc {
     fn last_video_refresh_frame_time(&self) -> f64 { 0.0 }
     fn compute_packet_loss(&mut self, _i: &PacketLossInput) -> PacketLossOutput {
         PacketLossOutput { packet_loss_rate: Some(0.0), packet_loss_rate_video: Some(0.0),
-            packet_loss_rate_audio: Some(0.0), most_burst_loss: Some(0) }
+            packet_loss_rate_audio: Some(0.0), most_burst_loss: Some(0), received_bitrate: None }
     }
     fn media_queue_settings(&self) -> (f64, f64, f64, f64) { (0.0, self.out_video, 0.0, 0.0) }
     fn media_queue_rate_change_counter(&self) -> (u32, f64) { (u32::MAX, 0.0) }

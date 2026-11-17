@@ -25,6 +25,9 @@ pub struct PacketLossOutput {
     pub packet_loss_rate: Option<f64>,
     pub packet_loss_rate_audio: Option<f64>,
     pub packet_loss_rate_video: Option<f64>,
+    /// Receiver-side bitrate (bps) FindPacketInTxHistory 0x205f5b144 writes through info+0x28.
+    /// ComputePacketLoss points that at a local (0x20657526c) and discards it.
+    pub received_bitrate: Option<u32>,
 }
 
 pub trait MediaController {
