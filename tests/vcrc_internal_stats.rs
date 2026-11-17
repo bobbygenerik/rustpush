@@ -19,6 +19,9 @@ impl MediaController for Mc {
     fn media_queue_rate_change_counter(&self) -> (u32, f64) { self.rcc }
     fn traffic_type(&self) -> u8 { 0 }
     fn is_video_stopped(&self) -> bool { false }
+    fn set_min_target_bitrate(&mut self, _bps: u32) {}
+    fn set_should_disable_large_frame_requests_when_initial_ramp_up(&mut self, _v: bool) {}
+    fn set_rate_limited_max_time_exceeded(&mut self, _v: bool) {}
 }
 
 #[test]

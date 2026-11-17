@@ -6,12 +6,15 @@
 //!
 //! NOT wired into the call path. Time is always passed in; nothing here reads a clock.
 //!
-//! Status (chunk 3 of 4): state, inputs, media-controller interface,
+//! Status (chunks 1-4 done): state, inputs, media-controller interface,
 //! `UpdateInternalStatistics`, ShouldRampDown / ShouldRampUp / ShouldFastRampUp,
-//! IsBitrateOscillating, UpdateVCRateControlHistory and the Base/Util helpers they call.
+//! IsBitrateOscillating, UpdateVCRateControlHistory, the Base/Util helpers they call, and
+//! LayeredContinuousTier creation/Configure, RampUp/RampDown and DoRateControl (lct.rs).
+//! Entry point: `VcrcState::new_layered_continuous_tier` then `do_rate_control` per report.
 
 pub mod base;
 pub mod internal_stats;
+pub mod lct;
 pub mod media;
 pub mod ramp_down;
 pub mod ramp_up;

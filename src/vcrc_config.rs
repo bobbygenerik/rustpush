@@ -361,6 +361,25 @@ pub struct VcrcConfig {
     /// Later-write audit: No later write on the specified no-override path; unchanged. All X/S/V-forced stores excluded. No post-copy write.
     /// Potential writers: 0x205eaa9e8, 0x205eaaec4, 0x205eab0dc, 0x205eab2c0, 0x205eb12c0, 0x205eb1290.
     pub o_183: u8,
+    /// Config +0x180 ("enableBytesInFlightAdaptation", VCDefaults key at 0x205ead1e0):
+    /// bit(F,14) stored by 0x205eaabb4..bb8 (the same bit as +0x181, the continuous-tier
+    /// selector, which selection.md establishes as 1). VCDefaults keeps it with no override
+    /// (0x205ead1d4..1e8). 0x205ead4b4 zeroes it only on another mode path. Copied to
+    /// `_bytesInFlightAdaptationEnabled` by StabilizedNOWRD Configure.
+    pub o_180: u8,
+    /// Config +0x18b: RampDownSpeedFactor 0x205f97440 uses 1.0 instead of 3.0 when set.
+    /// 0x205eaa900/0x205eaa9c8: the controller+0x60 byte (the same flag that makes +0x88
+    /// 6.0 instead of 2.0). 0 on this Wi-Fi profile, consistent with o_88 = 2.0.
+    pub o_18b: u8,
+    /// Config +0x200: GetBitrateOscillationCount 0x2065c18b8 threshold factor
+    /// (× tier[o_14]). 0x205eaaa2c..a38 stores bits 0x3fe4cccccccccccd at sp+0x248.
+    pub o_200: f64,
+    /// Config +0x1f0 ("durationRatio") / +0x1f8 ("aggDurationRatio"): StabilizedNOWRD
+    /// StateEnter(4) multipliers. q0 from 0x2066a3a10 = (4.0, 8.0) stored by 0x205eaaa28
+    /// (x9 = sp+0x139, +0xff). Other writers 0x205eab718/738 are ServerBag (S).
+    pub o_1f0: f64,
+    /// See o_1f0.
+    pub o_1f8: f64,
     /// Config +0x185.
     /// 0x205eaaa00..a04, sp+0x1cd.
     /// Builder zero/copy coordinates: 0x205eaa560..568; 0x2061fb4e8..500.
@@ -749,6 +768,11 @@ pub fn mode1_camera_defaults() -> VcrcConfig {
         o_178: 5.0,
         o_182: 1,
         o_183: 0,
+        o_180: 1,
+        o_18b: 0,
+        o_200: f64::from_bits(0x3fe4cccccccccccd),
+        o_1f0: 4.0,
+        o_1f8: 8.0,
         o_185: 0,
         o_186: 0,
         o_187: 1,

@@ -11,7 +11,7 @@ impl VcrcState {
     /// Returns Apple's return value: false when the report is the first one or its timestamp
     /// is rejected, true otherwise. `now` stands in for `micro()` inside SetBitrateUnstable.
     pub fn update_internal_statistics(&mut self, s: &VcrcStatistics,
-        mut mc: Option<&mut dyn MediaController>, now: f64) -> bool {
+        mut mc: Option<&mut (dyn MediaController + '_)>, now: f64) -> bool {
         // 0x2061fd400..550: copy feedback fields.
         self.receive_jitter_queue_size = s.receive_jitter_queue_size;
         self.packet_burst_loss = s.burst_loss;

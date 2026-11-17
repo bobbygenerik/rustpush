@@ -288,6 +288,44 @@ pub struct VcrcState {
     pub current_history_index: u32,
     /// `StabilizedNOWRD._currentHistorySize`.
     pub current_history_size: u32,
+    // ---- added for chunk 4 (LayeredContinuousTier state machine, init, Configure) ----
+    /// +0x4d8 `_consecutiveRampDown`.
+    pub consecutive_ramp_down: u32,
+    /// +0x4e0 `_lastTimeStartRampingDown`.
+    pub last_time_start_ramping_down: f64,
+    /// `Base._rampUpCounter`.
+    pub ramp_up_counter: u32,
+    /// `Base._rampUpSpeedAdjustmentFactor`.
+    pub ramp_up_speed_adjustment_factor: f64,
+    /// +0x147c `_rateSharingCount` (Base init: 1).
+    pub rate_sharing_count: i32,
+    /// +0x1480 `_rateSharingFactor` (Base init: 1.0).
+    pub rate_sharing_factor: f64,
+    /// `StabilizedNOWRD._rampUpFrozenDuration`.
+    pub ramp_up_frozen_duration: f64,
+    /// `StabilizedNOWRD._shouldConsiderCongestionLevelForBIF` (StabilizedNOWRD init: 1).
+    pub should_consider_congestion_level_for_bif: bool,
+    /// `StabilizedNOWRD._bytesInFlightState` (Configure: -1).
+    pub bytes_in_flight_state: i32,
+    /// `StabilizedNOWRD._bytesInFlightThreshold`.
+    pub bytes_in_flight_threshold: u32,
+    /// +0xb6b8 `_bandwidthWall` (f64).
+    pub bandwidth_wall: f64,
+    /// +0xb6c0 `_bandwidthWallConfidence` (32-bit, compared signed).
+    pub bandwidth_wall_confidence: i32,
+    /// +0xb6c8 `_speedFactor`.
+    pub speed_factor: f64,
+    /// +0xb6d0 `_previousRateControlTime`.
+    pub previous_rate_control_time: f64,
+    /// +0xb6d8 `_congestionSeverity` (LCT init: 1.0).
+    pub congestion_severity: f64,
+    /// +0xb6e0 `_shouldRampUp`.
+    pub should_ramp_up_flag: bool,
+    /// +0xb6e1 `_shouldRampDown`.
+    pub should_ramp_down_flag: bool,
+    /// Stand-in for `arc4random_uniform` in GetRampUpFrozenDuration (xorshift64 state).
+    /// Only matters when config+0x185 == 1 (0 on the static profile).
+    pub rng: u64,
 }
 
 /// One `_history` record, as UpdateVCRateControlHistory 0x2061fe564 writes it.
@@ -358,6 +396,13 @@ impl VcrcState {
             allow_ramp_up_based_on_bytes_in_flight: false,
             history: Box::new([HistoryRecord::default(); 1024]),
             current_history_index: 0, current_history_size: 0,
+            consecutive_ramp_down: 0, last_time_start_ramping_down: 0.0, ramp_up_counter: 0,
+            ramp_up_speed_adjustment_factor: 0.0, rate_sharing_count: 0, rate_sharing_factor: 0.0,
+            ramp_up_frozen_duration: 0.0, should_consider_congestion_level_for_bif: false,
+            bytes_in_flight_state: 0, bytes_in_flight_threshold: 0, bandwidth_wall: 0.0,
+            bandwidth_wall_confidence: 0, speed_factor: 0.0, previous_rate_control_time: 0.0,
+            congestion_severity: 0.0, should_ramp_up_flag: false, should_ramp_down_flag: false,
+            rng: 0x9e3779b97f4a7c15,
         }
     }
 

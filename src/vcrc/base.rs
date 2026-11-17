@@ -243,7 +243,8 @@ impl VcrcState {
     }
 
     /// `_VCRateControlAlgorithmBasePriv_CheckPaused` 0x20617a1e8. Pause/resume go through the
-    /// class vtable's StateExit/StateEnter (object +0x20 / +0x18), ported in chunk 4.
+    /// class vtable's StateExit/StateEnter (object +0x20 / +0x18); for LayeredContinuousTier
+    /// these are StabilizedNOWRD's (see lct.rs `vtable_state_exit` / `vtable_state_enter`).
     pub fn check_paused(&mut self) {
         if self.state == 1 { return; }
         let paused = self.paused; // VCRateControlAlgorithm_IsPaused 0x20617a3f8
@@ -260,11 +261,4 @@ impl VcrcState {
             self.paused = false; // VCRateControlAlgorithm_SetPaused(self, 0) 0x20617a580
         }
     }
-
-    /// vtable StateExit (object +0x20). Chunk 4: StabilizedNOWRD_StateExit 0x2061fc094 and
-    /// the LayeredContinuousTier vtable setup. Until then: no effect.
-    pub fn vtable_state_exit(&mut self) {}
-
-    /// vtable StateEnter (object +0x18). Chunk 4: StabilizedNOWRD_StateEnter 0x2061fbf6c.
-    pub fn vtable_state_enter(&mut self) {}
 }

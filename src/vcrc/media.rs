@@ -45,4 +45,11 @@ pub trait MediaController {
     /// `VCRateControlMediaController_IsVideoStopped` 0x20604c8e8: any of the controller's
     /// flag bytes +0x38, +0x39, +0x3a set.
     fn is_video_stopped(&self) -> bool;
+    /// `VCRateControlMediaController_SetMinTargetBitrate` 0x20604e6c8 (Configure).
+    fn set_min_target_bitrate(&mut self, bps: u32);
+    /// `VCRateControlMediaController_SetShouldDisableLargeFrameRequestsWhenInitialRampUp`
+    /// 0x20604e90c (PostStateTransitionUpdates).
+    fn set_should_disable_large_frame_requests_when_initial_ramp_up(&mut self, v: bool);
+    /// `VCRateControlMediaController_SetRateLimitedMaxTimeExceeded` 0x20604e984.
+    fn set_rate_limited_max_time_exceeded(&mut self, v: bool);
 }
