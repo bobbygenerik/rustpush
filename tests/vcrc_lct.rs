@@ -140,3 +140,14 @@ fn audio_only_is_not_handled_here() {
     let mut s = fresh(&mut mc);
     assert!(!s.do_rate_control(&report(1), Some(&mut mc), 0.0));
 }
+
+#[test]
+fn low_bandwidth_optimization_steps_one_tier_on_overshoot() {
+    // config+0x18e = 1: a BWE-overshoot ramp-down (rampDownStatus 0x10) below tier
+    // config+0x20 drops exactly one tier (0x205f972b0..2e8) instead of dividing.
+    let mut mc = Mc::default();
+    let mut s = fresh(&mut mc);
+    assert_eq!(s.config.o_18e, 1);
+    s.ramp_down_status = 0x10;
+    assert_eq!(s.lct_ramp_down(0.0), TIER_BITRATES[16]);
+}

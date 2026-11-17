@@ -1,7 +1,7 @@
 //! Data extracted from AVConference, iOS 27.0.1 24A446, iPhone17,5.
 //!
 //! Later-write audit covers the mode-1 Wi-Fi camera profile with no overrides.
-//! Six runtime-dependent fields remain in EFFECTIVE_VALUE_UNKNOWNS; their values
+//! Four runtime-dependent fields remain in EFFECTIVE_VALUE_UNKNOWNS (0x186 and 0x18e resolved later); their values
 //! retain the documented binary-default fallback. Other values have had their
 //! later stores and the two Configure copy paths checked for this profile.
 //! This static data audit does not establish live-call or full controller parity.
@@ -26,7 +26,7 @@ pub const TIER_BITRATES: [u32; 66] = [
 
 /// Config offsets whose final effective value remains UNKNOWN.
 pub const EFFECTIVE_VALUE_UNKNOWNS: &[u16] = &[
-    0x10, 0x54, 0x186, 0x18e, 0x370, 0x428,
+    0x10, 0x54, 0x370, 0x428,
 ];
 
 /// Named by native config-relative offset; this is not a C ABI memory layout.
@@ -389,8 +389,14 @@ pub struct VcrcConfig {
     /// Config +0x186.
     /// 0x205eaaa08..a0c, sp+0x1ce.
     /// Builder zero/copy coordinates: 0x205eaa560..568; 0x2061fb4e8..500.
-    /// Effective value UNKNOWN; initializer uses an inspected builder default or binary zero.
-    /// Runtime OR-0xbd/0x3d helper default remains UNKNOWN (0x205eb0ac0..b24, 0x205eb0ccc..cdc); fallback 0.
+    /// RESOLVED (2026-11-17, Claude) = 0: bit 7 of the default flag word from
+    /// -[AVCRateController loadDefaultVCRCFeatureFlags:] 0x205eb0a98, which is 0xbd only when
+    /// the VCDefaults bool at 0x2721ecba0 is true (0x205eb0ccc..cdc), else 0x3d. That bool
+    /// defaults to 0 unless VCFeatureFlagManager_ReduceKPIVariation 0x20643c010 is true
+    /// (0x205eb0ac0..b20), and that needs os_feature_enabled(AVConference/ReduceKPIVariation)
+    /// (block 0x20643c13c); the 24A446 FeatureFlags plist has ReduceKPIVariation with only
+    /// DevelopmentPhase=FeatureComplete and no Enabled key, i.e. off on customer builds.
+    /// The same 0x3d word confirms +0x185 (bit 6) = 0, +0x187 (bit 3) = 1, +0x188 (bit 5) = 1.
     pub o_186: u8,
     /// Config +0x187.
     /// 0x205eaaa90..ac4, byte 0 of four-byte feature extraction store; shift constants directly dumped at 0x2066a3908..917.
@@ -419,8 +425,13 @@ pub struct VcrcConfig {
     /// Config +0x18e.
     /// 0x205eaa560..568 zeros config+0..0x42f.
     /// Builder zero/copy coordinates: 0x205eaa560..568; 0x2061fb4e8..500.
-    /// Effective value UNKNOWN; initializer uses an inspected builder default or binary zero.
-    /// Runtime controller+0x7e0 default remains UNKNOWN (0x205ead200..210); fallback 0.
+    /// RESOLVED (2026-11-17, Claude) = 1 ("rateControlLowBandwidthOptimization"):
+    /// 0x205ead200..210 stores VCDefaults_GetBoolValueForKey(key, controller+0x7e0) here.
+    /// controller+0x7e0 (`_lowBandwidthOptimizationEnabled`) is set to 1 at 0x205ea80d4..d8 in
+    /// -[AVCRateController loadParametersFromExperimentManagerForABTesting]; the only other
+    /// writer is the experiment-manager loader at 0x205ea8490..4a4
+    /// (kVCExperimentFTLowBandwidthOptimization), the same mechanism that leaves
+    /// `_abTestRateRampUp` (+0x701) at its default 1 in selection.md.
     pub o_18e: u8,
     /// Config +0x194.
     /// 0x205eaaa6c..a70, sp+0x1dc.
@@ -779,7 +790,7 @@ pub fn mode1_camera_defaults() -> VcrcConfig {
         o_188: 1,
         o_189: 0,
         o_18a: 0,
-        o_18e: 0,
+        o_18e: 1,
         o_194: 0,
         o_198: 0.005,
         o_1a8: 26,
