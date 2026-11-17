@@ -18,6 +18,7 @@ impl MediaController for Mc {
     fn media_queue_settings(&self) -> (f64, f64, f64, f64) { self.settings }
     fn media_queue_rate_change_counter(&self) -> (u32, f64) { self.rcc }
     fn traffic_type(&self) -> u8 { 0 }
+    fn is_video_stopped(&self) -> bool { false }
 }
 
 #[test]

@@ -42,4 +42,7 @@ pub trait MediaController {
     fn media_queue_rate_change_counter(&self) -> (u32, f64);
     /// `[mediaController trafficType]` (stub 0x2080b3f40).
     fn traffic_type(&self) -> u8;
+    /// `VCRateControlMediaController_IsVideoStopped` 0x20604c8e8: any of the controller's
+    /// flag bytes +0x38, +0x39, +0x3a set.
+    fn is_video_stopped(&self) -> bool;
 }

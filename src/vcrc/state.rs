@@ -233,6 +233,78 @@ pub struct VcrcState {
     pub previous_round_trip_time: f64,
     /// +0xb678 `_lastNetworkUnstableTime`.
     pub last_network_unstable_time: f64,
+    // ---- added for chunk 3 (ShouldRampDown / ShouldRampUp and their helpers) ----
+    /// +0x480 `_previousTierIndex`.
+    pub previous_tier_index: i32,
+    /// `Base._lastLossEventRampDownTime`.
+    pub last_loss_event_ramp_down_time: f64,
+    /// `Base._didMBLRampDown`.
+    pub did_mbl_ramp_down: bool,
+    /// `Base._shouldConsiderCongestionLevelForNOWRDAcc` (set by Configure; chunk 4).
+    pub should_consider_congestion_level_for_nowrd_acc: bool,
+    /// +0x13e0 `_packetLossRateBadTrendCount`.
+    pub packet_loss_rate_bad_trend_count: i32,
+    /// +0x13e4 `_lossEventBandwidthLimit`.
+    pub loss_event_bandwidth_limit: u32,
+    /// +0x13e8 `_lossEventBandwidthConfidence`.
+    pub loss_event_bandwidth_confidence: u32,
+    /// +0x1410 `_packetLossRateThreshold`.
+    pub packet_loss_rate_threshold: f64,
+    /// +0x1420 `_packetLossRateAvgLongPrevious`.
+    pub packet_loss_rate_avg_long_previous: f64,
+    /// +0x1428 `_packetLossRateAvgLongAtLBAStart`.
+    pub packet_loss_rate_avg_long_at_lba_start: f64,
+    /// +0x149a `_didLBARampDown`.
+    pub did_lba_ramp_down: bool,
+    /// `StabilizedNOWRD._fastRampDownBitrateRange`.
+    pub fast_ramp_down_bitrate_range: u32,
+    /// `StabilizedNOWRD._previousNOWRD`.
+    pub previous_nowrd: f64,
+    /// `StabilizedNOWRD._lastPositiveOWRDTime`.
+    pub last_positive_owrd_time: f64,
+    /// `StabilizedNOWRD._additionalTierForRampDown`.
+    pub additional_tier_for_ramp_down: u32,
+    /// +0x1430 `_packetLossRateAvgLongAtLBAExit`.
+    pub packet_loss_rate_avg_long_at_lba_exit: f64,
+    /// `Base._lastRampDownTimeDueToBaseband`.
+    pub last_ramp_down_time_due_to_baseband: f64,
+    /// `StabilizedNOWRD._extendedRampUpFrozenExitTime`.
+    pub extended_ramp_up_frozen_exit_time: f64,
+    /// `StabilizedNOWRD._basebandAdaptationEnabled` (cellular modem feedback; not available).
+    pub baseband_adaptation_enabled: bool,
+    /// `StabilizedNOWRD._basebandAdditionalTiersForRampUp`.
+    pub baseband_additional_tiers_for_ramp_up: u32,
+    /// `StabilizedNOWRD._withBTCoex`.
+    pub with_bt_coex: bool,
+    /// `StabilizedNOWRD._bytesInFlightAdaptationEnabled`.
+    pub bytes_in_flight_adaptation_enabled: bool,
+    /// `StabilizedNOWRD._bytesInFlight`.
+    pub bytes_in_flight: u32,
+    /// `StabilizedNOWRD._allowRampUpBasedOnBytesInFlight`.
+    pub allow_ramp_up_based_on_bytes_in_flight: bool,
+    /// `StabilizedNOWRD._history` (1024 × 40-byte records).
+    pub history: Box<[HistoryRecord; 1024]>,
+    /// `StabilizedNOWRD._currentHistoryIndex`.
+    pub current_history_index: u32,
+    /// `StabilizedNOWRD._currentHistorySize`.
+    pub current_history_size: u32,
+}
+
+/// One `_history` record, as UpdateVCRateControlHistory 0x2061fe564 writes it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct HistoryRecord {
+    /// +0x00 `_owrd`.
+    pub owrd: f64,
+    /// +0x08 `_roundTripTime`.
+    pub round_trip_time: f64,
+    /// +0x10 `_roundTripTimeMinEnvelope`.
+    pub round_trip_time_min_envelope: f64,
+    /// +0x18 `_packetLossRate`.
+    pub packet_loss_rate: f64,
+    /// +0x20 `_currentTierIndex`.
+    pub tier_index: i32,
+    /// +0x24: the function's second argument (w1).
+    pub arg: u32,
 }
 
 impl VcrcState {
@@ -272,6 +344,20 @@ impl VcrcState {
             should_suppress_ramp_down: false, ramp_down_suppression_bitrate_threshold: 0,
             is_waiting_for_baseband_ramp_down: false, packet_burst_loss: 0,
             previous_round_trip_time: 0.0, last_network_unstable_time: 0.0,
+            previous_tier_index: 0, last_loss_event_ramp_down_time: 0.0, did_mbl_ramp_down: false,
+            should_consider_congestion_level_for_nowrd_acc: false,
+            packet_loss_rate_bad_trend_count: 0, loss_event_bandwidth_limit: 0,
+            loss_event_bandwidth_confidence: 0, packet_loss_rate_threshold: 0.0,
+            packet_loss_rate_avg_long_previous: 0.0, packet_loss_rate_avg_long_at_lba_start: 0.0,
+            did_lba_ramp_down: false, fast_ramp_down_bitrate_range: 0, previous_nowrd: 0.0,
+            last_positive_owrd_time: 0.0, additional_tier_for_ramp_down: 0,
+            packet_loss_rate_avg_long_at_lba_exit: 0.0, last_ramp_down_time_due_to_baseband: 0.0,
+            extended_ramp_up_frozen_exit_time: 0.0, baseband_adaptation_enabled: false,
+            baseband_additional_tiers_for_ramp_up: 0, with_bt_coex: false,
+            bytes_in_flight_adaptation_enabled: false, bytes_in_flight: 0,
+            allow_ramp_up_based_on_bytes_in_flight: false,
+            history: Box::new([HistoryRecord::default(); 1024]),
+            current_history_index: 0, current_history_size: 0,
         }
     }
 

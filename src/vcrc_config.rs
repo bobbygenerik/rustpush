@@ -37,6 +37,12 @@ pub struct VcrcConfig {
     /// Builder zero/copy coordinates: 0x205eaa560..568; 0x2061fb4e8..500.
     /// Native pointer 0x2066a3b10 is represented by a host reference to the extracted table.
     pub o_8: &'static [u32; 66],
+    /// Config +0x0: the caller's rate-control mode. ConfigureInternal copies `[x1]` into
+    /// controller+0x48 (0x205eaa18c..19c) and then into sp+0x48 = config+0 (0x205eaa56c..574).
+    /// Value 1 is ASSUMED for a 1:1 camera call: selection.md reads the mode at controller+0x58,
+    /// not +0x48, and the two have not been reconciled. Only read by IsVideoStopped
+    /// 0x20617a9e8 (modes 1, 2, 7 consult the media controller).
+    pub o_0: u32,
     /// Config +0x10; initial tier (role established by table lookup at 0x205eaceb4..ec0).
     /// 0x205eaa5fc..614 selects 17 when max>25; 0x205eaa634..790 learnt path; 0x205eaa87c..890 clamp/store at sp+0x58.
     /// Builder zero/copy coordinates: 0x205eaa560..568; 0x2061fb4e8..500.
@@ -136,6 +142,22 @@ pub struct VcrcConfig {
     /// Later-write audit: No later write on the specified no-override path; unchanged. All X/S/V-forced stores excluded. No post-copy write.
     /// Potential writers: 0x205eaa8f0, 0x205eab1e8, 0x205eab238, 0x205eac210.
     pub o_68: f64,
+    /// Config +0x60 (ServerBag key "rampDown-delay"/"NOWRD" at 0x205eac1f0): NOWRD threshold
+    /// used when send-limited. 0x205eaa8e4/8f0: q0 from 0x2066a3970 = (0.1, 0.15) stored at
+    /// sp+0xa8 (config+0x60 low lane, +0x68 high lane). Other writers 0x205eab1e8/0x205eab238
+    /// (X-RAT doubling) and 0x205eac1f0 (S) are excluded exactly as for o_68 in config.md.
+    pub o_60: f64,
+    /// Config +0x70 ("aggNOWRD", 0x205eac230): NOWRD threshold when not send-limited.
+    /// 0x205eaa8ec/8f4: q1 from 0x2066a3980 = (0.06, 0.1) stored at sp+0xb8.
+    pub o_70: f64,
+    /// Config +0x78 ("aggNOWRDAcc", 0x205eac250): accumulated-NOWRD threshold during
+    /// initial ramp / settling when not send-limited. High lane of the same q1: 0.1.
+    pub o_78: f64,
+    /// Config +0x1a0: multiplier on the NOWRD-accumulation threshold while ramp-down is
+    /// suppressed (ShouldRampDown 0x2065c1f24). Only writer is 0x205eac2d0 inside the
+    /// ServerBag group skipped at 0x205eac1c8 (S), so it stays 0 from the bzero
+    /// at 0x205eaa560..568. Unused on the static profile because o_194 == 0.
+    pub o_1a0: f64,
     /// Config +0x80.
     /// 0x205eaa8f8..8fc: bits 0x4000000000000000, store at sp+0xc8.
     /// Builder zero/copy coordinates: 0x205eaa560..568; 0x2061fb4e8..500.
@@ -405,6 +427,11 @@ pub struct VcrcConfig {
     /// Later-write audit: No later write on the specified no-override path; unchanged. All X/S/V-forced stores excluded. No post-copy write.
     /// Potential writers: 0x205eaaa48, 0x205eab588.
     pub o_1b0: f64,
+    /// Config +0x1b8 ("minTierGap", ServerBag key at 0x205eab550): tiers above the current one
+    /// that the remote BWE must clear for a fast ramp-up (ShouldFastRampUp 0x2065c1a78).
+    /// `mov w12, #0x3` at 0x205eaa9b4, stored at sp+0x200 by 0x205eaaa40. The only other
+    /// writer, 0x205eab568, is inside the ServerBag group (S).
+    pub o_1b8: u32,
     /// Config +0x1c0.
     /// 0x205eaaacc..ad4: q0 from 0x2066a3a50, low lane stored at sp+0x208 via sp+0x109+0xff.
     /// Builder zero/copy coordinates: 0x205eaa560..568; 0x2061fb4e8..500.
@@ -625,6 +652,12 @@ pub struct VcrcConfig {
     /// Effective value UNKNOWN; initializer uses an inspected builder default or binary zero.
     /// Hardware/feature strategy 0 or 2 and post-copy initialization failure remain UNKNOWN (0x205eac7d0..824, 0x2061fb80c); fallback 0.
     pub o_370: u32,
+    /// Config +0x378..0x418: the whole 20-f64 congestion-level threshold table, as
+    /// `_VCRateControlCongestionLevel_PopulateCongestionLevelThresholds` 0x2060de4d0 writes it
+    /// (q-loads from 0x2066a7610..0x2066a76a8, stp at 0x2060de4e8/4f4/508/524/530) and
+    /// 0x205ead24c..270 copies it to config+0x378. Indexed by ShouldRampDown at 0x2065c1e10..e14
+    /// (`config+0x378 + range*8`). Entries 5..=9 are also o_3a0..o_3c0 below.
+    pub o_378: [f64; 20],
     /// Config +0x3a0.
     /// Output+0x28, high lane of q0 from 0x2066a7640 at 0x2060de4f0; store at output+0x20 by 0x2060de4f4; source constant 0x2066a7648; config copy 0x205ead25c..260.
     /// Builder zero/copy coordinates: 0x205eaa560..568; 0x2061fb4e8..500.
@@ -659,6 +692,7 @@ pub struct VcrcConfig {
 /// The static profile is audited; runtime inputs and live behavior are not established.
 pub fn mode1_camera_defaults() -> VcrcConfig {
     VcrcConfig {
+        o_0: 1,
         o_8: &TIER_BITRATES,
         o_10: 17,
         o_14: 31,
@@ -677,6 +711,10 @@ pub fn mode1_camera_defaults() -> VcrcConfig {
         o_54: 0,
         o_58: 0,
         o_68: 0.15,
+        o_60: 0.1,
+        o_70: 0.06,
+        o_78: 0.1,
+        o_1a0: 0.0,
         o_80: 2.0,
         o_88: 2.0,
         o_90: 0.25,
@@ -722,6 +760,7 @@ pub fn mode1_camera_defaults() -> VcrcConfig {
         o_198: 0.005,
         o_1a8: 26,
         o_1b0: 20.0,
+        o_1b8: 3,
         o_1c0: 5.0,
         o_1c8: 4.0,
         o_1d0: 3.0,
@@ -759,6 +798,16 @@ pub fn mode1_camera_defaults() -> VcrcConfig {
         o_360: 0.1,
         o_368: 0.5,
         o_370: 0,
+        o_378: [
+            -1.0, 4.0, 3.5, 3.0, 2.5,
+            f64::from_bits(0xbfecccccc0000000), f64::from_bits(0x400cccccc0000000),
+            f64::from_bits(0x4009333328000000), f64::from_bits(0x4005999990000000),
+            f64::from_bits(0x4001fffff8000000),
+            -1.0, 8.0, 3.0, 1.0, 0.5,
+            f64::from_bits(0xbfecccccc0000000), f64::from_bits(0x401cccccc0000000),
+            f64::from_bits(0x4005999990000000), f64::from_bits(0x3fecccccc0000000),
+            f64::from_bits(0x3fdcccccc0000000),
+        ],
         o_3a0: f64::from_bits(0xbfecccccc0000000),
         o_3a8: f64::from_bits(0x400cccccc0000000),
         o_3b0: f64::from_bits(0x4009333328000000),

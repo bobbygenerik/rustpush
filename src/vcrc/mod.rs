@@ -6,12 +6,15 @@
 //!
 //! NOT wired into the call path. Time is always passed in; nothing here reads a clock.
 //!
-//! Status (chunk 2 of 4): state, inputs, media-controller interface,
-//! `UpdateInternalStatistics` and the Base/Util helpers it calls.
+//! Status (chunk 3 of 4): state, inputs, media-controller interface,
+//! `UpdateInternalStatistics`, ShouldRampDown / ShouldRampUp / ShouldFastRampUp,
+//! IsBitrateOscillating, UpdateVCRateControlHistory and the Base/Util helpers they call.
 
 pub mod base;
 pub mod internal_stats;
 pub mod media;
+pub mod ramp_down;
+pub mod ramp_up;
 pub mod state;
 pub mod stats;
 
