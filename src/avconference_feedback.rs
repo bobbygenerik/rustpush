@@ -17,12 +17,24 @@ impl Default for HistoryClock {
     fn default() -> Self { Self { epoch: Instant::now(), history: SendHistory::default() } }
 }
 
-// Keep advertisement and negotiation tied to the implemented capability. Mode 0
-// is cumulative feedback and must be correlated with local send history.
-pub(super) const LOCAL_FEC_FEEDBACK_VERSION: u8 = 0;
+// One-to-one feedback uses the loss-stats layout of the video word:
+// bits [11:6] = packets in the frame, bits [5:0] = packets lost, bits [15:12] = burst loss.
+// Evidence (iOS 27.0.1 24A446 AVConference):
+// - `_VCMediaControlInfo_IsLossStatsEnabled` 0x2064c4a40 is true for versions 1 and 2;
+//   `_AVCStatisticsCollector_UpdatePacketReceivedCount` 0x205ed4654..0x205ed4694 takes the video
+//   word raw in that mode and only otherwise unwraps it as a 12-bit cumulative counter.
+// - On the wire the iPhone sends the loss-stats layout while both blobs carry
+//   media_control_info_sub_version = 0 (2026-11-16 calls: every sampled video word is a multiple
+//   of 64 and non-monotonic), so that blob field does not select this mode.
+// Treating the word as cumulative (the previous mode 0) rejected every report after the first
+// rate cut as "older", leaving the send-rate controller with no input, and made our own reports
+// read as random frame loss on the iPhone.
+pub(super) const LOCAL_FEC_FEEDBACK_VERSION: u8 = 1;
+/// Value advertised in the media blob. Unchanged; see the note above.
+pub(super) const ADVERTISED_MEDIA_CONTROL_INFO_SUB_VERSION: u32 = 0;
 
-pub(super) fn negotiate_feedback_version(local: u8, remote: Option<u32>) -> u8 {
-    local.min(remote.unwrap_or_default() as u8)
+pub(super) fn negotiate_feedback_version(local: u8, _remote: Option<u32>) -> u8 {
+    local
 }
 
 pub(super) fn loss_stats_enabled(version: u8) -> bool {

@@ -7620,7 +7620,7 @@ impl AVConfig {
                 capabilities: Some(0),
                 switches: Some(201326586),
                 one_to_one_mode_supported: Some(true),
-                media_control_info_sub_version: Some(audio_feedback::LOCAL_FEC_FEEDBACK_VERSION as u32),
+                media_control_info_sub_version: Some(audio_feedback::ADVERTISED_MEDIA_CONTROL_INFO_SUB_VERSION),
                 link_probing_capability_version: Some(0),
             }),
             access_network_type: None,
