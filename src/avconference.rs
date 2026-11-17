@@ -718,15 +718,22 @@ enum SSRCState {
 
 const BITRATE_TABLE: &[usize] = &[
     10, 20, 52, 84, 116, 164, 228, 299, 422, 597,
-    802, 1078, 1450, 1949, 2620, 3522, 4735, 6365,
+    802, 1078, 1450, 1949, 2620, 3522, 4084, 4735, 6365,
     8557, 9920,
 ];
+// Highest rung a 1:1 call may use: 4084 kbps, AVConference's Wi-Fi/wired 1:1 maximum
+// (tier 31 of _vcRateControlTierBitrates 0x2066a3b10, selected in AVCRateController
+// ConfigureInternal 0x205eaa584..890; evidence sender-rate-20261116/ramp.md 1.2). Apple allows
+// tier 34 (6365 kbps) on cellular; we do not know the local network type here, so the Wi-Fi
+// value is used everywhere. Rungs above stay in the table for the ceiling-probe arithmetic.
+const MAX_VIDEO_RUNG: usize = 16;
 // The camera encoder starts at 2.5 Mbps (FaceTimeCameraCapture KEY_BIT_RATE);
 // start the controller's model at the matching rung (2620 kbps) instead of the
 // table midpoint (802 kbps) so the first SelectVideoBitrate reflects what is
 // actually on the wire -- with the midpoint the first change would yank the
 // encoder to ~600k-1.1M based on a model that never described the real rate.
 const INITIAL_VIDEO_RUNG: usize = 14; // 2620 kbps
+const _: () = assert!(BITRATE_TABLE[MAX_VIDEO_RUNG] == 4084 && BITRATE_TABLE[INITIAL_VIDEO_RUNG] == 2620);
 const U1_CHANGE_SETTLE_TIME: Duration = Duration::from_secs(5);
 
 // U1 outgoing rate control. Borrows the shape of WebRTC's GCC -- decrease fast, increase only on
@@ -6374,8 +6381,8 @@ impl AVSession {
                         if state.current_video_bitrate < MIN_VIDEO_RUNG {
                             state.current_video_bitrate = MIN_VIDEO_RUNG;
                         }
-                        if state.current_video_bitrate >= BITRATE_TABLE.len() {
-                            state.current_video_bitrate = BITRATE_TABLE.len() - 1;
+                        if state.current_video_bitrate > MAX_VIDEO_RUNG {
+                            state.current_video_bitrate = MAX_VIDEO_RUNG;
                         }
                         if old_bitrate != state.current_video_bitrate {
                             if bucket < 0 {
