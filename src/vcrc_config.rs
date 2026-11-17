@@ -1,10 +1,11 @@
 //! Data extracted from AVConference, iOS 27.0.1 24A446, iPhone17,5.
 //!
-//! This is a partial reconstruction, not a native-parity verdict. Effective values
-//! listed in EFFECTIVE_VALUE_UNKNOWNS remain UNKNOWN. Their initializer retains
-//! an inspected binary builder default (or binary zero) under the requested
-//! fallback policy; it does not establish the final Apple runtime configuration.
-//! The cold initial tier is 17; a live learnt-bitrate delegate may replace it.
+//! Later-write audit covers the mode-1 Wi-Fi camera profile with no overrides.
+//! Six runtime-dependent fields remain in EFFECTIVE_VALUE_UNKNOWNS; their values
+//! retain the documented binary-default fallback. Other values have had their
+//! later stores and the two Configure copy paths checked for this profile.
+//! This static data audit does not establish live-call or full controller parity.
+//! A live learnt-bitrate delegate may replace the cold initial tier 17.
 //! No controller is wired to these values by this data-only module.
 
 /// `_vcRateControlTierBitrates`, 66 little-endian u32 words at 0x2066a3b10.
@@ -41,6 +42,7 @@ pub struct VcrcConfig {
     /// Builder zero/copy coordinates: 0x205eaa560..568; 0x2061fb4e8..500.
     /// Effective value UNKNOWN; initializer uses an inspected builder default or binary zero.
     /// Binary cold default 17; learnt delegate and forcedInitialBitrate can change the live tier.
+    /// Runtime learnt-bitrate delegate remains UNKNOWN (0x205eaa634..790); cold fallback 17.
     pub o_10: i32,
     /// Config +0x14; max tier (clamp use 0x2061fb94c..958).
     /// 0x205eaa584..5c0 chooses upper tier 31/42/16 according to traffic and feature bits 16/19 and scans down; 0x205eaa5cc..5d0 stores nonnegative result at sp+0x5c.
@@ -68,11 +70,11 @@ pub struct VcrcConfig {
     /// Later-write audit: No later write on the specified no-override path; unchanged. All X/S/V-forced stores excluded. No post-copy write.
     /// Potential writers: 0x205eaa9b8.
     pub o_28: i32,
-    /// Config +0x2c; forcedSoftMaxTierMildLowIndex.
-    /// 0x205eaabf4..0x205eaac04: VCDefaults default w1=0x16, result stored at sp+0x6c.
-    /// Builder zero/copy coordinates: 0x205eaa560..568; 0x2061fb4e8..500.
-    /// Later-write audit: 0x205eaa568 zeros config+0x2c; 0x205eaac04 writes forcedSoftMaxTierMildLowIndex to +0x24, not +0x2c. Only +0x2c stores at 0x205eaaef4/0x205eab2fc are outside the Wi-Fi camera path.
-    /// Potential writers: 0x205eaaef4, 0x205eab2fc.
+    /// Config +0x2c; native role UNKNOWN.
+    /// Effective 0: config zero at 0x205eaa560..568; +0x2c stores at
+    /// 0x205eaaef4/0x205eab2fc are on excluded RAT/mode paths.
+    /// forcedSoftMaxTierMildLowIndex at 0x205eaac04 is +0x24, not this field.
+    /// No post-copy write in 0x2061fb4b4..bba0 or 0x205f95c34..cd4.
     pub o_2c: i32,
     /// Config +0x30.
     /// 0x205eaa9b4..9bc: w12=3, store at sp+0x78.
@@ -120,6 +122,7 @@ pub struct VcrcConfig {
     /// 0x205eaab94..9c: lsl by 16 then arithmetic sign extraction and AND 17; 0x205eaabb0 stores at sp+0x9c.
     /// Builder zero/copy coordinates: 0x205eaa560..568; 0x2061fb4e8..500.
     /// Effective value UNKNOWN; initializer uses an inspected builder default or binary zero.
+    /// Runtime isUsingPersonaCamera input remains UNKNOWN (0x206430f3c..4c); fallback 0.
     pub o_54: u32,
     /// Config +0x58.
     /// Zero initialization covers sp+0xa0; later-writer audit outstanding.
@@ -341,6 +344,7 @@ pub struct VcrcConfig {
     /// 0x205eaaa08..a0c, sp+0x1ce.
     /// Builder zero/copy coordinates: 0x205eaa560..568; 0x2061fb4e8..500.
     /// Effective value UNKNOWN; initializer uses an inspected builder default or binary zero.
+    /// Runtime OR-0xbd/0x3d helper default remains UNKNOWN (0x205eb0ac0..b24, 0x205eb0ccc..cdc); fallback 0.
     pub o_186: u8,
     /// Config +0x187.
     /// 0x205eaaa90..ac4, byte 0 of four-byte feature extraction store; shift constants directly dumped at 0x2066a3908..917.
@@ -370,6 +374,7 @@ pub struct VcrcConfig {
     /// 0x205eaa560..568 zeros config+0..0x42f.
     /// Builder zero/copy coordinates: 0x205eaa560..568; 0x2061fb4e8..500.
     /// Effective value UNKNOWN; initializer uses an inspected builder default or binary zero.
+    /// Runtime controller+0x7e0 default remains UNKNOWN (0x205ead200..210); fallback 0.
     pub o_18e: u8,
     /// Config +0x194.
     /// 0x205eaaa6c..a70, sp+0x1dc.
@@ -419,11 +424,10 @@ pub struct VcrcConfig {
     /// Later-write audit: No later write on the specified no-override path; unchanged. All X/S/V-forced stores excluded. No post-copy write.
     /// Potential writers: 0x205eaaae0, 0x205eabb9c.
     pub o_1d8: u32,
-    /// Config +0x1e0.
-    /// 0x205eaaa2c..a38, sp+0x248.
-    /// Builder zero/copy coordinates: 0x205eaa560..568; 0x2061fb4e8..500.
-    /// Later-write audit: 0x205eaaae4..af4 constructs 0x3f60624dd2f1a9fc and stores at sp+0x228 (config+0x1e0). 0.65 at 0x205eaaa38 belongs to config+0x200.
-    /// Potential writers: 0x205eaaaf4, 0x205eabbbc.
+    /// Config +0x1e0; native role UNKNOWN.
+    /// Effective 0.002: 0x205eaaae4..af4 constructs bits 0x3f60624dd2f1a9fc
+    /// and stores at sp+0x228. The 0.65 store at 0x205eaaa38 is +0x200.
+    /// Later 0x205eabbbc is ServerBag-only; no post-copy write.
     pub o_1e0: f64,
     /// Config +0x1e8.
     /// 0x205eaaa14..a18 copies 8 constant bytes from 0x2066a3900 to sp+0x230; low word bytes 04 00 00 00.
@@ -491,11 +495,11 @@ pub struct VcrcConfig {
     /// Later-write audit: No later write on the specified no-override path; unchanged. All X/S/V-forced stores excluded. No post-copy write.
     /// Potential writers: 0x205eaaa58, 0x205eabe28.
     pub o_298: f64,
-    /// Config +0x2a0.
-    /// Same zero, sp+0x2e8.
-    /// Builder zero/copy coordinates: 0x205eaa560..568; 0x2061fb4e8..500.
-    /// Later-write audit: 0x205eaaa4c..a58: x22=config+0x187, x9=x22+0x111=config+0x298; q0 from 0x2066a3a20 contains 0.0/10.0; high lane reaches config+0x2a0. Override 0x205eaba18 is ServerBag-only.
-    /// Potential writers: 0x205eaaa58, 0x205eaae70, 0x205eaba18.
+    /// Config +0x2a0; native role UNKNOWN.
+    /// Effective 10.0: 0x205eaaa4c..a58 stores q0 through config+0x298;
+    /// high lane comes from 0x2066a3a28 (bits 0x4024000000000000).
+    /// Later 0x205eaba18 is ServerBag-only; 0x205eaae70 is another mode.
+    /// No post-copy write in 0x2061fb4b4..bba0 or 0x205f95c34..cd4.
     pub o_2a0: f64,
     /// Config +0x2d0.
     /// Explicit strb wzr,[sp,#0x318] at 0x205eaa9ec.
@@ -509,11 +513,10 @@ pub struct VcrcConfig {
     /// Later-write audit: No later write on the specified no-override path; unchanged. All X/S/V-forced stores excluded. No post-copy write.
     /// Potential writers: 0x205eab174.
     pub o_2d4: u32,
-    /// Config +0x2d8; RTTThreshold.
-    /// Same zero, sp+0x320.
-    /// Builder zero/copy coordinates: 0x205eaa560..568; 0x2061fb4e8..500.
-    /// Later-write audit: 0x205eaaa5c..a68: x9=x22+0x151=config+0x2d8; q0 from 0x2066a3a30 contains 0.5/0.0. Override 0x205eabe48 is ServerBag-only.
-    /// Potential writers: 0x205eaaa68, 0x205eabe48.
+    /// Config +0x2d8; RTTThreshold in the noRampUp-network ServerBag group.
+    /// Effective 0.5: 0x205eaaa5c..a68 stores q0 through config+0x2d8;
+    /// low lane comes from 0x2066a3a30 (bits 0x3fe0000000000000).
+    /// Later 0x205eabe48 is ServerBag-only; no post-copy write.
     pub o_2d8: f64,
     /// Config +0x2e0; PLRThreshold.
     /// Same zero, sp+0x328.
@@ -615,6 +618,7 @@ pub struct VcrcConfig {
     /// Zero at sp+0x3b8; 0x205eac7d0..804 can set 2 when the hardware predicate and UseSmartBrake feature allow it; 0x205eac874 writes 0 otherwise; stabilized configure can also reset it to 0 if initialization fails.
     /// Builder zero/copy coordinates: 0x205eaa560..568; 0x2061fb4e8..500.
     /// Effective value UNKNOWN; initializer uses an inspected builder default or binary zero.
+    /// Hardware/feature strategy 0 or 2 and post-copy initialization failure remain UNKNOWN (0x205eac7d0..824, 0x2061fb80c); fallback 0.
     pub o_370: u32,
     /// Config +0x3a0.
     /// Output+0x28, high lane of q0 from 0x2066a7640 at 0x2060de4f0; store at output+0x20 by 0x2060de4f4; source constant 0x2066a7648; config copy 0x205ead25c..260.
@@ -640,13 +644,14 @@ pub struct VcrcConfig {
     /// Zero at 0x205eaa560..568, then 0x205eaac68..c6c copies controller+0x7b8 to sp+0x470.
     /// Builder zero/copy coordinates: 0x205eaa560..568; 0x2061fb4e8..500.
     /// Effective value UNKNOWN; initializer uses an inspected builder default or binary zero.
+    /// Runtime controller+0x7b8 byte remains UNKNOWN (0x205eaac68..c6c); fallback 0.
     pub o_428: u8,
 }
 
 /// Wi-Fi camera data profile with a 4084000 bps cap and cold initial tier.
 ///
-/// UNKNOWN effective values use binary defaults, as documented per field.
-/// This constructor must not be interpreted as an audited live Apple config.
+/// Six UNKNOWN runtime inputs use binary defaults, as documented per field.
+/// The static profile is audited; runtime inputs and live behavior are not established.
 pub fn mode1_camera_defaults() -> VcrcConfig {
     VcrcConfig {
         o_8: &TIER_BITRATES,

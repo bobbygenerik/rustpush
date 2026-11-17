@@ -44,3 +44,16 @@ fn copied_thresholds_keep_exact_native_bits() {
     assert_eq!(config.o_3b8.to_bits(), 0x4005999990000000);
     assert_eq!(config.o_3c0.to_bits(), 0x4001fffff8000000);
 }
+
+#[test]
+fn later_write_audit_keeps_alias_stores_and_correct_offset_coordinates() {
+    let config = mode1_camera_defaults();
+    // 0x205eaac04 stores the mild-low tier at +0x24, leaving +0x2c zero.
+    assert_eq!(config.o_2c, 0);
+    // 0x205eaaae4..af4 assembles this literal and stores at sp+0x228.
+    assert_eq!(config.o_1e0.to_bits(), 0x3f60624dd2f1a9fc);
+    // q0 high lane at 0x205eaaa58: constant 0x2066a3a28 -> config+0x2a0.
+    assert_eq!(config.o_2a0.to_bits(), 0x4024000000000000);
+    // q0 low lane at 0x205eaaa68: constant 0x2066a3a30 -> config+0x2d8.
+    assert_eq!(config.o_2d8.to_bits(), 0x3fe0000000000000);
+}
