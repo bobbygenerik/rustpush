@@ -232,6 +232,11 @@ pub struct VcrcConfig {
     /// Later-write audit: No later write on the specified no-override path; unchanged. All X/S/V-forced stores excluded. No post-copy write.
     /// Potential writers: 0x205eaa940, 0x205eab008, 0x205eabcf4.
     pub o_108: f64,
+    /// Config +0x110: send-limited duration read by StabilizedNOWRD UpdateInternalStatistics.
+    /// 0x205eaa95c..96c: q0 from 0x2066a39c0 (1.0; high lane 0x2066a39c8 = 2.0) stored by
+    /// `stur q0, [x8, #0xff]` with x8 = sp+0x59 (0x205eaa968), i.e. sp+0x158 = config+0x110.
+    /// later-write-stores.tsv lists 0x205eaa96c as the only writer of +0x110.
+    pub o_110: f64,
     /// Config +0x118.
     /// 0x205eaa95c..96c: q0 from 0x2066a39c0, high lane at 0x2066a39c8, stored at sp+0x160.
     /// Builder zero/copy coordinates: 0x205eaa560..568; 0x2061fb4e8..500.
@@ -688,6 +693,7 @@ pub fn mode1_camera_defaults() -> VcrcConfig {
         o_f0: 2.0,
         o_f8: -0.05,
         o_108: 0.75,
+        o_110: 1.0,
         o_118: 2.0,
         o_120: 0.5,
         o_128: 0.25,

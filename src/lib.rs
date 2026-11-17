@@ -18,6 +18,7 @@ pub mod feedback_delay;
 pub mod jlag_processor;
 pub mod ltr_ack;
 pub mod vcrc_config;
+pub mod vcrc;
 #[cfg(not(target_arch = "wasm32"))]
 mod evs_decoder;
 pub mod icloud;
