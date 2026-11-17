@@ -4,6 +4,8 @@ mod quality_feedback;
 mod audio_feedback;
 #[path = "avconference_receive_clock.rs"]
 pub mod receive_clock;
+#[path = "audio_receive_diagnostics.rs"]
+mod audio_receive_diagnostics;
 #[path = "avconference_control.rs"]
 mod control_retry;
 #[path = "video_receive_diagnostics.rs"]
@@ -1337,6 +1339,7 @@ pub struct RecvStatTracker {
     last_report: Option<Instant>,
 
     audio_clocks: HashMap<(u64, u32), (Instant, receive_clock::AudioOwrdTracker)>,
+    audio_diagnostics: HashMap<(u64, u32), audio_receive_diagnostics::AudioPacketDiagnostics>,
     audio_history: Vec<FTAudioControlData>,
     audio_history_context: Option<(u64, u64)>, // participant, negotiation generation
     video_receive_counter: CumulativeCounter12,
@@ -1443,6 +1446,7 @@ impl RecvStatTracker {
             last_report: None,
 
             audio_clocks: HashMap::new(),
+            audio_diagnostics: HashMap::new(),
             audio_history: Vec::with_capacity(30),
             audio_history_context: None,
             video_receive_counter: CumulativeCounter12::default(),
@@ -1454,6 +1458,59 @@ impl RecvStatTracker {
             last_feedback_rx: FeedbackLogState::default(),
             video_ctrl_log_count: 0,
             last_video_ctrl_key: None,
+        }
+    }
+
+    // Called only after authentication and after the existing OWRD update.
+    // Observe the unpacked primary block without changing parser/clock/media state.
+    fn log_audio_packet(&mut self, recv: &GlobalPacket, header: &Header,
+        ssrc: &AVSessionSSRC, payload_bytes: usize, unpacked: Option<&[Packet]>) {
+        use audio_receive_diagnostics::{ClockSnapshot, PacketFormat, PacketSample};
+        let key = (ssrc.owner, header.ssrc);
+        let Some((origin, tracker)) = self.audio_clocks.get(&key) else { return };
+        let processor = tracker.processor();
+        let primary = unpacked.and_then(|packets| packets.last());
+        // A framing count is not a codec decode or an Apple DTX/repair classification.
+        let layout = primary.filter(|p| matches!(p.header.payload_type, 104 | 108))
+            .and_then(|p| audio_receive_diagnostics::frame_layout(&p.payload));
+        let owrd_sec = tracker.owrd_or_nan();
+        let sample = PacketSample {
+            sequence: header.sequence_number,
+            timestamp: header.timestamp,
+            arrival_sec: recv.time_parsed.saturating_duration_since(*origin).as_secs_f64(),
+            marker: header.marker,
+            payload_bytes,
+            primary_bytes: primary.map(|p| p.payload.len()),
+            format: PacketFormat {
+                configuration: ssrc.feedback.configuration(),
+                stream_group: ssrc.stream_index,
+                negotiated_stream_id: ssrc.group_stream_ids.get(&header.ssrc).copied(),
+                outer_payload: header.payload_type,
+                primary_payload: primary.map(|p| p.header.payload_type),
+                red_blocks: unpacked.map(|packets| packets.len().saturating_sub(1)),
+            },
+            layout,
+            clock: ClockSnapshot {
+                ts_rate: processor.ts_rate,
+                samples_per_frame: processor.samples_per_frame,
+                ref_sequence: processor.ref_seq,
+                ref_timestamp: processor.ref_timestamp,
+                ref_arrival_sec: processor.ref_arrival_sec,
+                lag_sec: processor.stats_lag,
+                owrd_sec,
+                owrd_q13: receive_clock::pack_q13_delay(owrd_sec),
+                filter_short: processor.owrd_short,
+                filter_long: processor.owrd_long,
+                in_spike: processor.in_spike,
+                packet_counter: processor.packet_counter,
+            },
+        };
+        let observation = self.audio_diagnostics.entry(key).or_default()
+            .observe(self.start_time.elapsed(), sample);
+        if observation.detail || observation.summary.is_some() {
+            info!("[FTAudioRx] ssrc={} detail={} changed={} delta={:?} window={:?} packet={:?}",
+                header.ssrc, observation.detail, observation.changed,
+                observation.delta, observation.summary, sample);
         }
     }
 
@@ -2492,10 +2549,14 @@ impl IncomingFrameHandler {
                     //     unmarshalled.header.ssrc,
                     //     encode_hex(&unmarshalled.payload));
 
+                    let audio_payload_bytes = unmarshalled.payload.len();
                     let mut packets = vec![];
                     
                     if payload == AVSessionPayload::Red {
                         let Some(decoded) = parse_red_audio(&unmarshalled) else {
+                            if !is_group {
+                                stat_tracker.log_audio_packet(&recv, &header, &ssrc, audio_payload_bytes, None);
+                            }
                             warn!("Discarding malformed RED audio for SSRC {}", header.ssrc);
                             continue;
                         };
@@ -2531,6 +2592,9 @@ impl IncomingFrameHandler {
                         packets.push(unmarshalled);
                     }
 
+                    if !is_group && payload.is_audio() {
+                        stat_tracker.log_audio_packet(&recv, &header, &ssrc, audio_payload_bytes, Some(&packets));
+                    }
                     for unmarshalled in packets {
                         let payload_type = unmarshalled.header.payload_type;
                         let Some(channel_type) = ChannelType::from_payload(payload_type) else {
