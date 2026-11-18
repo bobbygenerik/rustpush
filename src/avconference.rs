@@ -1908,7 +1908,7 @@ pub trait TimingTarget: Send + Sync {
 }
 
 /// Feature flag gating real receiver-side probing BWE measurement and reporting in 1:1 calls.
-pub const REPORT_REAL_BWE: bool = false;
+pub const REPORT_REAL_BWE: bool = true;
 
 /// Pack `bandwidthEstimation` (kbps) and `isBWEStable` into the wire `u16` field matching
 /// Apple's `__AVCStatisticsCollector_ComputeBWEstimation` (`0x205ed47b4` at `0x205ed489c..8cc`),
