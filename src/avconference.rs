@@ -2750,6 +2750,8 @@ impl IncomingFrameHandler {
                                     receive_timing: None,
                                     prev_dropped: 0,
                                     metadata: HashMap::new(),
+                                    vra_width: None,
+                                    vra_height: None,
                                     camera_meta: config_camera_meta,
                                     ltr_bits: 0,
                                     ltr_timestamp: None,
@@ -2833,6 +2835,11 @@ impl IncomingFrameHandler {
                                     sample_camera_meta.map(|m| (m.orientation, m.orientation as u8, m.is_back, m.is_mirrored))
                                 );
                             }
+                            let vra_dims = if matches!(channel_type, ChannelType::H264 | ChannelType::H265) {
+                                parse_vra_dimensions(&frame_meta)
+                            } else {
+                                None
+                            };
                             if matches!(channel_type, ChannelType::H264 | ChannelType::H265) {
                                 let rvra1: Option<[u8; 2]> = frame_meta
                                     .get("RVRA1")
@@ -2870,6 +2877,8 @@ impl IncomingFrameHandler {
                                 receive_timing,
                                 prev_dropped: sample.prev_dropped_packets.saturating_sub(sample.prev_padding_packets),
                                 metadata: frame_meta,
+                                vra_width: vra_dims.map(|(w, _)| w),
+                                vra_height: vra_dims.map(|(_, h)| h),
                                 camera_meta: sample_camera_meta,
                                 ltr_bits: popped_control.map(|c| c.ltr_bits).unwrap_or(0),
                                 ltr_timestamp: popped_control.and_then(|c| c.ltr_timestamp),
@@ -4046,9 +4055,33 @@ fn test_fec_header() {
     assert_eq!(header.to_bytes(), data);
 }
 
-fn build_rvra1(width: u32, height: u32) -> [u8; 2] {
-    let width = (width / 8) as u8;
-    let height = (height / 8) as u8;
+pub fn parse_vra_dimensions(metadata: &HashMap<&'static str, Vec<u8>>) -> Option<(u16, u16)> {
+    if let Some(vrae) = metadata.get("VRAE") {
+        if vrae.len() >= 4 {
+            let w = u16::from_be_bytes([vrae[0], vrae[1]]);
+            let h = u16::from_be_bytes([vrae[2], vrae[3]]);
+            if w > 0 && h > 0 {
+                return Some((w, h));
+            }
+        }
+    }
+    if let Some(rvra1) = metadata.get("RVRA1") {
+        if rvra1.len() >= 2 {
+            let w = u16::from(rvra1[0]) << 3;
+            let h = u16::from(rvra1[1]) << 3;
+            if w > 0 && h > 0 {
+                return Some((w, h));
+            }
+        }
+    }
+    None
+}
+
+/// Encode per-frame coded `VRAUsedDimension` as Apple `RVRA1` 8x8 macroblock units
+/// (`sub_22a6a6ba0` / `0x22a721fbc`: `[(w >> 3) as u8, (h >> 3) as u8]`, unswapped coded-frame pixel space).
+pub fn build_rvra1(width: u32, height: u32) -> [u8; 2] {
+    let width = (width >> 3).min(u8::MAX as u32) as u8;
+    let height = (height >> 3).min(u8::MAX as u32) as u8;
     [width, height]
 }
 
@@ -4271,6 +4304,8 @@ pub struct VideoSender {
     fec_number: u16,
     pending_desc: Option<DecoderConfiguration>,
     cached_image_desc: Option<ImageDescription>,
+    /// Latest per-frame coded `VRAUsedDimension` `(width, height)` for `RVRA1`.
+    used_dimensions: Option<(u16, u16)>,
     last_probe: Option<Instant>,
     pub ssrc: u32,
     pub secondary_streams: Vec<u16>,
@@ -4321,7 +4356,38 @@ fn test_video_rtp_clock() {
     assert_eq!(next_video_rtp_timestamp(Some(400), u32::MAX - 399), 401);
 }
 
+/// Select coded-space pixel dimensions for the outgoing `RVRA1` footer.
+///
+/// Apple TX writes `VRAUsedDimension` directly into `[feat+0x8/+0xc]`
+/// (`sub_22a6c8de8`, `0x22a6c8e18..44`) and `sub_22a6a6ba0` shifts `>> 3`
+/// without any portrait `(min, max)` swap; RX crops `CGRect(0, 0, w, h)`
+/// prior to rotation (`sub_22a647238` -> `sub_22a64e538`).
+pub fn select_rvra1_dimensions(used: Option<(u16, u16)>, coded: Option<(u32, u32)>) -> (u32, u32) {
+    match (used, coded) {
+        (Some((uw, uh)), Some((cw, ch))) if uw > 0 && uh > 0 && cw > 0 && ch > 0 => {
+            (u32::from(uw).min(cw), u32::from(uh).min(ch))
+        }
+        (Some((uw, uh)), _) if uw > 0 && uh > 0 => (u32::from(uw), u32::from(uh)),
+        (_, Some((cw, ch))) if cw > 0 && ch > 0 => (cw, ch),
+        _ => (1280, 720),
+    }
+}
+
 impl VideoSender {
+    /// Like [`Self::send_video_frame`], recording per-frame coded
+    /// `VRAUsedDimension` `(width, height)` for the `RVRA1` footer.
+    pub fn send_video_frame_with_used_dimensions(
+        &mut self,
+        frame: ChannelFrame,
+        timestamp: u32,
+        used_dimensions: Option<(u16, u16)>,
+    ) -> Result<(), PushError> {
+        if let Some((w, h)) = used_dimensions.filter(|&(w, h)| w > 0 && h > 0) {
+            self.used_dimensions = Some((w, h));
+        }
+        self.send_video_frame(frame, timestamp)
+    }
+
     /// `timestamp` is already on the 24 kHz audio/capture timebase. The caller
     /// must rescale its full capture timestamp BEFORE crossing the u32 bridge;
     /// a truncated 90 kHz timestamp cannot recover the audio clock's epoch.
@@ -4368,58 +4434,18 @@ impl VideoSender {
                         }
                     }
                 }
-                if self.to_participant.is_some() {
-                    // 1:1 calls: emit the SAME footer format as the group path
-                    // (RVRA1 + CH1 + CR + FA, cf. GROUP_H265_FEATURES). The Mac
-                    // enables RVRA1 ("FLS2;RVRA1;CH1;CR;CF;FA;" - macos
-                    // features) and our PT123 feature string advertises
-                    // RVRA1:1, but this path never sent it, so the Mac had no
-                    // per-frame render-area hint and fell back to landscape
-                    // geometry for portrait streams.
-                    GROUP_H265_FEATURES.add_footer(&mut nal, HashMap::from_iter([
-                        // Advertise the orientation-aware render area so portrait streams
-                        // (coded as 1280x720 with orientation=0) are rendered in a 720x1280 area.
-                        ("RVRA1", {
-                            let (w, h) = self.cached_image_desc.as_ref()
-                                .map(|d| (d.desc.width as u32, d.desc.height as u32))
-                                .unwrap_or((1280, 720));
-                            let (render_w, render_h) = match self.camera_source.orientation {
-                                DeviceOrientation::Portrait | DeviceOrientation::PortraitUpsideDown => {
-                                    (w.min(h), w.max(h))
-                                }
-                                DeviceOrientation::LandscapeLeft | DeviceOrientation::LandscapeRight => {
-                                    (w.max(h), w.min(h))
-                                }
-                            };
-                            build_rvra1(render_w, render_h).to_vec()
-                        }),
-                        ("CH1", vec![0x00, 0x00]),
-                        ("CR", vec![0x00, 0x00, 0x00, 0x00]),
-                        ("FA", vec![0x3e, 0x3e, 0xc0, 0xc0]),
-                    ]));
-                } else {
-                    GROUP_H265_FEATURES.add_footer(&mut nal, HashMap::from_iter([
-                        // FIX GROUP RESOLUTION: advertise the orientation-aware render area
-                        // so portrait streams are not mapped into a landscape render area.
-                        ("RVRA1", {
-                            let (w, h) = self.cached_image_desc.as_ref()
-                                .map(|d| (d.desc.width as u32, d.desc.height as u32))
-                                .unwrap_or((1280, 720));
-                            let (render_w, render_h) = match self.camera_source.orientation {
-                                DeviceOrientation::Portrait | DeviceOrientation::PortraitUpsideDown => {
-                                    (w.min(h), w.max(h))
-                                }
-                                DeviceOrientation::LandscapeLeft | DeviceOrientation::LandscapeRight => {
-                                    (w.max(h), w.min(h))
-                                }
-                            };
-                            build_rvra1(render_w, render_h).to_vec()
-                        }),
-                        ("CH1", vec![0x00, 0x00]),
-                        ("CR", vec![0x00, 0x00, 0x00, 0x00]),
-                        ("FA", vec![0x3e, 0x3e, 0xc0, 0xc0]),
-                    ]));
-                }
+                // Apple VCP TX writes coded-space `VRAUsedDimension` directly
+                // into RVRA1 (`[w >> 3, h >> 3]`, `0x22a6c8de8` -> `0x22a6a6ba0`)
+                // with no portrait `(min, max)` swap; RX crops before rotating.
+                let coded = self.cached_image_desc.as_ref()
+                    .map(|d| (d.desc.width as u32, d.desc.height as u32));
+                let (rvra_w, rvra_h) = select_rvra1_dimensions(self.used_dimensions, coded);
+                GROUP_H265_FEATURES.add_footer(&mut nal, HashMap::from_iter([
+                    ("RVRA1", build_rvra1(rvra_w, rvra_h).to_vec()),
+                    ("CH1", vec![0x00, 0x00]),
+                    ("CR", vec![0x00, 0x00, 0x00, 0x00]),
+                    ("FA", vec![0x3e, 0x3e, 0xc0, 0xc0]),
+                ]));
                 nal
             }
         };
@@ -5891,6 +5917,7 @@ impl AVSession {
             fec_number,
             pending_desc: None,
             cached_image_desc: None,
+            used_dimensions: None,
 
             enabled_features: self.av_config.enabled_features.clone(),
             ssrc,
@@ -7113,6 +7140,8 @@ pub struct ChannelMessage {
     pub frame: ChannelFrame,
     pub prev_dropped: u16,
     pub metadata: HashMap::<&'static str, Vec<u8>>,
+    pub vra_width: Option<u16>,
+    pub vra_height: Option<u16>,
     pub camera_meta: Option<FTVideoCameraStatus>,
     pub ltr_bits: u8,
     pub ltr_timestamp: Option<u32>,
@@ -7162,6 +7191,10 @@ pub struct FTMediaFrameEnvelope {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decode_receipt: Option<u64>,
     pub height: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vra_width: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vra_height: Option<u16>,
     pub camera_orientation: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub camera_status_bits: Option<u8>,
@@ -7295,8 +7328,8 @@ pub struct AVConfig {
     audio_ssrc: u32,
     pub video_streams: HashMap<u32, VcMediaNegotiationBlobV2StreamGroupStream>,
     pub audio_streams: HashMap<u32, VcMediaNegotiationBlobV2StreamGroupStream>,
-    enabled_features: EnabledAVFeatures,
-    supported_features: EnabledAVFeatures,
+    pub enabled_features: EnabledAVFeatures,
+    pub supported_features: EnabledAVFeatures,
     h264_features: EnabledAVFeatures,
     h264_supported: EnabledAVFeatures,
 }
@@ -7372,7 +7405,7 @@ impl AVConfig {
                 },
             ]),
             enabled_features: EnabledAVFeatures::from_str("FLS2;RVRA1;CH1;CR;CF;FA;"),
-            supported_features: EnabledAVFeatures::from_str("FLS2;VRAE;CH1;CR;CF;FA;POS;HTS;EOD;RR;QP;SW;"),
+            supported_features: EnabledAVFeatures::from_str("FLS2;RVRA1;VRAE;CH1;CR;CF;FA;POS;HTS;EOD;RR;QP;SW;"),
             h264_features: EnabledAVFeatures::from_str("FLS2;CH1;CR;FA;"),
             h264_supported: EnabledAVFeatures::from_str("FLS2;CH1;CR;FA;POS;HTS;EOD;RR;QP;SW;"),
         }
@@ -7975,7 +8008,7 @@ static FEATURES: &[AVFeature] = &[
 
 // To the best of my knowledge, for V2 blobs, this is hardcoded as
 // FLS;RVRA1:0;PR;LF:-1;CR:1;CF:2;CH1:3;FA:4;
-static GROUP_H265_FEATURES: LazyLock<EnabledAVFeatures> = LazyLock::new(|| EnabledAVFeatures(vec![
+pub static GROUP_H265_FEATURES: LazyLock<EnabledAVFeatures> = LazyLock::new(|| EnabledAVFeatures(vec![
     &FEATURES[0], // RVRA1
     &FEATURES[3], // CR
     &FEATURES[4], // CF
@@ -8128,7 +8161,7 @@ mod audio_expected_tests {
 }
 
 #[derive(Debug, Clone)]
-struct EnabledAVFeatures(Vec<&'static AVFeature>);
+pub struct EnabledAVFeatures(Vec<&'static AVFeature>);
 
 impl Display for EnabledAVFeatures {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -8143,7 +8176,7 @@ impl EnabledAVFeatures {
         features.get(..2).map(Self::from_bytes)
     }
 
-    fn from_str(features: &str) -> Self {
+    pub fn from_str(features: &str) -> Self {
         let mut result = [false; FEATURES.len()];
         for feature in features.split(";") {
             if feature.is_empty() { continue }
@@ -8156,11 +8189,25 @@ impl EnabledAVFeatures {
         Self::from_bits(&result)
     }
 
+    pub fn has_feature(&self, name: &str) -> bool {
+        self.0.iter().any(|f| f.feature == name)
+    }
+
+    pub fn intersect(&self, other: &Self) -> Self {
+        let a = self.to_bits();
+        let b = other.to_bits();
+        let mut out = [false; FEATURES.len()];
+        for i in 0..FEATURES.len() {
+            out[i] = a[i] && b[i];
+        }
+        Self::from_bits(&out)
+    }
+
     fn from_bits(bits: &[bool]) -> Self {
         Self(bits.iter().take(FEATURES.len()).enumerate().filter(|i| *i.1).map(|(i, _)| &FEATURES[i]).collect())
     }
 
-    fn from_bytes(features: &[u8]) -> Self {
+    pub fn from_bytes(features: &[u8]) -> Self {
         let mut list = vec![false; features.len() * 8];
         for (byte, list) in features.iter().zip(list.chunks_mut(8)) {
             for (idx, feature) in list.iter_mut().enumerate() {
@@ -8179,7 +8226,7 @@ impl EnabledAVFeatures {
         })
     }
 
-    fn to_bytes(&self) -> [u8; (FEATURES.len() + 7) / 8] {
+    pub fn to_bytes(&self) -> [u8; (FEATURES.len() + 7) / 8] {
         let bits = self.to_bits();
         let mut bytes = [0u8; (FEATURES.len() + 7) / 8];
         for (bits, byte) in bits.chunks(8).zip(bytes.iter_mut()) {
@@ -8195,7 +8242,7 @@ impl EnabledAVFeatures {
         Self::from_bits(&self.to_bits().into_iter().zip(peer.to_bits()).map(|(a, b)| a && b).collect::<Vec<_>>())
     }
 
-    fn add_footer(&self, nal: &mut Vec<u8>, mut features: HashMap::<&'static str, Vec<u8>>) {
+    pub fn add_footer(&self, nal: &mut Vec<u8>, mut features: HashMap::<&'static str, Vec<u8>>) {
         let mut ext_buf = vec![];
         let feature_marker = self.0.iter().filter(|i| i.feature != "MLS").enumerate().take(7)
             .fold(0u8, |mut acc, (idx, feature)| {
@@ -8220,7 +8267,7 @@ impl EnabledAVFeatures {
         }
     }
 
-    fn parse_frame<'a>(&self, decode: &'a [u8]) -> Option<(&'a [u8], HashMap::<&'static str, Vec<u8>>)> {
+    pub fn parse_frame<'a>(&self, decode: &'a [u8]) -> Option<(&'a [u8], HashMap::<&'static str, Vec<u8>>)> {
         let ctrl = *decode.last()? as usize;
 
         let frame_features = self.0.iter().filter(|i| i.feature != "MLS").enumerate().take(7).filter(|(idx, feature)| 

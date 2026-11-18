@@ -786,6 +786,8 @@ impl FTClient {
                     decode_receipt,
                     width,
                     height,
+                    vra_width: msg.vra_width,
+                    vra_height: msg.vra_height,
                     camera_orientation: msg.camera_meta.map(|m| m.orientation as u8),
                     camera_status_bits: msg.camera_meta.map(|m| m.encode() | 0x80),
                     receive_timing: msg.receive_timing.clone(),
