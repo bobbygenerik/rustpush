@@ -7090,6 +7090,13 @@ pub struct FTMediaFrameEnvelope {
     pub is_configuration: bool,
     #[serde(default)]
     pub ltr_refresh: bool,
+    /// Frame carries an LTR token (ltr_bits & 1, ltr_timestamp != 0). Apple's
+    /// `__VideoReceiver_DecoderCallback` checks this on every decoded frame
+    /// (0x205fefa88..0x205fefcb4) and reaches `_VideoTransmitter_SendLTRACK`
+    /// (0x205ff0694) with no time sampling, so the decoder must report this
+    /// frame's output instead of relying on the 500 ms output sample.
+    #[serde(default)]
+    pub ltr_ack_output: bool,
     pub timestamp: u32,
     pub width: Option<i32>,
     /// App-local decoder ownership token; never part of RTP or hosted signaling.

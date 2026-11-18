@@ -779,6 +779,9 @@ impl FTClient {
                     codec,
                     is_configuration: matches!(msg.frame, ChannelFrame::Configuration(_)),
                     ltr_refresh,
+                    ltr_ack_output: is_video && !configuration && decode_receipt.is_some()
+                        && (msg.ltr_bits & 1) != 0
+                        && msg.ltr_timestamp.is_some_and(|ts| ts != 0),
                     timestamp: msg.timestamp,
                     decode_receipt,
                     width,
