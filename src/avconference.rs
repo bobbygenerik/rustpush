@@ -2252,6 +2252,41 @@ pub enum AVInternalMessage {
     RateFeedback(u64, u64, u16, Vec<u8>, f64),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IncomingVraKey {
+    is_group: bool,
+    payload_type: u8,
+    footer_control: Option<u8>,
+    rvra1: Option<[u8; 2]>,
+    vrae: Option<[u8; 4]>,
+}
+
+/// Rate-limited, change-only state for logging incoming VRA feature trailer fields
+/// (`RVRA1` 8px units `0x22a721ca8..c0`, `VRAE` BE u16 px `0x22a721cd8..f0`).
+#[derive(Default)]
+struct IncomingVraLogState {
+    last_key: Option<IncomingVraKey>,
+    last_logged_at: Option<std::time::Instant>,
+}
+
+impl IncomingVraLogState {
+    const MIN_INTERVAL: Duration = Duration::from_millis(500);
+
+    fn should_log(&mut self, key: IncomingVraKey, now: std::time::Instant) -> bool {
+        if self.last_key == Some(key) {
+            return false;
+        }
+        if let Some(prev) = self.last_logged_at {
+            if now.duration_since(prev) < Self::MIN_INTERVAL {
+                return false;
+            }
+        }
+        self.last_key = Some(key);
+        self.last_logged_at = Some(now);
+        true
+    }
+}
+
 pub struct IncomingFrameHandler {
     target_video: std::sync::mpsc::SyncSender<IncomingFrameCommand>,
     target_audio: std::sync::mpsc::SyncSender<IncomingFrameCommand>,
@@ -2314,6 +2349,7 @@ impl IncomingFrameHandler {
         let mut video_nacks = HashMap::<u32, (i64, video_nack::VideoNackGenerator)>::new();
         let mut last_config_camera_meta: Option<FTVideoCameraStatus> = None;
         let mut last_sample_camera_meta: Option<FTVideoCameraStatus> = None;
+        let mut vra_log_state = IncomingVraLogState::default();
         let mut retry_enqueue_after = Duration::ZERO;
         let mut video_rx_bytes_1s: u64 = 0;
         let mut video_rx_pkts_1s: u64 = 0;
@@ -2796,6 +2832,29 @@ impl IncomingFrameHandler {
                                     "[FTVideo] sample camera_meta changed: {:?}",
                                     sample_camera_meta.map(|m| (m.orientation, m.orientation as u8, m.is_back, m.is_mirrored))
                                 );
+                            }
+                            if matches!(channel_type, ChannelType::H264 | ChannelType::H265) {
+                                let rvra1: Option<[u8; 2]> = frame_meta
+                                    .get("RVRA1")
+                                    .and_then(|v| v.as_slice().try_into().ok());
+                                let vrae: Option<[u8; 4]> = frame_meta
+                                    .get("VRAE")
+                                    .and_then(|v| v.as_slice().try_into().ok());
+                                let key = IncomingVraKey {
+                                    is_group,
+                                    payload_type,
+                                    footer_control,
+                                    rvra1,
+                                    vrae,
+                                };
+                                if vra_log_state.should_log(key, std::time::Instant::now()) {
+                                    let rvra1_px = rvra1.map(|[w, h]| (u16::from(w) << 3, u16::from(h) << 3));
+                                    let vrae_px = vrae.map(|[w0, w1, h0, h1]| (u16::from_be_bytes([w0, w1]), u16::from_be_bytes([h0, h1])));
+                                    info!(
+                                        "[FTVideoVRA] ssrc={} pt={} is_group={} ctrl={:?} rvra1={:?} ({:?}px) vrae={:?} ({:?}px)",
+                                        header_ssrc, payload_type, is_group, footer_control, rvra1, rvra1_px, vrae, vrae_px
+                                    );
+                                }
                             }
                             incoming_handler.read().unwrap().handle(ChannelMessage {
                                 participant: ssrc.owner,
@@ -8006,6 +8065,28 @@ mod frame_feature_tests {
         let (payload, metadata) = features.parse_frame(&[101, 165, 90, 1]).unwrap();
         assert_eq!(payload, &[101]);
         assert_eq!(metadata.get("RVRA1").map(Vec::as_slice), Some(&[165, 90][..]));
+    }
+
+    #[test]
+    fn incoming_vra_log_state_is_change_only_and_rate_limited() {
+        let mut state = IncomingVraLogState::default();
+        let t0 = std::time::Instant::now();
+        let k1 = IncomingVraKey {
+            is_group: false,
+            payload_type: 100,
+            footer_control: Some(0x1f),
+            rvra1: Some([160, 90]),
+            vrae: None,
+        };
+        assert!(state.should_log(k1, t0));
+        // Same value does not re-log even after the rate limit expires.
+        assert!(!state.should_log(k1, t0 + Duration::from_secs(2)));
+        // Distinct value within 500ms is suppressed.
+        let k2 = IncomingVraKey { rvra1: Some([120, 68]), ..k1 };
+        assert!(!state.should_log(k2, t0 + Duration::from_millis(100)));
+        // Distinct value after 500ms logs and updates last_key.
+        assert!(state.should_log(k2, t0 + Duration::from_millis(500)));
+        assert!(!state.should_log(k2, t0 + Duration::from_secs(5)));
     }
 }
 
