@@ -4317,6 +4317,8 @@ pub struct VideoSender {
     last_key_frame: Option<Vec<u8>>,
     last_timestamp: Option<u32>,
     last_key_request: Option<Instant>,
+    /// TX LTR `(token, rtp_ts)` ring + RTT EWMA (`LtrTxTracker`).
+    ltr_tx: crate::ltr_tx::LtrTxTracker,
     /// RTCP Sender Report accounting: without periodic SRs the peer cannot
     /// map our RTP timestamps to its playout clock and discards every frame
     /// as "too old" (observed as a constant ~19s playout delta on Apple
@@ -4382,16 +4384,54 @@ impl VideoSender {
         timestamp: u32,
         used_dimensions: Option<(u16, u16)>,
     ) -> Result<(), PushError> {
+        self.send_video_frame_with_metadata(frame, timestamp, used_dimensions, None, None)
+    }
+
+    /// Send a video frame with optional VRA used dimensions and TX LTR metadata
+    /// (`ltr_bits`: bit 0 = mark LTR awaiting ACK, bit 1 = LTR refresh; `ltr_token`: correlation token).
+    pub fn send_video_frame_with_metadata(
+        &mut self,
+        frame: ChannelFrame,
+        timestamp: u32,
+        used_dimensions: Option<(u16, u16)>,
+        ltr_bits: Option<u8>,
+        ltr_token: Option<u32>,
+    ) -> Result<(), PushError> {
         if let Some((w, h)) = used_dimensions.filter(|&(w, h)| w > 0 && h > 0) {
             self.used_dimensions = Some((w, h));
         }
-        self.send_video_frame(frame, timestamp)
+        self.send_video_frame_inner(frame, timestamp, ltr_bits, ltr_token)
+    }
+
+    /// Consume an inbound RTCP PSFB `FMT=15` Type-5 LTR ACK (`_VideoTransmitter_ACKLTRFrame` `0x206025638`).
+    pub fn handle_ltr_ack(&mut self, acked_rtp_ts: u32) -> Option<crate::ltr_tx::LtrAckEvent> {
+        self.ltr_tx.ack_rtp_timestamp(acked_rtp_ts, std::time::Instant::now())
+    }
+
+    /// Pick the newest confirmed ACKed LTR token for `FIRType == 2` refresh, or `None` -> IDR fallback.
+    pub fn select_ltr_refresh_token(&mut self) -> Option<u32> {
+        self.ltr_tx.select_refresh_token(std::time::Instant::now())
+    }
+
+    /// Bypass local FIR request throttling when `FIRType == 4`.
+    pub fn clear_key_request_throttle(&mut self) {
+        self.last_key_request = None;
     }
 
     /// `timestamp` is already on the 24 kHz audio/capture timebase. The caller
     /// must rescale its full capture timestamp BEFORE crossing the u32 bridge;
     /// a truncated 90 kHz timestamp cannot recover the audio clock's epoch.
     pub fn send_video_frame(&mut self, frame: ChannelFrame, timestamp: u32) -> Result<(), PushError> {
+        self.send_video_frame_inner(frame, timestamp, None, None)
+    }
+
+    fn send_video_frame_inner(
+        &mut self,
+        frame: ChannelFrame,
+        timestamp: u32,
+        ltr_bits_override: Option<u8>,
+        ltr_token: Option<u32>,
+    ) -> Result<(), PushError> {
         let mut is_key_frame = false;
         let mut nal = match frame {
             ChannelFrame::Configuration(desc) => {
@@ -4527,11 +4567,14 @@ impl VideoSender {
             self.last_probe = Some(Instant::now());
         }
 
+        let effective_ltr_bits = ltr_bits_override
+            .map(|bits| bits & (crate::ltr_tx::LTR_BIT_MARK | crate::ltr_tx::LTR_BIT_REFRESH))
+            .unwrap_or_else(|| if desc.is_some() { crate::ltr_tx::LTR_BIT_MARK } else { 0 });
         let mut payloads_len = payloads.len();
         let extension = FTVideoControlData {
             version: if self.to_participant.is_some() { 2 } else { 1 },
             camera_status: self.camera_source,
-            ltr_bits: if desc.is_some() { 1 } else { 0 },
+            ltr_bits: effective_ltr_bits,
             total_packets_per_frame: Some((payloads.len() - if matches!(&desc, Some(DecoderConfiguration::ImageDescription(_))) { 1 } else { 0 }) as u16),
             frame_sequence_number: Some(self.frame_number),
             ..Default::default()
@@ -4753,6 +4796,8 @@ impl VideoSender {
                 }
             }
         }
+
+        self.ltr_tx.record_sent(is_key_frame, effective_ltr_bits, ltr_token, timestamp, std::time::Instant::now());
 
         Ok(())
     }
@@ -5596,7 +5641,7 @@ impl AVSession {
                         match cmd {
                             AVControlCommand::AVControl { participant, data } => {
                                 if let VCControlData::GenerateKeyFrame(fir) = &data {
-                                    info!("Got FIR from participant {participant}: stream_id={} stream_group_id={}", fir.stream_id, fir.stream_group_id);
+                                    info!("Got FIR from participant {participant}: stream_id={} stream_group_id={} fir_type={}", fir.stream_id, fir.stream_group_id, fir.fir_type);
                                     {
                                         let mut cache = PEER_FIR_PARAMS.lock().unwrap();
                                         cache.insert(participant as u64, (fir.stream_id, fir.stream_group_id));
@@ -5608,14 +5653,36 @@ impl AVSession {
                                     {
                                         let mut sender = session.video_sender.lock().await;
                                         if let Some(sender) = sender.as_mut() {
-                                            match sender.resend_key_frame(|| publish_encoder_control("requestKeyFrame", None)) {
-                                                Ok(true) => {
-                                                    info!("FIR from {participant}: requested fresh encoder IDR; cached replay attempted if available");
+                                            if fir.fir_type == crate::ltr_tx::FIR_TYPE_LTR_REFRESH {
+                                                if let Some(token) = sender.select_ltr_refresh_token() {
+                                                    info!("[FTLtrTx] FIRType=2 from {participant}: requesting LTR refresh token={token}");
+                                                    publish_encoder_control_ltr(
+                                                        Some((&session.session_id, session.encoder_instance)),
+                                                        "requestLtrRefresh",
+                                                        Some(token),
+                                                        None,
+                                                    );
+                                                } else {
+                                                    info!("[FTLtrTx] FIRType=2 from {participant}: no ACKed LTR token; falling back to IDR");
+                                                    match sender.resend_key_frame(|| publish_encoder_control("requestKeyFrame", None)) {
+                                                        Ok(true) => info!("FIR from {participant}: requested fresh encoder IDR (LTR fallback)"),
+                                                        Ok(false) => info!("FIR from {participant}: within local request budget, not re-requesting"),
+                                                        Err(e) => warn!("Keyframe replay failed after LTR fallback: {e}"),
+                                                    }
                                                 }
-                                                Ok(false) => {
-                                                    info!("FIR from {participant}: within local request budget, not re-requesting");
+                                            } else {
+                                                if fir.fir_type == crate::ltr_tx::FIR_TYPE_FORCE_IDR_UNTHROTTLED {
+                                                    sender.clear_key_request_throttle();
                                                 }
-                                                Err(e) => warn!("Keyframe replay failed after requesting fresh encoder output: {e}"),
+                                                match sender.resend_key_frame(|| publish_encoder_control("requestKeyFrame", None)) {
+                                                    Ok(true) => {
+                                                        info!("FIR from {participant}: requested fresh encoder IDR; cached replay attempted if available");
+                                                    }
+                                                    Ok(false) => {
+                                                        info!("FIR from {participant}: within local request budget, not re-requesting");
+                                                    }
+                                                    Err(e) => warn!("Keyframe replay failed after requesting fresh encoder output: {e}"),
+                                                }
                                             }
                                         }
                                     }
@@ -5936,6 +6003,7 @@ impl AVSession {
             last_key_frame: None,
             last_timestamp: None,
             last_key_request: None,
+            ltr_tx: crate::ltr_tx::LtrTxTracker::new(),
         })
     }
 
@@ -6278,12 +6346,32 @@ impl AVSession {
                         let header = packet.header();
                         if header.packet_type == rtc_rtcp::header::PacketType::PayloadSpecificFeedback
                             && header.count == 15 {
-                            // Decode the native bounded layouts for diagnosis.
-                            // No encoder reference ACK or bitrate action is
-                            // fabricated from these opposite-direction reports.
                             let media = raw.0.get(8..12).map(|s| u32::from_be_bytes(s.try_into().unwrap()));
                             let feedback = facetime_rtcp::application_feedback(raw.0.as_ref())?;
-                            info!("FaceTime RTCP application feedback: bytes={} media_ssrc={media:?} feedback={feedback:?} unhandled=true", raw.0.len());
+                            if let facetime_rtcp::ApplicationFeedback::LtrAck { timestamp } = feedback {
+                                let ack_event = {
+                                    let mut sender = self.video_sender.lock().await;
+                                    sender.as_mut()
+                                        .filter(|s| media.is_none() || media == Some(s.ssrc))
+                                        .and_then(|s| s.handle_ltr_ack(timestamp))
+                                };
+                                if let Some(ev) = ack_event {
+                                    info!(
+                                        "[FTLtrTx] PSFB Type-5 ACK: media_ssrc={media:?} token={} rtp_ts={} sample_ms={:.1} rtt_ewma_ms={}",
+                                        ev.token, ev.rtp_ts, ev.sample_ms, ev.rtt_ms
+                                    );
+                                    publish_encoder_control_ltr(
+                                        Some((&self.session_id, self.encoder_instance)),
+                                        "ltrAck",
+                                        Some(ev.token),
+                                        Some(ev.rtt_ms),
+                                    );
+                                } else {
+                                    info!("FaceTime RTCP LtrAck: media_ssrc={media:?} rtp_ts={timestamp} unmatched=true");
+                                }
+                            } else {
+                                info!("FaceTime RTCP application feedback: bytes={} media_ssrc={media:?} feedback={feedback:?} unhandled=true", raw.0.len());
+                            }
                             continue;
                         }
                     }
@@ -7235,15 +7323,21 @@ pub struct FTEncoderControlEnvelope {
     /// Distinguishes successive calls which reuse a conversation GUID.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instance: Option<u64>,
-    /// "requestKeyFrame" | "setBitrate"
+    /// "requestKeyFrame" | "setBitrate" | "requestLtrRefresh" | "ltrAck"
     pub action: String,
     /// Present for setBitrate: target bits per second.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bits_per_second: Option<u64>,
+    /// Present for requestLtrRefresh and ltrAck: TX LTR correlation token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ltr_token: Option<u32>,
+    /// Present for ltrAck: EWMA RTT estimate in ms.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rtt_ms: Option<u32>,
 }
 
 static ENCODER_CONTROL: LazyLock<broadcast::Sender<FTEncoderControlEnvelope>> = LazyLock::new(|| {
-    let (sender, _) = broadcast::channel(16);
+    let (sender, _) = broadcast::channel(64);
     sender
 });
 
@@ -7270,7 +7364,12 @@ pub fn subscribe_encoder_controls() -> broadcast::Receiver<FTEncoderControlEnvel
 
 pub fn publish_encoder_control_for_session(guid: &str, instance: u64, action: &'static str, bits_per_second: Option<u64>) {
     let _ = ENCODER_CONTROL.send(FTEncoderControlEnvelope {
-        guid: Some(guid.to_owned()), instance: Some(instance), action: action.to_string(), bits_per_second,
+        guid: Some(guid.to_owned()),
+        instance: Some(instance),
+        action: action.to_string(),
+        bits_per_second,
+        ltr_token: None,
+        rtt_ms: None,
     });
 }
 
@@ -7280,6 +7379,24 @@ pub fn publish_encoder_control(action: &'static str, bits_per_second: Option<u64
         instance: None,
         action: action.to_string(),
         bits_per_second,
+        ltr_token: None,
+        rtt_ms: None,
+    });
+}
+
+pub fn publish_encoder_control_ltr(
+    session: Option<(&str, u64)>,
+    action: &'static str,
+    ltr_token: Option<u32>,
+    rtt_ms: Option<u32>,
+) {
+    let _ = ENCODER_CONTROL.send(FTEncoderControlEnvelope {
+        guid: session.map(|(g, _)| g.to_owned()),
+        instance: session.map(|(_, i)| i),
+        action: action.to_string(),
+        bits_per_second: None,
+        ltr_token,
+        rtt_ms,
     });
 }
 
