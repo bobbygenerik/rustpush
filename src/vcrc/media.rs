@@ -31,6 +31,10 @@ pub struct PacketLossOutput {
 }
 
 pub trait MediaController {
+    /// Host diagnostics only. Called immediately before the native status clear
+    /// at 0x205f964f0..504; the default observer has no effect on rate control.
+    fn observe_decision(&mut self, _state: &super::state::VcrcState) {}
+
     /// `VCRateControlMediaController_IsAudioOnly` 0x20604c700.
     fn is_audio_only(&self) -> bool;
     /// `VCRateControlMediaController_LastVideoRefreshFrameTime` 0x20604e9fc, seconds.

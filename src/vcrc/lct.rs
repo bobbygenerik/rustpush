@@ -454,6 +454,7 @@ impl VcrcState {
         }
         self.update_target_bitrate_vcrc(now);
         self.post_state_transition_updates(mc.as_deref_mut());
+        if let Some(m) = mc { m.observe_decision(self); }
         // 0x205f964f0..504: statuses cleared after every successful round.
         self.ramp_up_status = 0;
         self.ramp_down_status = 0;

@@ -2,6 +2,38 @@
 mod quality_feedback;
 #[path = "avconference_feedback.rs"]
 mod audio_feedback;
+#[path = "avconference_rate.rs"]
+pub mod sender_rate;
+
+/// A/B switch; only U1 camera calls use the port (24A446 0x205ead53c).
+pub const USE_APPLE_VCRC: bool = true;
+type SenderRateHandle = Arc<std::sync::Mutex<(u64, Option<sender_rate::SenderRateController>)>>;
+
+fn packet_uses_ipv6(link: &GlobalLink) -> bool {
+    link.current_direct_socket.read().unwrap().as_ref()
+        .map_or(link.relay_addr.is_ipv6(), |(_, peer)| peer.is_ipv6())
+}
+fn account_rate_enqueue(rate: &SenderRateHandle, generation: u64, audio: bool, len: usize, ipv6: bool) {
+    let mut lock = rate.lock().unwrap();
+    if lock.0 != generation { return; }
+    if let Some(controller) = &mut lock.1 {
+        controller.media.enqueue(audio, len as u16, ipv6, duration_since_epoch().as_secs_f64());
+    }
+}
+fn account_rate_send(rate: &SenderRateHandle, generation: u64, audio: bool, len: usize, ipv6: bool, stamp: Option<u16>) {
+    let mut lock = rate.lock().unwrap();
+    if lock.0 != generation { return; }
+    if let Some(controller) = &mut lock.1 {
+        controller.media.sent(audio, len as u16, ipv6, stamp, duration_since_epoch().as_secs_f64());
+    }
+}
+fn account_rate_refresh(rate: &SenderRateHandle, generation: u64) {
+    let mut lock = rate.lock().unwrap();
+    if lock.0 != generation { return; }
+    if let Some(controller) = &mut lock.1 {
+        controller.media.last_refresh = duration_since_epoch().as_secs_f64();
+    }
+}
 #[path = "avconference_receive_clock.rs"]
 pub mod receive_clock;
 #[path = "audio_receive_diagnostics.rs"]
@@ -1585,6 +1617,7 @@ impl RecvStatTracker {
     }
 
     fn track(&mut self, recv: &GlobalPacket, header: &Header, elapsed_packets: u16, callback: &tokio::sync::mpsc::Sender<AVInternalMessage>, ssrc: &AVSessionSSRC, is_group: bool) -> Result<Option<FTVideoControlData>, ()> {
+        let feedback_receive_time = duration_since_epoch().as_secs_f64();
         let payload = AVSessionPayload::from_id(header.payload_type as u32).ok_or(())?;
         // Reject malformed video metadata before frame accounting. The caller
         // must drop the packet, not mistake a failed FEC parse for plain video.
@@ -1718,6 +1751,13 @@ impl RecvStatTracker {
                             None,
                             None,
                         );
+                        // Native per-message entry 0x205eb9fb8..9ff8 -> 0x205eb83c8.
+                        // Keep arrival time, not the later 500 ms aggregate report time.
+                        if USE_APPLE_VCRC && !is_group {
+                            let _ = callback.try_send(AVInternalMessage::RateFeedback(
+                                ssrc.owner, feedback_configuration, header.extension_profile,
+                                header.extensions[0].payload.to_vec(), feedback_receive_time));
+                        }
                         // info!("Audio data {data:?}");
                         if let Some(time) = data.current_send_timestamp {
                             self.stats.last_feedback.store(time, Ordering::Relaxed);
@@ -2209,6 +2249,7 @@ pub enum AVInternalMessage {
     Rtcp(GlobalPacket),
     RtcpOutgoing(i64, BytesMut),
     Stats(bool /* audio */, IncomingReport),
+    RateFeedback(u64, u64, u16, Vec<u8>, f64),
 }
 
 pub struct IncomingFrameHandler {
@@ -4162,6 +4203,7 @@ fn balanced_chunks<T>(
 }
 
 pub struct VideoSender {
+    sender_rate: SenderRateHandle,
     hevc: HevcPayloader,
     context: Context,
     frame_number: u16,
@@ -4492,6 +4534,9 @@ impl VideoSender {
         let pace_enabled = self.to_participant.is_some() && payloads.len() > PACE_INITIAL_BURST;
         let pace_handle = if pace_enabled { tokio::runtime::Handle::try_current().ok() } else { None };
         let mut deferred: Vec<GlobalLinkOutgoingPacket> = vec![];
+        let rate_generation = self.sender_rate.lock().unwrap().0;
+        let ipv6 = packet_uses_ipv6(&self.link);
+        let mut refresh_pending = self.to_participant.is_some() && is_key_frame;
         for (idx, payload) in payloads.into_iter().enumerate() {
             // info!("SEnding video payload {}", encode_hex(&payload));
 
@@ -4542,6 +4587,9 @@ impl VideoSender {
                 packet: encrypted,
             };
             
+            if self.to_participant.is_some() {
+                account_rate_enqueue(&self.sender_rate, rate_generation, false, p.packet.len(), ipv6);
+            }
             if is_data {
                 self.sequence_number = self.sequence_number.wrapping_add(1);
                 self.packet_buffer.lock().unwrap().add_packet(packet.header.sequence_number, p.clone(), self.frame_number, self.probe_number, self.fec_number);
@@ -4553,7 +4601,14 @@ impl VideoSender {
                 deferred.push(p);
             } else {
                 match self.link.send(&p) {
-                    Ok(()) => self.feedback.record_video_sent(),
+                    Ok(()) => {
+                        self.feedback.record_video_sent();
+                        if self.to_participant.is_some() { account_rate_send(&self.sender_rate, rate_generation, false, p.packet.len(), ipv6, None); }
+                        if refresh_pending {
+                            account_rate_refresh(&self.sender_rate, rate_generation);
+                            refresh_pending = false;
+                        }
+                    },
                     Err(e) => warn!("Failed to send video packet {e}!"),
                 }
             }
@@ -4563,6 +4618,7 @@ impl VideoSender {
         if let (Some(handle), false) = (pace_handle, deferred.is_empty()) {
             let link = self.link.clone();
             let feedback = self.feedback.clone();
+            let sender_rate = self.sender_rate.clone();
             let per_tick = deferred.len().div_ceil(PACE_TICKS).max(2);
             handle.spawn(async move {
                 let mut iter = deferred.into_iter().peekable();
@@ -4570,7 +4626,14 @@ impl VideoSender {
                     sleep(Duration::from_millis(1)).await;
                     for p in iter.by_ref().take(per_tick) {
                         match link.send(&p) {
-                            Ok(()) => feedback.record_video_sent(),
+                            Ok(()) => {
+                                feedback.record_video_sent();
+                                account_rate_send(&sender_rate, rate_generation, false, p.packet.len(), packet_uses_ipv6(&link), None);
+                                if refresh_pending {
+                                    account_rate_refresh(&sender_rate, rate_generation);
+                                    refresh_pending = false;
+                                }
+                            },
                             Err(e) => warn!("Failed to send paced video packet {e}!"),
                         }
                     }
@@ -4652,6 +4715,7 @@ impl VideoSender {
 const AFRC_LOG_INTERVAL_PACKETS: u16 = 50;
 
 pub struct AudioSender {
+    sender_rate: SenderRateHandle,
     context: Context,
     sequence_number: u16,
     is_first: bool,
@@ -4832,6 +4896,8 @@ impl AudioSender {
 
         let feedback_stamp = (self.is_u1 && ext.1.len() >= 10)
             .then(|| u16::from_be_bytes([ext.1[8], ext.1[9]]));
+        let rate_generation = self.sender_rate.lock().unwrap().0;
+        let ipv6 = packet_uses_ipv6(&self.link);
         let packet = Packet {
             header: Header {
                 version: 2,
@@ -4874,7 +4940,11 @@ impl AudioSender {
         if false {
             warn!("Dropping packet {}", self.sequence_number);
         } else {
+            if self.is_u1 {
+                account_rate_enqueue(&self.sender_rate, rate_generation, true, p.packet.len(), ipv6);
+            }
             self.link.send(&p)?;
+            if self.is_u1 { account_rate_send(&self.sender_rate, rate_generation, true, p.packet.len(), ipv6, feedback_stamp); }
             if let Some(stamp) = feedback_stamp { self.feedback.record_audio_sent(stamp); }
         }
         Ok(())
@@ -4952,6 +5022,9 @@ pub struct AVSession {
 
     ssrc_packet_buffer: std::sync::Mutex<HashMap<u32, Arc<std::sync::Mutex<AVChannelHistory>>>>,
     u1: AtomicBool,
+    is_video_call: AtomicBool,
+    encoder_instance: u64,
+    sender_rate: SenderRateHandle,
 
     /// Lazily-created outgoing video sender, cached for the lifetime of the
     /// session so RTP sequence numbers stay monotonic across frames.
@@ -4968,6 +5041,15 @@ pub struct AVSession {
     video_receiver_visible: AtomicBool,
     ltr_ack_sender_ssrc: u32,
     ltr_ack_log_count: AtomicU64,
+}
+
+impl Drop for AVSession {
+    fn drop(&mut self) {
+        let mut initial = ENCODER_INITIAL_TARGETS.lock().unwrap();
+        if initial.get(&self.session_id).is_some_and(|(instance, _)| *instance == self.encoder_instance) {
+            initial.remove(&self.session_id);
+        }
+    }
 }
 
 impl AVSession {
@@ -5192,6 +5274,11 @@ impl AVSession {
 
             // will automatically upgrade to u1 if we end up being the only person in a 3-way call
             u1: AtomicBool::new(participants.len() <= 2),
+            is_video_call: AtomicBool::new(video_enabled),
+            encoder_instance: NEXT_ENCODER_INSTANCE.fetch_add(1, Ordering::Relaxed),
+            sender_rate: Arc::new(std::sync::Mutex::new((0,
+                (USE_APPLE_VCRC && participants.len() <= 2 && video_enabled)
+                    .then(|| sender_rate::SenderRateController::new(false, duration_since_epoch().as_secs_f64()))))),
 
             video_sender: tokio::sync::Mutex::new(None),
             audio_sender: tokio::sync::Mutex::new(None),
@@ -5202,6 +5289,12 @@ impl AVSession {
             ltr_ack_sender_ssrc: rand::random(),
             ltr_ack_log_count: AtomicU64::new(0),
         });
+
+        publish_encoder_initial_target(&new_session.session_id, new_session.encoder_instance,
+            new_session.sender_rate.lock().unwrap().1.as_ref().map(|rate| rate.state.target_bitrate as u64));
+        if let Some(rate) = &new_session.sender_rate.lock().unwrap().1 {
+            let _ = new_session.control_sender.try_send(AVControlCommand::SelectVideoBitrate(rate.state.target_bitrate as usize));
+        }
 
         let avc_mat_id: [u8; 20] = rand::random();
 
@@ -5451,8 +5544,11 @@ impl AVSession {
                                 }
                             }
                             AVControlCommand::SelectVideoBitrate(bps) => {
+                                if !session.u1.load(Ordering::Relaxed) { continue; }
+                                if USE_APPLE_VCRC && session.sender_rate.lock().unwrap().1.as_ref()
+                                    .is_some_and(|rate| rate.state.target_bitrate as usize != bps) { continue; }
                                 info!("SelectVideoBitrate {bps} bps from U1 controller -> requesting encoder update");
-                                publish_encoder_control("setBitrate", Some(bps as u64));
+                                publish_encoder_control_for_session(&session.session_id, session.encoder_instance, "setBitrate", Some(bps as u64));
                             }
                             _ => {}
                         }
@@ -5513,6 +5609,20 @@ impl AVSession {
     async fn update_u1(&self, u1: bool) -> Result<(), PushError> {
         info!("Setting U1 state to {u1}");
         self.u1.store(u1, Ordering::Relaxed);
+        let video_enabled = self.state.lock().await.video_enabled;
+        {
+            let mut rate = self.sender_rate.lock().unwrap();
+            rate.0 = rate.0.wrapping_add(1);
+            rate.1 = (USE_APPLE_VCRC && u1 && self.is_video_call.load(Ordering::Relaxed))
+                .then(|| {
+                    let mut controller = sender_rate::SenderRateController::new(false, duration_since_epoch().as_secs_f64());
+                    controller.media.video_stopped = !video_enabled;
+                    controller
+                });
+            if let Some(controller) = &rate.1 {
+                let _ = self.control_sender.try_send(AVControlCommand::SelectVideoBitrate(controller.state.target_bitrate as usize));
+            }
+        }
         if u1 {
             let _ = self.control_sender.try_send(AVControlCommand::SelectStreams { video_streams: vec![None], audio_streams: vec![None] });
         } else {
@@ -5527,6 +5637,17 @@ impl AVSession {
     pub async fn set_video_enabled(&self, video: bool) -> Result<(), PushError> {
         let mut data = self.state.lock().await;
         data.video_enabled = video;
+        if video && !self.is_video_call.swap(true, Ordering::Relaxed)
+            && USE_APPLE_VCRC && self.u1.load(Ordering::Relaxed) {
+            let mut rate = self.sender_rate.lock().unwrap();
+            rate.0 = rate.0.wrapping_add(1);
+            let controller = sender_rate::SenderRateController::new(false, duration_since_epoch().as_secs_f64());
+            let _ = self.control_sender.try_send(AVControlCommand::SelectVideoBitrate(controller.state.target_bitrate as usize));
+            rate.1 = Some(controller);
+        }
+        if let Some(controller) = &mut self.sender_rate.lock().unwrap().1 {
+            controller.media.video_stopped = !video;
+        }
         drop(data);
         self.send_stream_groups_state(None).await
     }
@@ -5605,8 +5726,14 @@ impl AVSession {
         }
         let feedback = to_participant.map(|p| state.encryption_states.entry(p as u64)
             .or_default().feedback.clone()).unwrap_or_default();
+        if group_stream.is_none() {
+            if let Some(rate) = &mut self.sender_rate.lock().unwrap().1 {
+                rate.participant = to_participant.map(|p| p as u64);
+            }
+        }
         let mut buffer = self.ssrc_packet_buffer.lock().unwrap();
         Ok(AudioSender {
+            sender_rate: self.sender_rate.clone(),
             context: Context::new(
                 &audio_key[..16], 
                 &audio_key[16..], 
@@ -5674,6 +5801,11 @@ impl AVSession {
 
         let feedback = to_participant.map(|p| state.encryption_states.entry(p as u64)
             .or_default().feedback.clone()).unwrap_or_default();
+        if group_stream.is_none() {
+            if let Some(rate) = &mut self.sender_rate.lock().unwrap().1 {
+                rate.participant = to_participant.map(|p| p as u64);
+            }
+        }
 
         info!("Video send main ssrc {} extra {:?}", ssrc, extra_ssrcs);
 
@@ -5685,6 +5817,7 @@ impl AVSession {
                 .unwrap_or((1532, 990, 0 /* is this supposed to be 1? or zero? */, 0));
 
         Ok(VideoSender {
+            sender_rate: self.sender_rate.clone(),
             hevc: Default::default(), 
             context: Context::new(
                 &video_key[..16], 
@@ -6077,12 +6210,29 @@ impl AVSession {
                             };
                             info!("Responding {} NACK;", nack.media_ssrc);
                             packet.probe_id = None; // retramsmitted packets are not part of a probe.
-                            if self.link.send(&packet).is_ok()
-                                && packet.packet.get(1).and_then(|byte| ChannelType::from_payload(byte & 0x7f))
-                                    .is_some_and(|kind| matches!(kind, ChannelType::H264 | ChannelType::H265)) {
-                                if let Some(participant) = packet.participant {
-                                    if let Some(peer) = self.state.lock().await.encryption_states.get(&(participant as u64)) {
-                                        peer.feedback.record_video_sent();
+                            let media = packet.packet.get(1).and_then(|byte| ChannelType::from_payload(byte & 0x7f));
+                            let video = media.is_some_and(|kind| matches!(kind, ChannelType::H264 | ChannelType::H265));
+                            let audio = media.is_some_and(|kind| matches!(kind, ChannelType::Aac | ChannelType::Evs));
+                            let ipv6 = packet_uses_ipv6(&self.link);
+                            let generation = self.sender_rate.lock().unwrap().0;
+                            if packet.participant.is_some() && (video || audio) {
+                                account_rate_enqueue(&self.sender_rate, generation, audio, packet.packet.len(), ipv6);
+                            }
+                            if self.link.send(&packet).is_ok() {
+                                if packet.participant.is_some() && (video || audio) {
+                                    // SRTP leaves RTP header extensions readable. A cached AAC
+                                    // retransmit carries its original timestamp; record exactly it.
+                                    let stamp = audio.then(|| Header::unmarshal(&mut &packet.packet[..]).ok())
+                                        .flatten().and_then(|header| header.extensions.first().and_then(|ext|
+                                            FTAudioControlData::from_ext_with_feedback_version(header.extension_profile, &ext.payload, 1)))
+                                        .and_then(|data| data.current_send_timestamp);
+                                    account_rate_send(&self.sender_rate, generation, audio, packet.packet.len(), ipv6, stamp);
+                                }
+                                if video {
+                                    if let Some(participant) = packet.participant {
+                                        if let Some(peer) = self.state.lock().await.encryption_states.get(&(participant as u64)) {
+                                            peer.feedback.record_video_sent();
+                                        }
                                     }
                                 }
                             }
@@ -6188,11 +6338,30 @@ impl AVSession {
                 self.link.send_rtcp(participant, &item)?;
                 Ok(())
             },
+            AVInternalMessage::RateFeedback(participant, configuration, profile, raw, now) => {
+                if !USE_APPLE_VCRC || !self.u1.load(Ordering::Relaxed) { return Ok(()); }
+                let session = self.state.lock().await;
+                if !session.encryption_states.get(&participant)
+                    .is_some_and(|peer| peer.feedback.accepts_report(configuration)) { return Ok(()); }
+                let mut lock = self.sender_rate.lock().unwrap();
+                if let Some(rate) = &mut lock.1 {
+                    if rate.participant.is_some_and(|expected| expected != participant)
+                        || (rate.participant.is_none() && session.encryption_states.len() != 1) { return Ok(()); }
+                    if now < rate.started_at { return Ok(()); } // queued feedback from the previous U1 incarnation
+                    if let Some(stats) = rate.decode_feedback(profile, &raw, configuration as u8, now) {
+                        if let Some(bps) = rate.on_feedback(&stats, duration_since_epoch().as_secs_f64()) {
+                            let _ = self.control_sender.try_send(AVControlCommand::SelectVideoBitrate(bps as usize));
+                        }
+                    }
+                }
+                Ok(())
+            },
             AVInternalMessage::Stats(is_audio, report) => {
                 info!("Got link report {is_audio} {report:?}");
                 let u1 = self.u1.load(Ordering::Relaxed);
 
-                if is_audio && u1 && !report.history.is_empty() {
+                let apple_active = USE_APPLE_VCRC && self.sender_rate.lock().unwrap().1.is_some();
+                if is_audio && u1 && !apple_active && !report.history.is_empty() {
                     let Some((participant, configuration)) = report.feedback_context else { return Ok(()) };
                     let feedback = {
                         let mut state = self.state.lock().await;
@@ -6961,6 +7130,12 @@ pub fn publish_media_frame(envelope: FTMediaFrameEnvelope) {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FTEncoderControlEnvelope {
+    /// Call correlation for bitrate configuration; older FIR consumers may omit it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guid: Option<String>,
+    /// Distinguishes successive calls which reuse a conversation GUID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance: Option<u64>,
     /// "requestKeyFrame" | "setBitrate"
     pub action: String,
     /// Present for setBitrate: target bits per second.
@@ -6973,12 +7148,37 @@ static ENCODER_CONTROL: LazyLock<broadcast::Sender<FTEncoderControlEnvelope>> = 
     sender
 });
 
+// Initial configuration must survive a late subscriber. These are metadata events,
+// not repeated setBitrate commands; live directives keep their bounded broadcast path.
+static NEXT_ENCODER_INSTANCE: AtomicU64 = AtomicU64::new(1);
+static ENCODER_INITIAL_TARGETS: LazyLock<std::sync::Mutex<HashMap<String, (u64, Option<u64>)>>> =
+    LazyLock::new(Default::default);
+
+fn publish_encoder_initial_target(guid: &str, instance: u64, bps: Option<u64>) {
+    let mut initial = ENCODER_INITIAL_TARGETS.lock().unwrap();
+    initial.insert(guid.to_owned(), (instance, bps));
+    publish_encoder_control_for_session(guid, instance, "initialBitrate", bps);
+}
+
 pub fn subscribe_encoder_controls() -> broadcast::Receiver<FTEncoderControlEnvelope> {
-    ENCODER_CONTROL.subscribe()
+    let initial = ENCODER_INITIAL_TARGETS.lock().unwrap();
+    let receiver = ENCODER_CONTROL.subscribe();
+    for (guid, (instance, bps)) in initial.iter() {
+        publish_encoder_control_for_session(guid, *instance, "initialBitrate", *bps);
+    }
+    receiver
+}
+
+pub fn publish_encoder_control_for_session(guid: &str, instance: u64, action: &'static str, bits_per_second: Option<u64>) {
+    let _ = ENCODER_CONTROL.send(FTEncoderControlEnvelope {
+        guid: Some(guid.to_owned()), instance: Some(instance), action: action.to_string(), bits_per_second,
+    });
 }
 
 pub fn publish_encoder_control(action: &'static str, bits_per_second: Option<u64>) {
     let _ = ENCODER_CONTROL.send(FTEncoderControlEnvelope {
+        guid: None,
+        instance: None,
         action: action.to_string(),
         bits_per_second,
     });
@@ -8059,4 +8259,42 @@ impl ControlKeySet {
 
         data
     }
+}
+
+#[test]
+fn sender_rate_initial_configuration_replays_before_encoder_creation() {
+    let guid = format!("vcrc-test-{}", Uuid::new_v4());
+    let rate = sender_rate::SenderRateController::new(false, 1000.0);
+    let first = AVControlCommand::SelectVideoBitrate(rate.state.target_bitrate as usize);
+    assert!(matches!(first, AVControlCommand::SelectVideoBitrate(502000)));
+    publish_encoder_initial_target(&guid, 1, Some(rate.state.target_bitrate as u64));
+    let mut receiver = subscribe_encoder_controls();
+    let replay = std::iter::from_fn(|| receiver.try_recv().ok())
+        .find(|control| control.guid.as_deref() == Some(guid.as_str())).unwrap();
+    assert_eq!(replay.action, "initialBitrate");
+    assert_eq!(replay.instance, Some(1));
+    assert_eq!(replay.bits_per_second, Some(502000));
+    ENCODER_INITIAL_TARGETS.lock().unwrap().remove(&guid);
+}
+
+#[test]
+fn sender_rate_discards_deferred_packets_from_previous_u1_generation() {
+    let handle = Arc::new(std::sync::Mutex::new((0, Some(sender_rate::SenderRateController::new(false, 1000.0)))));
+    account_rate_enqueue(&handle, 0, true, 100, false);
+    account_rate_send(&handle, 0, true, 100, false, Some(10));
+    assert_eq!(handle.lock().unwrap().1.as_ref().unwrap().media.tx_history.sent_audio_packets, 1);
+    *handle.lock().unwrap() = (1, Some(sender_rate::SenderRateController::new(false, 1001.0)));
+    account_rate_enqueue(&handle, 0, false, 1000, false);
+    account_rate_send(&handle, 0, true, 100, false, Some(11));
+    account_rate_refresh(&handle, 0);
+    assert_eq!(handle.lock().unwrap().1.as_ref().unwrap().media.last_refresh, 0.0);
+    account_rate_refresh(&handle, 1);
+    account_rate_send(&handle, 1, true, 100, false, Some(12));
+    let lock = handle.lock().unwrap();
+    let rate = lock.1.as_ref().unwrap();
+    assert_eq!(rate.media.tx_history.sent_audio_packets, 1);
+    assert_eq!(rate.media.tx_history.count, 1);
+    assert_eq!(rate.media.tx_history.records[0].tx_timestamp, 12);
+    assert!(rate.media.last_refresh > 0.0);
+    assert_eq!(rate.state.target_bitrate, 502000);
 }
