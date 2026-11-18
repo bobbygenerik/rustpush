@@ -175,3 +175,33 @@ fn absent_video_keeps_the_native_cumulative_counter_guard() {
     // to the cumulative unwrap guard, which rejects this old half-cycle value.
     assert_eq!(c.decode_feedback(0x8100, &raw[..12], 0, 1001.1).unwrap().video_received_packets, 100);
 }
+
+#[test]
+fn notify_gate_matches_avcratecontroller() {
+    // __AVCRateController_NotifyTargetBitrateChange 0x205eb261c: during a ramp-up inside one
+    // tier, the encoder hears about a new target only every 10 rate changes; a tier change,
+    // ramping down (state 6) or a zero tier always notifies.
+    use rustpush::avconference::sender_rate::NotifyGate;
+    let rc = SenderRateController::new(false, 0.0);
+    let mut s = rc.state.clone();
+    let mut g = rc.notify_gate;
+    assert_eq!((g.last_target, g.last_tier), (502_000, 502_000));
+    s.state = 2;
+    let mut sent = 0;
+    for k in 1..=25u32 {
+        s.rate_change_counter += 1;
+        s.target_bitrate = 502_000 + k * 3000; // same tier bps
+        if g.notify(&s).is_some() { sent += 1; }
+    }
+    assert_eq!(sent, 2); // counters +10 and +20
+    s.target_bitrate_tier = 599_000;
+    s.rate_change_counter += 1;
+    s.target_bitrate += 1000;
+    assert!(g.notify(&s).is_some()); // tier changed
+    s.state = 6;
+    s.rate_change_counter += 1;
+    s.target_bitrate -= 50_000;
+    assert!(g.notify(&s).is_some()); // ramping down
+    assert!(g.notify(&s).is_none()); // same target, same counter
+    let _ = NotifyGate::default();
+}

@@ -125,14 +125,19 @@ pub struct SenderRateController {
     pub(super) participant: Option<u64>,
     last_requested_target: u32,
     received_video: u32,
+    pub notify_gate: NotifyGate,
 }
 impl SenderRateController {
     pub fn new(audio_only: bool, now: f64) -> Self {
         let mut media = SenderMediaController::new(audio_only, now);
         let state = VcrcState::new_layered_continuous_tier(mode1_camera_defaults(), Some(&mut media), now);
         let last_requested_target = state.target_bitrate;
+        // ConfigureInternal notifies once right after Configure (0x205eada18); the caller
+        // sends that first target to the encoder.
+        let mut notify_gate = NotifyGate::default();
+        let _ = notify_gate.notify(&state);
         Self { state, media, received_audio: 0, received_video: 0, started_at: now,
-            participant: None, last_requested_target }
+            participant: None, last_requested_target, notify_gate }
     }
     /// Uses the same parser as the receive path; exposed for integration fixtures.
     pub fn decode_feedback(&mut self, profile: u16, raw: &[u8], version: u8, now: f64) -> Option<VcrcStatistics> {
@@ -181,12 +186,48 @@ impl SenderRateController {
         self.media.set_time(now);
         let ran = self.state.do_rate_control(stats, Some(&mut self.media), now);
         if !ran { log_decision(&self.state, false); }
-        // Identical targets do not reconfigure the encoder on every AAC packet.
-        // Native NotifyTargetBitrateChange also skips unchanged outputs, 0x205eb2a14..234.
-        if ran && self.state.target_bitrate != self.last_requested_target {
-            self.last_requested_target = self.state.target_bitrate;
-            Some(self.state.target_bitrate)
-        } else { None }
+        // AVCRateController_DoRateControlWithStatistics 0x205eb2eec reaches
+        // NotifyTargetBitrateChange (0x205eb3ba0) after the algorithm on its paths.
+        let notify = self.notify_gate.notify(&self.state);
+        if let Some(bps) = notify { self.last_requested_target = bps; }
+        notify
+    }
+}
+
+/// The gate in `__AVCRateController_NotifyTargetBitrateChange` 0x205eb261c that decides when
+/// a new target reaches the encoder (`VCRateControlMediaController_SetTargetBitrate` and the
+/// delegate, 0x205eb2c38..ca8). Mode 1 uses a threshold of 10 rate changes (0x205eb29b8..9d8:
+/// only modes 10..13 read the table at 0x2066a3b00). Selectors resolved from the 24A446 shared
+/// cache stubs: 0x2080b3960 targetBitrate, 0x2080a41c0 rateChangeCounter, 0x2080b39b0
+/// targetBitrateTier, 0x20809e040 isRampingDown (`_state == 6`, 0x20617a1d8).
+/// Not applied: the forced Tx/Rx caps (`rateControlForceTxCap/RxCap`, VCDefaults only) and the
+/// controller+0x7e2 low-rate reduction (0x205eb2924..95c), which is 0 unless an A/B
+/// experiment sets it (0x205ea8538..544).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NotifyGate {
+    /// controller+0x4dc: last notified target.
+    pub last_target: u32,
+    /// controller+0x4e4: targetBitrateTier at the last notify.
+    pub last_tier: u32,
+    /// controller+0x4e8: rateChangeCounter at the last notify.
+    pub last_counter: u32,
+}
+impl NotifyGate {
+    /// Returns the target to send to the encoder, or None when Apple would not notify.
+    pub fn notify(&mut self, state: &VcrcState) -> Option<u32> {
+        let target = state.target_bitrate;
+        let counter = state.rate_change_counter;
+        let tier = state.target_bitrate_tier;
+        // 0x205eb29e0..a10
+        let mut go = tier == 0 || state.state == 6 || self.last_tier != tier
+            || counter.wrapping_sub(self.last_counter) >= 10;
+        // 0x205eb2a14..a38: an unchanged target also needs a new rate-change counter.
+        if self.last_target == target { go = go && self.last_counter != counter; }
+        if !go { return None; }
+        self.last_target = target; // 0x205eb2c38
+        self.last_counter = counter; // 0x205eb2c78
+        self.last_tier = tier; // 0x205eb2c3c / 0x205eb2ca4
+        Some(target)
     }
 }
 fn unwrap12(previous: u32, count: u32) -> u32 {
