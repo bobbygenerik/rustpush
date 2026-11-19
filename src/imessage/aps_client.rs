@@ -119,6 +119,20 @@ impl IDSRecvMessage {
     }
 }
 
+/// IPSW `IMReadReceiptProcessingPipelineComponent` (`0x2346a1fd8`, `0x2346a2044`, `0x2346a2c40`):
+/// an incoming read receipt (`command == 102`) carrying certified-delivery context
+/// (`wantsDeliveryReceipt`) returns that context so the client certifies delivery.
+pub fn should_certify_control_receipt(
+    command: u8,
+    certified_context: Option<CertifiedContext>,
+) -> Option<CertifiedContext> {
+    if command == 102 {
+        certified_context
+    } else {
+        None
+    }
+}
+
 pub struct IMClient {
     pub conn: APSConnection,
     pub identity: IdentityManager,
@@ -225,6 +239,12 @@ impl IMClient {
             command: 101 | 102 | 113,
             ..
         } = &payload {
+            // IMReadReceiptProcessingPipelineComponent (0x2346a1fd8, 0x2346a2044, 0x2346a2c40):
+            // when an incoming read receipt carries certified-delivery context (wantsDeliveryReceipt),
+            // acknowledge delivery on receipt best-effort.
+            if let Some(context) = should_certify_control_receipt(command, payload.certified_context()) {
+                let _ = self.identity.certify_delivery("com.apple.madrid", &context, false).await;
+            }
             return Ok(payload.to_message(None, match command {
                 101 => Message::Delivered,
                 102 => Message::Read,
