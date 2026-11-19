@@ -91,6 +91,8 @@ pub const MADRID_SERVICE: IDSService = IDSService {
         ("supports-async-attachments", Value::Boolean(true)),
         // `IDSFoundation` `0x197ce9f1e` & `iMessage.imservice` `0x8b144`/`0x8bfb0`: group photo refresh (`gpru`).
         ("supports-group-photo-refresh-version", Value::Boolean(true)),
+        // `iMessage.imservice` `0xf00e8`, `0x130ce0`, `0x47938`: XHTML pre-sent translation (`tx` / `ept`).
+        ("supports-xhtml-translation", Value::Boolean(true)),
     ],
     flags: 17,
     capabilities_name: "Messenger"

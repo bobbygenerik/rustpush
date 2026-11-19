@@ -70,6 +70,7 @@ pub struct CommonHqCapabilities {
     pub supports_high_quality_photo_file_sizes: bool,
     pub supports_async_attachments: bool,
     pub supports_heif: bool,
+    pub supports_xhtml_translation: bool,
 }
 
 /// Computes `commonCapabilities` for a set of recipients (`participant -> device client_data list`).
@@ -90,6 +91,7 @@ pub fn compute_common_hq_capabilities(
     let mut all_photo = true;
     let mut all_async_attachments = true;
     let mut all_heif = true;
+    let mut all_xhtml_translation = true;
 
     for devices in per_participant.values() {
         if devices.is_empty() {
@@ -110,6 +112,9 @@ pub fn compute_common_hq_capabilities(
         if !devices.iter().all(|d| d.supports_heif) {
             all_heif = false;
         }
+        if !devices.iter().all(|d| d.supports_xhtml_translation) {
+            all_xhtml_translation = false;
+        }
     }
 
     CommonHqCapabilities {
@@ -117,6 +122,7 @@ pub fn compute_common_hq_capabilities(
         supports_high_quality_photo_file_sizes: all_photo,
         supports_async_attachments: all_async_attachments,
         supports_heif: all_heif,
+        supports_xhtml_translation: all_xhtml_translation,
     }
 }
 

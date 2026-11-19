@@ -1134,7 +1134,9 @@ pub struct UnsendMessage {
 pub struct EditMessage {
     pub tuuid: String,
     pub edit_part: u64,
-    pub new_parts: MessageParts
+    pub new_parts: MessageParts,
+    #[serde(default)]
+    pub translated_html: Option<String>,
 }
 
 pub struct IMessageContainer<T> {
@@ -2613,7 +2615,7 @@ impl MessageInst {
                 let raw = RawEditMessage {
                     version: Some("1".to_string()),
                     new_html_body: msg.new_parts.to_xml(None),
-                    translated_html: None,
+                    translated_html: msg.translated_html.clone(),
                     et: 1,
                     part_index: msg.edit_part,
                     message: msg.tuuid.clone(),
@@ -2926,7 +2928,8 @@ impl MessageInst {
             return wrapper.to_message(None, Message::Edit(EditMessage {
                 tuuid: loaded.message,
                 edit_part: loaded.part_index,
-                new_parts: MessageParts::parse_parts(&loaded.new_html_body, None)
+                new_parts: MessageParts::parse_parts(&loaded.new_html_body, None),
+                translated_html: loaded.translated_html,
             }))
         }
         if let Ok(loaded) = plist::from_value::<RawChangeMessage>(&value) {
@@ -3333,6 +3336,98 @@ pub fn encode_balloon_transport_inline(
         balloon_part: balloon_part.map(Into::into),
         balloon_part_mmcs: None,
     })?)
+}
+
+/// Decoded payload from iOS 27 `tx` / `ept` XHTML translation (`iMessage.imservice` `0x433b0..0x43548`, `0x16bc0..0x16d28`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecodedTranslatedHtml {
+    pub source_language: Option<String>,
+    pub translation_language: Option<String>,
+    pub text: String,
+}
+
+/// Encodes translated text into Apple's `tx` / `ept` XHTML shape:
+/// `<html><body[ source-language="..."][ translation-language="..."]>...</body></html>`
+/// matching `iMessage.imservice` `SuperToMessageParserContext` (`0x433b0..0x43548`).
+pub fn encode_translated_html(
+    text: &str,
+    source_language: Option<&str>,
+    translation_language: Option<&str>,
+) -> String {
+    let mut output = vec![];
+    let config = EmitterConfig::new().write_document_declaration(false);
+    let mut writer = config.create_writer(Cursor::new(&mut output));
+    writer.write(XmlEvent::start_element("html")).unwrap();
+    let mut body = XmlEvent::start_element("body");
+    if let Some(src) = source_language.map(str::trim).filter(|s| !s.is_empty()) {
+        body = body.attr("source-language", src);
+    }
+    if let Some(tgt) = translation_language.map(str::trim).filter(|s| !s.is_empty()) {
+        body = body.attr("translation-language", tgt);
+    }
+    writer.write(body).unwrap();
+    writer.write(XmlEvent::characters(text)).unwrap();
+    writer.write(XmlEvent::end_element()).unwrap();
+    writer.write(XmlEvent::end_element()).unwrap();
+    String::from_utf8(output).unwrap()
+}
+
+/// Decodes Apple's `tx` / `ept` XHTML payload (`<html><body source-language="..." translation-language="...">...</body></html>`),
+/// returning `None` if no translated body text can be extracted.
+pub fn decode_translated_html(xml: &str) -> Option<DecodedTranslatedHtml> {
+    let trimmed = xml.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let reader: EventReader<Cursor<&str>> = EventReader::new(Cursor::new(trimmed));
+    let mut source_language: Option<String> = None;
+    let mut translation_language: Option<String> = None;
+    let mut text = String::new();
+    let mut parsed_any_element = false;
+
+    for event in reader {
+        match event {
+            Ok(reader::XmlEvent::StartElement { name, attributes, .. }) => {
+                parsed_any_element = true;
+                let tag = name.local_name.to_ascii_lowercase();
+                if tag == "body" || tag == "message" {
+                    for attr in attributes {
+                        let attr_name = attr.name.local_name.as_str();
+                        if attr_name == "source-language" && !attr.value.trim().is_empty() {
+                            source_language = Some(attr.value);
+                        } else if attr_name == "translation-language" && !attr.value.trim().is_empty() {
+                            translation_language = Some(attr.value);
+                        }
+                    }
+                } else if tag == "br" && !text.is_empty() {
+                    text.push('\n');
+                }
+            }
+            Ok(reader::XmlEvent::Characters(chunk)) | Ok(reader::XmlEvent::CData(chunk)) => {
+                text.push_str(&chunk);
+            }
+            Ok(reader::XmlEvent::Whitespace(ws)) => {
+                text.push_str(&ws);
+            }
+            Err(_) => {
+                if !parsed_any_element {
+                    return None;
+                }
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    if text.trim().is_empty() {
+        return None;
+    }
+
+    Some(DecodedTranslatedHtml {
+        source_language,
+        translation_language,
+        text,
+    })
 }
 
 /// Decodes an inline `c=196` (`FTCommandIDBalloonTransportCommand`) plist body (`iMessage.imservice` `0x1f974..0x1f9dc`).

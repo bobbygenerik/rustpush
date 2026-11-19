@@ -199,4 +199,29 @@ fn ipsw_size_limits_and_mmcs_report_size_overrides_match_24a446() {
         mmcs_target_report_size_for_hq_photo(8_000_000, true, true, true, None),
         8_000_000
     );
+
+    // Feature B5: supports-xhtml-translation + tx XML encode/decode round-trip
+    assert!(MADRID_SERVICE
+        .client_data
+        .iter()
+        .any(|(k, v)| *k == "supports-xhtml-translation" && v.as_boolean() == Some(true)));
+    let ident = dummy_public_identity();
+    let mut dict = plist::Dictionary::new();
+    dict.insert(
+        "public-message-identity-key".to_string(),
+        plist::to_value(&ident).expect("serialize IDSPublicIdentity"),
+    );
+    dict.insert("supports-xhtml-translation".to_string(), Value::Integer(1.into()));
+    let client_data: ParsedClientData =
+        plist::from_value(&Value::Dictionary(dict)).expect("valid ParsedClientData");
+    let caps = compute_common_hq_capabilities(&HashMap::from([(
+        "mailto:peer@example.com".to_string(),
+        vec![client_data],
+    )]));
+    assert!(caps.supports_xhtml_translation);
+    let tx = rustpush::encode_translated_html("Hola mundo", Some("en"), Some("es"));
+    let decoded = rustpush::decode_translated_html(&tx).expect("tx xml decodes");
+    assert_eq!(decoded.source_language.as_deref(), Some("en"));
+    assert_eq!(decoded.translation_language.as_deref(), Some("es"));
+    assert_eq!(decoded.text, "Hola mundo");
 }
