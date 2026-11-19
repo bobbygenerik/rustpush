@@ -202,6 +202,8 @@ struct RawUpdateExtensionMessage {
     target_id: String,
     #[serde(rename = "srpi")]
     new_info: Value,
+    #[serde(rename = "rp", default, skip_serializing_if = "Option::is_none")]
+    replication_source_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]

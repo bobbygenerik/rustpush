@@ -929,7 +929,7 @@ pub enum PartExtension {
         sai: u64,
         #[serde(rename = "ssa")]
         scale: f64,
-        #[serde(rename = "sir")]
+        #[serde(rename = "sir", default, skip_serializing_if = "Option::is_none")]
         update: Option<bool>, // Some(false) for updates
         sli: u64,
         #[serde(rename = "sxs")]
@@ -2284,6 +2284,7 @@ impl MessageInst {
                     version: "1".to_string(),
                     target_id: ext.for_uuid.clone(),
                     new_info: plist::to_value(&ext.ext)?,
+                    replication_source_id: None,
                 };
                 plist_to_bin(&raw).unwrap()
             },
