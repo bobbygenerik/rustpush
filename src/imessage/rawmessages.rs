@@ -693,4 +693,66 @@ pub struct BaseBalloonBody {
     pub attachments: Vec<Data>,
 }
 
+/// `IMDaemonCore` / `iMessage.imservice` `file-size` in `c=108` dictionaries (`0x135e4`, `0x135f4`: `longLongValue` accepts integer or decimal string).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(untagged)]
+enum RawFileSizeValue {
+    Int(u64),
+    Str(String),
+}
+
+impl RawFileSizeValue {
+    fn as_usize(&self) -> Option<usize> {
+        match self {
+            RawFileSizeValue::Int(v) => Some(*v as usize),
+            RawFileSizeValue::Str(s) => s.parse().ok(),
+        }
+    }
+}
+
+/// `iMessage.imservice` `sub_55804` & `IMSharedUtilities` `userInfoPropertiesFrom:` (`0x1a4285228`).
+#[derive(Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct RawFileTransferUpdateQuality {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    part_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mime_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uti_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stage: Option<String>,
+    #[serde(rename = "mmcs-url", skip_serializing_if = "Option::is_none")]
+    mmcs_url: Option<String>,
+    #[serde(rename = "mmcs-signature-hex", skip_serializing_if = "Option::is_none")]
+    mmcs_signature_hex: Option<String>,
+    #[serde(rename = "mmcs-owner", skip_serializing_if = "Option::is_none")]
+    mmcs_owner: Option<String>,
+    #[serde(rename = "decryption-key", skip_serializing_if = "Option::is_none")]
+    decryption_key: Option<String>,
+    #[serde(rename = "file-size", skip_serializing_if = "Option::is_none")]
+    file_size: Option<RawFileSizeValue>,
+}
+
+/// `iMessage.imservice` `_determineUpdateReason:` (`0x10e94` -> `sub_460f8`) & `_applyHQUpdateToAttachments:` (`0x1276c`).
+#[derive(Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct RawFileTransferUpdateEntry {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    low_quality: Option<RawFileTransferUpdateQuality>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    high_quality: Option<RawFileTransferUpdateQuality>,
+}
+
+/// `iMessage.imservice` `FTCommandIDUpdateAttachmentsMessage` (`c=108` / `0x6c`, `0x550f4` & `0x83268`).
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawUpdateAttachments {
+    file_transfer_updates: Vec<RawFileTransferUpdateEntry>,
+}
+
 

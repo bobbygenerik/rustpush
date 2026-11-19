@@ -534,7 +534,8 @@ impl Into<Option<MMCSAttachmentMeta>> for &Attachment {
                 uti_type: Some(self.uti_type.clone()), 
                 mime_type: Some(self.mime.clone()),
                 name: Some(self.name.clone())
-            })
+            }),
+            AttachmentType::Placeholder { .. } => None,
         }
     }
 }

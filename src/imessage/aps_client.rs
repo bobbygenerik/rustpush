@@ -87,6 +87,8 @@ pub const MADRID_SERVICE: IDSService = IDSService {
         ("supports-emoji-stickers", Value::Boolean(true)),
         ("supports-sticker-editing", Value::Boolean(true)),
         ("supports-animoji-v2", Value::Boolean(true)),
+        // `identityservicesd` (`0x10065817c`): gates NBAS placeholder `<FILE>` + `c=108` updates.
+        ("supports-async-attachments", Value::Boolean(true)),
     ],
     flags: 17,
     capabilities_name: "Messenger"
@@ -408,6 +410,17 @@ impl IMClient {
         // `iMessage` `0x2832c`: `c=112` (DeliveredQuietly) requires `supports-dq-nr`.
         if matches!(message.message, Message::DeliveredQuietly) {
             message_targets.retain(|t| t.delivery_data.client_data.supports_delivered_quietly_and_notify_recipient);
+            if message_targets.is_empty() {
+                return Ok(SendJob {
+                    process: tokio::sync::broadcast::channel(1).1,
+                    handle: None,
+                });
+            }
+        }
+
+        // `iMessage` `0x55330`: `c=108` (`FTCommandIDUpdateAttachmentsMessage`) requires `supports-async-attachments`.
+        if matches!(message.message, Message::UpdateAttachments(_)) {
+            message_targets.retain(|t| t.delivery_data.client_data.supports_async_attachments);
             if message_targets.is_empty() {
                 return Ok(SendJob {
                     process: tokio::sync::broadcast::channel(1).1,

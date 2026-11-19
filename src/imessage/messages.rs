@@ -267,6 +267,19 @@ impl MessageParts {
                                     ].concat()))
                             ).unwrap();
                         }
+                        AttachmentType::Placeholder { stage, grad_colors, .. } => {
+                            // `iMessage.imservice` `0x44834..0x44a18`: NBAS placeholder `<FILE>` omits MMCS attrs
+                            // and appends `grad-colors` + `stage` (`_IMFileTransferPreflightStageToString`).
+                            let colors = grad_colors
+                                .as_deref()
+                                .unwrap_or("FF000000,00FF0000,0000FF00,FFFFFF00");
+                            let st = stage.as_deref().unwrap_or("gradient");
+                            writer.write(
+                                element
+                                    .attr("grad-colors", colors)
+                                    .attr("stage", st)
+                            ).unwrap();
+                        }
                     }
                 },
                 MessagePart::Text(text, format) => {
@@ -434,6 +447,10 @@ impl MessageParts {
                         attributes.iter().find(|attr| attr.name.to_string() == name)
                             .map_or_else(|| def.expect(&format!("attribute {} doesn't exist!", name)).to_string(), |data| data.value.to_string())
                     };
+                    let get_attr_opt = |name: &str| {
+                        attributes.iter().find(|attr| attr.name.to_string() == name)
+                            .map(|data| data.value.to_string())
+                    };
                     let part_idx = attributes.iter().find(|attr| attr.name.to_string() == "message-part").map(|opt| opt.value.parse().unwrap());
                     let all_items: HashMap<String, String> = attributes.iter().map(|a| (a.name.to_string(), a.value.clone())).collect();
                     match name.local_name.as_str() {
@@ -447,31 +464,64 @@ impl MessageParts {
                                 text_part_idx = None; // FILEs are always top-level, so reset the thing
                                 text_meta = None;
                             }
+                            let a_type = if let Some(inline) = attributes.iter().find(|attr| attr.name.to_string() == "inline-attachment") {
+                                AttachmentType::Inline(if inline.value == "ia-0" {
+                                    raw.map_or(vec![], |raw| raw.inline0.clone().unwrap().into())
+                                } else if inline.value == "ia-1" {
+                                    raw.map_or(vec![], |raw| raw.inline1.clone().unwrap().into())
+                                } else {
+                                    continue
+                                })
+                            } else if let (Some(sig_hex), Some(key_hex), Some(owner), Some(url)) = (
+                                get_attr_opt("mmcs-signature-hex"),
+                                get_attr_opt("decryption-key"),
+                                get_attr_opt("mmcs-owner"),
+                                get_attr_opt("mmcs-url"),
+                            ) {
+                                match (decode_hex(&sig_hex), decode_hex(&key_hex)) {
+                                    (Ok(sig), Ok(key)) if key.len() > 1 => {
+                                        let size = get_attr_opt("file-size")
+                                            .or_else(|| get_attr_opt("datasize"))
+                                            .and_then(|s| s.parse().ok())
+                                            .unwrap_or(0);
+                                        AttachmentType::MMCS(MMCSFile {
+                                            signature: sig,
+                                            object: owner,
+                                            url,
+                                            key: key[1..].to_vec(),
+                                            size,
+                                        })
+                                    }
+                                    _ => AttachmentType::Placeholder {
+                                        size: get_attr_opt("file-size")
+                                            .or_else(|| get_attr_opt("datasize"))
+                                            .and_then(|s| s.parse().ok())
+                                            .unwrap_or(0),
+                                        stage: get_attr_opt("stage"),
+                                        grad_colors: get_attr_opt("grad-colors"),
+                                    },
+                                }
+                            } else {
+                                // `iMessage.imservice` `0x443c8..0x44a18`: NBAS placeholder `<FILE>` carries
+                                // `datasize`, optional `stage` (`"gradient"`/`"preview"`), and `grad-colors`
+                                // before MMCS attributes arrive on `c=108`.
+                                let size = get_attr_opt("file-size")
+                                    .or_else(|| get_attr_opt("datasize"))
+                                    .and_then(|s| s.parse().ok())
+                                    .unwrap_or(0);
+                                AttachmentType::Placeholder {
+                                    size,
+                                    stage: get_attr_opt("stage"),
+                                    grad_colors: get_attr_opt("grad-colors"),
+                                }
+                            };
                             data.push(IndexedMessagePart {
                                 part: MessagePart::Attachment(Attachment {
-                                    a_type: if let Some(inline) = attributes.iter().find(|attr| attr.name.to_string() == "inline-attachment") {
-                                        AttachmentType::Inline(if inline.value == "ia-0" {
-                                            raw.map_or(vec![], |raw| raw.inline0.clone().unwrap().into())
-                                        } else if inline.value == "ia-1" {
-                                            raw.map_or(vec![], |raw| raw.inline1.clone().unwrap().into())
-                                        } else {
-                                            continue
-                                        })
-                                    } else {
-                                        let sig = decode_hex(&get_attr("mmcs-signature-hex", None)).unwrap();
-                                        let key = decode_hex(&get_attr("decryption-key", None)).unwrap();
-                                        AttachmentType::MMCS(MMCSFile {
-                                            signature: sig.clone(), // chop off first byte because it's not actually the signature
-                                            object: get_attr("mmcs-owner", None),
-                                            url: get_attr("mmcs-url", None),
-                                            key: key[1..].to_vec(),
-                                            size: get_attr("file-size", None).parse().unwrap()
-                                        })
-                                    },
-                                    part: attributes.iter().find(|attr| attr.name.to_string() == "message-part").map(|item| item.value.parse().unwrap()).unwrap_or(0),
+                                    a_type,
+                                    part: attributes.iter().find(|attr| attr.name.to_string() == "message-part").and_then(|item| item.value.parse().ok()).unwrap_or(0),
                                     uti_type: get_attr("uti-type", Some("public.data")),
                                     mime: get_attr("mime-type", Some("application/octet-stream")),
-                                    name: get_attr("name", None),
+                                    name: get_attr("name", Some("attachment")),
                                     iris: get_attr("iris", Some("no")) == "yes"
                                 }),
                                 idx: part_idx,
@@ -604,6 +654,14 @@ impl MessageParts {
             MessagePart::Mention(_uri, text) => Some(format!("@{}", text)),
             MessagePart::Object(_) => Some("\u{fffd}\u{fffc}".to_string()) // two object replacements
         }).collect::<Vec<String>>().join("")
+    }
+
+    pub fn to_xml_string(&self) -> String {
+        self.to_xml(None)
+    }
+
+    pub fn parse_parts_xml(xml: &str) -> MessageParts {
+        Self::parse_parts(xml, None)
     }
 }
 
@@ -1184,7 +1242,7 @@ struct MMCSUploadResponse {
 }
 
 #[repr(C)]
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct MMCSFile {
     #[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize")]
     pub signature: Vec<u8>,
@@ -1397,7 +1455,12 @@ impl MMCSFile {
 #[derive(Clone, Serialize, Deserialize)]
 pub enum AttachmentType {
     Inline(#[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize")] Vec<u8>),
-    MMCS(MMCSFile)
+    MMCS(MMCSFile),
+    Placeholder {
+        size: usize,
+        stage: Option<String>,
+        grad_colors: Option<String>,
+    },
 }
 
 #[repr(C)]
@@ -1428,8 +1491,13 @@ impl Attachment {
     pub fn get_size(&self) -> usize {
         match &self.a_type {
             AttachmentType::Inline(data) => data.len(),
-            AttachmentType::MMCS(mmcs) => mmcs.size
+            AttachmentType::MMCS(mmcs) => mmcs.size,
+            AttachmentType::Placeholder { size, .. } => *size,
         }
+    }
+
+    pub fn is_placeholder(&self) -> bool {
+        matches!(self.a_type, AttachmentType::Placeholder { .. })
     }
 
     pub async fn get_attachment(&self, apns: &APSConnectionResource, mut writer: impl Write + Send + Sync, progress: impl FnMut(usize, usize) + Send + Sync) -> Result<(), PushError> {
@@ -1440,9 +1508,36 @@ impl Attachment {
             },
             AttachmentType::MMCS(mmcs) => {
                 mmcs.get_attachment(apns, writer, progress).await
-            }
+            },
+            AttachmentType::Placeholder { .. } => Err(PushError::BadMsg),
         }
     }
+}
+
+#[repr(C)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
+pub struct FileTransferUpdateQuality {
+    pub part_name: String,
+    pub name: Option<String>,
+    pub mime_type: Option<String>,
+    pub uti_type: Option<String>,
+    pub stage: Option<String>,
+    pub mmcs: Option<MMCSFile>,
+}
+
+#[repr(C)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
+pub struct FileTransferUpdateEntry {
+    pub reason: String,
+    pub low_quality: Option<FileTransferUpdateQuality>,
+    pub high_quality: Option<FileTransferUpdateQuality>,
+}
+
+#[repr(C)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
+pub struct UpdateAttachmentsMessage {
+    pub message_guid: String,
+    pub updates: Vec<FileTransferUpdateEntry>,
 }
 
 // file should be 570x570 png
@@ -1636,6 +1731,7 @@ pub enum Message {
     ShareProfile(ShareProfileMessage),
     NotifyAnyways,
     SetTranscriptBackground(SetTranscriptBackgroundMessage),
+    UpdateAttachments(UpdateAttachmentsMessage),
 }
 
 
@@ -1694,6 +1790,7 @@ impl Message {
             Self::ShareProfile(_) => 131,
             Self::NotifyAnyways => 113,
             Self::SetTranscriptBackground(_) => 138,
+            Self::UpdateAttachments(_) => 108,
         }
     }
 
@@ -1702,6 +1799,8 @@ impl Message {
             Message::Message(message) => matches!(message.service, MessageType::IMessage) && !conversation.is_group(),
             Message::React(_) => conversation.is_group(),
             Message::UpdateProfile(_) => true,
+            // `iMessage.imservice` `0x5537c..0x55400`: sets `WantsDeliveryStatusKey` on `c=108` in 1:1 chats.
+            Message::UpdateAttachments(_) => !conversation.is_group(),
             _ => false
         }
     }
@@ -1862,6 +1961,9 @@ impl fmt::Display for Message {
             },
             Message::SetTranscriptBackground(_) => {
                 write!(f, "Changed the transcript background")
+            },
+            Message::UpdateAttachments(_) => {
+                write!(f, "Updated attachments")
             }
         }
     }
@@ -2125,6 +2227,9 @@ impl MessageInst {
             },
             Message::SetTranscriptBackground(back) => {
                 plist_to_bin(&back).unwrap()
+            }
+            Message::UpdateAttachments(update) => {
+                encode_update_attachments(update)?
             }
             Message::UpdateExtension(ext) => {
                 let raw = RawUpdateExtensionMessage {
@@ -2658,6 +2763,18 @@ impl MessageInst {
                 }
             }
         }
+        if wrapper.command == 108 {
+            let target_guid = wrapper
+                .uuid
+                .as_deref()
+                .and_then(|u| <[u8; 16]>::try_from(u).ok())
+                .map(|b| Uuid::from_bytes(b).to_string().to_uppercase())
+                .unwrap_or_default();
+            if let Some(update) = decode_update_attachments(&value, &target_guid) {
+                return wrapper.to_message(None, Message::UpdateAttachments(update));
+            }
+            return Err(PushError::BadMsg);
+        }
         if let Ok(loaded) = plist::from_value::<SetTranscriptBackgroundMessage>(&value) {
             return wrapper.to_message(None, Message::SetTranscriptBackground(loaded))
         }
@@ -2974,4 +3091,100 @@ impl fmt::Display for MessageInst {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "[{}] '{}'", self.sender.clone().unwrap_or("unknown".to_string()), self.message)
     }
+}
+
+fn quality_to_raw(q: &FileTransferUpdateQuality) -> RawFileTransferUpdateQuality {
+    RawFileTransferUpdateQuality {
+        part_name: Some(q.part_name.clone()),
+        name: q.name.clone(),
+        mime_type: q.mime_type.clone(),
+        uti_type: q.uti_type.clone(),
+        stage: q.stage.clone(),
+        mmcs_url: q.mmcs.as_ref().map(|m| m.url.clone()),
+        mmcs_signature_hex: q.mmcs.as_ref().map(|m| encode_hex(&m.signature)),
+        mmcs_owner: q.mmcs.as_ref().map(|m| m.object.clone()),
+        decryption_key: q
+            .mmcs
+            .as_ref()
+            .map(|m| encode_hex(&[vec![0x00], m.key.clone()].concat())),
+        file_size: q
+            .mmcs
+            .as_ref()
+            .map(|m| RawFileSizeValue::Int(m.size as u64)),
+    }
+}
+
+fn quality_from_raw(raw: RawFileTransferUpdateQuality) -> Option<FileTransferUpdateQuality> {
+    let part_name = raw.part_name?;
+    let mmcs = match (
+        raw.mmcs_url,
+        raw.mmcs_signature_hex,
+        raw.mmcs_owner,
+        raw.decryption_key,
+    ) {
+        (Some(url), Some(sig_hex), Some(owner), Some(key_hex)) => {
+            let signature = decode_hex(&sig_hex).ok()?;
+            let key_bytes = decode_hex(&key_hex).ok()?;
+            if key_bytes.len() <= 1 {
+                None
+            } else {
+                Some(MMCSFile {
+                    signature,
+                    object: owner,
+                    url,
+                    key: key_bytes[1..].to_vec(),
+                    size: raw.file_size.as_ref().and_then(|s| s.as_usize()).unwrap_or(0),
+                })
+            }
+        }
+        _ => None,
+    };
+    Some(FileTransferUpdateQuality {
+        part_name,
+        name: raw.name,
+        mime_type: raw.mime_type,
+        uti_type: raw.uti_type,
+        stage: raw.stage,
+        mmcs,
+    })
+}
+
+/// Encodes an iOS 27 `c=108` (`FTCommandIDUpdateAttachmentsMessage`) plist body (`iMessage.imservice` `0x550f4`..`0x55284`).
+pub fn encode_update_attachments(msg: &UpdateAttachmentsMessage) -> Result<Vec<u8>, PushError> {
+    let raw = RawUpdateAttachments {
+        file_transfer_updates: msg
+            .updates
+            .iter()
+            .map(|entry| RawFileTransferUpdateEntry {
+                reason: Some(entry.reason.clone()),
+                low_quality: entry.low_quality.as_ref().map(quality_to_raw),
+                high_quality: entry.high_quality.as_ref().map(quality_to_raw),
+            })
+            .collect(),
+    };
+    Ok(plist_to_bin(&raw)?)
+}
+
+/// Decodes an iOS 27 `c=108` (`FTCommandIDUpdateAttachmentsMessage`) plist body (`iMessage.imservice` `0x83268` & `0x1126c`..`0x13600`).
+pub fn decode_update_attachments(
+    value: &Value,
+    message_guid: &str,
+) -> Option<UpdateAttachmentsMessage> {
+    let raw = plist::from_value::<RawUpdateAttachments>(value).ok()?;
+    let updates = raw
+        .file_transfer_updates
+        .into_iter()
+        .filter_map(|entry| {
+            let reason = entry.reason?;
+            Some(FileTransferUpdateEntry {
+                reason,
+                low_quality: entry.low_quality.and_then(quality_from_raw),
+                high_quality: entry.high_quality.and_then(quality_from_raw),
+            })
+        })
+        .collect();
+    Some(UpdateAttachmentsMessage {
+        message_guid: message_guid.to_string(),
+        updates,
+    })
 }

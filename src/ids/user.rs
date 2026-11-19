@@ -689,6 +689,8 @@ pub struct ParsedClientData {
     pub supports_queue_one_read_receipts_v3: bool,
     #[serde(default, deserialize_with = "deserialize_bool_or_int", rename = "supports-dq-nr")]
     pub supports_delivered_quietly_and_notify_recipient: bool,
+    #[serde(default, deserialize_with = "deserialize_bool_or_int")]
+    pub supports_async_attachments: bool,
 }
 
 pub fn deserialize_kt_data<'de, D>(d: D) -> Result<Option<CompactECKey<Public>>, D::Error>

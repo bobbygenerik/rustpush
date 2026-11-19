@@ -45,6 +45,7 @@ pub const MMCS_HQ_PHOTO_REPORTED_SIZE_OVERRIDE: usize = 0x10_0000; // 1,048,576 
 pub struct CommonHqCapabilities {
     pub supports_high_quality_video: bool,
     pub supports_high_quality_photo_file_sizes: bool,
+    pub supports_async_attachments: bool,
 }
 
 /// Computes `commonCapabilities` for a set of recipients (`participant -> device client_data list`).
@@ -63,6 +64,7 @@ pub fn compute_common_hq_capabilities(
 
     let mut all_video = true;
     let mut all_photo = true;
+    let mut all_async_attachments = true;
 
     for devices in per_participant.values() {
         if devices.is_empty() {
@@ -77,11 +79,15 @@ pub fn compute_common_hq_capabilities(
         {
             all_photo = false;
         }
+        if !devices.iter().all(|d| d.supports_async_attachments) {
+            all_async_attachments = false;
+        }
     }
 
     CommonHqCapabilities {
         supports_high_quality_video: all_video,
         supports_high_quality_photo_file_sizes: all_photo,
+        supports_async_attachments: all_async_attachments,
     }
 }
 
