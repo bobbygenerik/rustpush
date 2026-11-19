@@ -976,7 +976,7 @@ impl IdentityResource {
 
         info!("ID send message {:?} to {} targets", ids_message, message_targets.len());
 
-        if ids_message.queue_id.is_none() {
+        if ids_message.scheduled_ms.is_none() {
             // do not send to self
             let my_token = self.aps.get_token().await;
             message_targets.retain(|target| &target.delivery_data.push_token != &my_token);
@@ -1218,7 +1218,7 @@ impl InnerSendJob {
                 retry_count: if retry_count != 0 { Some(retry_count) } else { None },
                 original_epoch_nanos: if retry_count != 0 { Some(self.sent_timestamp * 1000000) } else { None },
                 deliver_message_time: message.scheduled_ms,
-                send_version: if message.queue_id.is_some() { Some(1) } else { None },
+                send_version: if message.scheduled_ms.is_some() { Some(1) } else { None },
                 queue_id: message.queue_id.clone(),
                 relay_reason: message.relay.as_ref().map(|relay| relay.reason),
                 relay_ids_session_id: message.relay.as_ref().map(|relay| Uuid::from_str(&relay.group_id).expect("bad guid").into_bytes().to_vec().into()),

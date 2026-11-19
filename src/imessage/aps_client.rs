@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 use tokio::{select, sync::{Mutex, broadcast}, task::{JoinHandle, JoinSet}};
 use uuid::Uuid;
 
-use crate::{aps::{get_message, APSConnection, APSInterestToken}, ids::{identity_manager::{IDSSendMessage, MessageTarget, SendJob}, user::{IDSNGMIdentity, IDSService}, CertifiedContext}, imessage::messages::ErrorMessage, util::{bin_deserialize_opt_vec, duration_since_epoch, encode_hex, plist_to_bin, ungzip}, APSMessage, ConversationData, IDSUser, Message, MessageInst, NormalMessage, OSConfig, PushError};
+use crate::{aps::{get_message, APSConnection, APSInterestToken}, ids::{identity_manager::{IDSSendMessage, MessageTarget, Raw, SendJob}, user::{IDSNGMIdentity, IDSService}, CertifiedContext}, imessage::messages::{decode_enhanced_read_receipt, encode_enhanced_read_receipt, ErrorMessage, ReadReceiptMessage}, util::{base64_encode, bin_deserialize_opt_vec, duration_since_epoch, encode_hex, plist_to_bin, ungzip}, APSMessage, ConversationData, IDSUser, Message, MessageInst, NormalMessage, OSConfig, PushError};
+use openssl::sha::sha256;
 
 use crate::ids::{identity_manager::{DeliveryHandle, IdentityManager, IdentityResource}, user::{IDSUserIdentity, QueryOptions}};
 use std::str::FromStr;
@@ -76,6 +77,16 @@ pub const MADRID_SERVICE: IDSService = IDSService {
         // and commonCapabilitiesSupportHighQualityPhotos: (0x2346d19a8).
         ("supports-high-quality-video", Value::Boolean(true)),
         ("supports-high-quality-photo-file-sizes", Value::Boolean(true)),
+        // IDSFoundation _IDSRegistrationPropertySupportsQueueOneReadReceiptsV3 (`0x574c56`),
+        // gated by Messages/enhanced_read_receipts (`identityservicesd` `0x10065815c`).
+        ("supports-queue-one-read-receipts-v3", Value::Boolean(true)),
+        // IDSFoundation safe capability advertisements parity with iOS 27 (`identityservicesd`):
+        // LQM-HQ (`0x100657274`), emoji stickers (`0x100658050`), sticker editing (`0x100658094`),
+        // Animoji v2 (`0x100657e68`).
+        ("supports-lqm-hq", Value::Boolean(true)),
+        ("supports-emoji-stickers", Value::Boolean(true)),
+        ("supports-sticker-editing", Value::Boolean(true)),
+        ("supports-animoji-v2", Value::Boolean(true)),
     ],
     flags: 17,
     capabilities_name: "Messenger"
@@ -131,6 +142,19 @@ pub fn should_certify_control_receipt(
     } else {
         None
     }
+}
+
+/// `-[MessageServiceSession _calculateQueueOneIdentifierForMessage:]` (`iMessage` `0x26560..0x26640`):
+/// SHA-256 base64 of `"%@-%@"` formatted from `(cloudKitChatID, sender)`.
+pub fn queue_one_id_for_read_receipt(chat_id: &str, sender: &str) -> String {
+    let raw = format!("{chat_id}-{sender}");
+    base64_encode(&sha256(raw.as_bytes()))
+}
+
+/// `IMSharedUtilities` `__im_nanosecondTimeIntervalSinceEpochTime` (`0x1a421fc20`):
+/// converts Unix epoch milliseconds into Unix epoch nanoseconds for `"omt"`.
+pub fn enhanced_read_receipt_omt_ns(omt_ms: u64) -> u64 {
+    omt_ms.saturating_mul(1_000_000)
 }
 
 pub struct IMClient {
@@ -234,9 +258,9 @@ impl IMClient {
     
     async fn process_msg(&self, mut payload: IDSRecvMessage) -> Result<Option<MessageInst>, PushError> {
         let command = payload.command;
-        // delivered/read
+        // delivered / read / played / saved / reflected-delivered / delivered-quietly / notify-anyways
         if let IDSRecvMessage {
-            command: 101 | 102 | 113,
+            command: 101 | 102 | 105 | 106 | 107 | 112 | 113,
             ..
         } = &payload {
             // IMReadReceiptProcessingPipelineComponent (0x2346a1fd8, 0x2346a2044, 0x2346a2c40):
@@ -245,9 +269,22 @@ impl IMClient {
             if let Some(context) = should_certify_control_receipt(command, payload.certified_context()) {
                 let _ = self.identity.certify_delivery("com.apple.madrid", &context, false).await;
             }
+            if command == 102 {
+                if let Some(body) = payload.message_unenc.take() {
+                    if let Ok(plist_val) = body.plist() {
+                        if let Some((convo, receipt)) = decode_enhanced_read_receipt(&plist_val) {
+                            return Ok(payload.to_message(convo, Message::EnhancedRead(receipt)).ok());
+                        }
+                    }
+                }
+            }
             return Ok(payload.to_message(None, match command {
                 101 => Message::Delivered,
                 102 => Message::Read,
+                105 => Message::Played,
+                106 => Message::Saved(payload.saved_type.unwrap_or(0)),
+                107 => Message::ReflectedDelivery,
+                112 => Message::DeliveredQuietly,
                 113 => Message::NotifyAnyways,
                 _ => panic!("no")
             }).ok())
@@ -355,7 +392,7 @@ impl IMClient {
 
         let handle = message.sender.as_ref().unwrap().to_string();
         let ident_cache = self.identity.cache.lock().await;
-        let message_targets = if let Some(message_targets) = &message.target {
+        let mut message_targets = if let Some(message_targets) = &message.target {
             ident_cache.get_targets(topic, &handle, &targets, message_targets)?
         } else {
             ident_cache.get_participants_targets(topic, &handle, &targets)
@@ -367,8 +404,58 @@ impl IMClient {
             !message_targets.iter().any(|target| !handles.contains(&target.participant)) {
             return Err(PushError::NoValidTargets);
         }
+
+        // `iMessage` `0x2832c`: `c=112` (DeliveredQuietly) requires `supports-dq-nr`.
+        if matches!(message.message, Message::DeliveredQuietly) {
+            message_targets.retain(|t| t.delivery_data.client_data.supports_delivered_quietly_and_notify_recipient);
+            if message_targets.is_empty() {
+                return Ok(SendJob {
+                    process: tokio::sync::broadcast::channel(1).1,
+                    handle: None,
+                });
+            }
+        }
         
         let my_handles = self.identity.get_handles().await;
+
+        // `iMessage` `0x2664c..0x26e20`: split c=102 read receipts by `supports-queue-one-read-receipts-v3`:
+        // peers lacking it receive legacy empty `c=102`; peers having it receive QueueOne + `omt` encrypted payload.
+        if let Message::EnhancedRead(ref rr) = message.message {
+            let convo = message.conversation.as_ref().expect("no convo for enhanced read");
+            let mut enhanced_targets = Vec::new();
+            let mut legacy_targets = Vec::new();
+            for target in message_targets {
+                if rr.omt_ms.is_some() && target.delivery_data.client_data.supports_queue_one_read_receipts_v3 {
+                    enhanced_targets.push(target);
+                } else {
+                    legacy_targets.push(target);
+                }
+            }
+
+            if !legacy_targets.is_empty() {
+                let mut ids_legacy = message.get_ids(&my_handles, &self.conn, true).await?;
+                ids_legacy.raw = Raw::None;
+                ids_legacy.queue_id = None;
+                ids_legacy.send_delivered = false;
+                if enhanced_targets.is_empty() {
+                    return self.identity.send_message(topic, ids_legacy, legacy_targets).await;
+                }
+                let _ = self.identity.send_message(topic, ids_legacy, legacy_targets).await;
+            }
+
+            if !enhanced_targets.is_empty() {
+                let mut ids_enhanced = message.get_ids(&my_handles, &self.conn, true).await?;
+                ids_enhanced.raw = Raw::Body(encode_enhanced_read_receipt(convo, rr)?);
+                ids_enhanced.queue_id = rr.chat_id.as_deref().map(|cid| queue_one_id_for_read_receipt(cid, &handle));
+                ids_enhanced.send_delivered = true;
+                return self.identity.send_message(topic, ids_enhanced, enhanced_targets).await;
+            }
+
+            return Ok(SendJob {
+                process: tokio::sync::broadcast::channel(1).1,
+                handle: None,
+            });
+        }
 
         if message.is_queued() {
             let mut targets = message_targets.clone();

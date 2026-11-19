@@ -136,6 +136,18 @@ struct RawReactMessage {
 }
 
 #[derive(Serialize, Deserialize)]
+pub(crate) struct RawEnhancedReadReceipt {
+    #[serde(rename = "p")]
+    pub participants: Vec<String>,
+    #[serde(rename = "gid")]
+    pub sender_guid: Option<String>,
+    #[serde(rename = "n")]
+    pub cv_name: Option<String>,
+    #[serde(rename = "omt")]
+    pub original_message_timestamp_ns: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct RawShareProfileMessage {
     cloud_kit_decryption_record_key: Data,

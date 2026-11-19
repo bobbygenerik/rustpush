@@ -1590,6 +1590,12 @@ impl SetTranscriptBackgroundMessage {
     }
 }
 
+#[derive(Clone, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadReceiptMessage {
+    pub omt_ms: Option<u64>,
+    pub chat_id: Option<String>,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TypingApp {
     pub bundle_id: String,
@@ -1605,6 +1611,11 @@ pub enum Message {
     React(ReactMessage),
     Delivered,
     Read,
+    EnhancedRead(ReadReceiptMessage),
+    Played,
+    Saved(i64),
+    ReflectedDelivery,
+    DeliveredQuietly,
     Typing(bool, Option<TypingApp>),
     Unsend(UnsendMessage),
     Edit(EditMessage),
@@ -1658,7 +1669,11 @@ impl Message {
             Self::RenameMessage(_) => 190,
             Self::ChangeParticipants(_) => 190,
             Self::Delivered => 101,
-            Self::Read => 102,
+            Self::Read | Self::EnhancedRead(_) => 102,
+            Self::Played => 105,
+            Self::Saved(_) => 106,
+            Self::ReflectedDelivery => 107,
+            Self::DeliveredQuietly => 112,
             Self::Typing(_, _) => 100,
             Self::Edit(_) => 118,
             Self::Unsend(_) => 118,
@@ -1773,11 +1788,20 @@ impl fmt::Display for Message {
             Message::React(msg) => {
                 write!(f, "{}", msg.get_text())
             },
-            Message::Read => {
+            Message::Read | Message::EnhancedRead(_) => {
                 write!(f, "read")
             },
-            Message::Delivered => {
+            Message::Played => {
+                write!(f, "played")
+            },
+            Message::Saved(_) => {
+                write!(f, "kept")
+            },
+            Message::Delivered | Message::ReflectedDelivery => {
                 write!(f, "delivered")
+            },
+            Message::DeliveredQuietly => {
+                write!(f, "delivered quietly")
             },
             Message::Typing(typing, _) => {
                 write!(f, "{}", if *typing { "typing" } else { "stopped typing" })
@@ -1919,6 +1943,38 @@ pub struct MessageInst {
     pub certified_context: Option<CertifiedContext>,
 }
 
+pub fn encode_enhanced_read_receipt(
+    conversation: &ConversationData,
+    msg: &ReadReceiptMessage,
+) -> Result<Vec<u8>, PushError> {
+    let binary = plist_to_bin(&RawEnhancedReadReceipt {
+        participants: conversation.participants.clone(),
+        sender_guid: conversation.sender_guid.clone(),
+        cv_name: conversation.cv_name.clone(),
+        original_message_timestamp_ns: msg.omt_ms.map(crate::imessage::aps_client::enhanced_read_receipt_omt_ns),
+    })?;
+    Ok(gzip(&binary)?)
+}
+
+pub fn decode_enhanced_read_receipt(value: &Value) -> Option<(Option<ConversationData>, ReadReceiptMessage)> {
+    let raw = plist::from_value::<RawEnhancedReadReceipt>(value).ok()?;
+    let convo = if raw.participants.is_empty() && raw.sender_guid.is_none() && raw.cv_name.is_none() {
+        None
+    } else {
+        Some(ConversationData {
+            participants: raw.participants,
+            cv_name: raw.cv_name,
+            sender_guid: raw.sender_guid,
+            after_guid: None,
+        })
+    };
+    let receipt = ReadReceiptMessage {
+        omt_ms: raw.original_message_timestamp_ns.map(|ns| ns / 1_000_000),
+        chat_id: None,
+    };
+    Some((convo, receipt))
+}
+
 impl MessageInst {
 
     pub fn new(conversation: ConversationData, sender: &str, message: Message) -> MessageInst {
@@ -1938,6 +1994,11 @@ impl MessageInst {
     pub fn has_payload(&self) -> bool {
         match &self.message {
             Message::Read => false,
+            Message::EnhancedRead(_) => false,
+            Message::Played => false,
+            Message::Saved(_) => false,
+            Message::ReflectedDelivery => false,
+            Message::DeliveredQuietly => false,
             Message::Delivered => false,
             Message::Typing(typing, app) => self.conversation.as_ref().is_some_and(|a| a.participants.len() > 2) || app.is_some() || !*typing,
             Message::MessageReadOnDevice => false,
@@ -1971,7 +2032,7 @@ impl MessageInst {
 
     pub fn get_send_participants(&self, my_handles: &[String]) -> Vec<String> {
         let mut target_participants = self.conversation.as_ref().unwrap().participants.clone();
-        if let Message::Delivered | Message::Typing(_, _) = self.message {
+        if let Message::Delivered | Message::DeliveredQuietly | Message::ReflectedDelivery | Message::Typing(_, _) = self.message {
             // do not send delivery reciepts to other devices on same acct
             target_participants.retain(|p| {
                 !my_handles.contains(p)
@@ -2378,8 +2439,17 @@ impl MessageInst {
                     }
                 }
             },
-            Message::Delivered => panic!("no enc body!"),
+            Message::Delivered | Message::ReflectedDelivery | Message::DeliveredQuietly | Message::Played | Message::Saved(_) => panic!("no enc body!"),
             Message::Read => panic!("no enc body!"),
+            Message::EnhancedRead(rr) => {
+                should_gzip = true;
+                plist_to_bin(&RawEnhancedReadReceipt {
+                    participants: conversation.participants.clone(),
+                    sender_guid: conversation.sender_guid.clone(),
+                    cv_name: conversation.cv_name.clone(),
+                    original_message_timestamp_ns: rr.omt_ms.map(crate::imessage::aps_client::enhanced_read_receipt_omt_ns),
+                }).unwrap()
+            },
             Message::MessageReadOnDevice => panic!("no enc body!"),
             Message::PeerCacheInvalidate => panic!("no enc body!"),
             Message::Error(_) => panic!("no enc body!"),

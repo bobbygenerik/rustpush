@@ -69,6 +69,8 @@ pub struct IDSRecvMessage {
     // for confirm
     #[serde(rename = "s")]
     pub status: Option<i64>,
+    #[serde(rename = "aT")]
+    pub saved_type: Option<i64>,
 
     #[serde(default, rename = "fU", deserialize_with = "bin_deserialize_opt_vec")]
     pub error_for: Option<Vec<u8>>,

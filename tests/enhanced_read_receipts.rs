@@ -1,4 +1,6 @@
-use rustpush::{CertifiedContext, should_certify_control_receipt};
+use rustpush::{
+    CertifiedContext, should_certify_control_receipt,
+};
 
 fn sample_context() -> CertifiedContext {
     CertifiedContext {
