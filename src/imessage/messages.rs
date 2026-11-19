@@ -1342,6 +1342,7 @@ impl MMCSFile {
             body: body.into()
         };
         let recv = apns.subscribe().await;
+        super::wire_capture::record_control_send("com.apple.madrid", &complete);
         apns.send_message("com.apple.madrid", complete, Some(msg_id)).await?;
 
         let reader = apns.wait_for_timeout(recv, get_message(|loaded| {
@@ -1443,6 +1444,7 @@ impl MMCSFile {
         info!("mmcs obj {} sig {}", self.object, encode_hex(&self.signature));
         
         let recv = apns.subscribe().await;
+        super::wire_capture::record_control_send("com.apple.madrid", &request_download);
         apns.send_message("com.apple.madrid", request_download, Some(msg_id)).await?;
 
         let reader = apns.wait_for_timeout(recv, get_message(|loaded| {

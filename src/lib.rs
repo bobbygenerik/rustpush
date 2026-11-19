@@ -27,6 +27,7 @@ pub mod statuskit;
 pub mod passwords;
 pub use imessage::cloud_messages;
 pub use imessage::hq_media;
+pub use imessage::wire_capture;
 pub use imessage::posterkit;
 pub use util::KeyedArchive;
 

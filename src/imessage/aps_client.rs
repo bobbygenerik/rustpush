@@ -241,6 +241,7 @@ impl IMClient {
                 e: duration_since_epoch().as_nanos() as u64,
             };
 
+            super::wire_capture::record_control_send("com.apple.madrid", &msg);
             conn.send_message("com.apple.madrid", msg, None).await?;
         }
         Ok(())

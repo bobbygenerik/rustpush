@@ -20,6 +20,7 @@ use uuid::Uuid;
 use std::str::FromStr;
 use std::fmt::Debug;
 use crate::{aps::new_aps_id, ids::link::QuickRelayAllocationsResponse, util::{DebugMutex, DebugRwLock}};
+use crate::imessage::wire_capture;
 
 use crate::{APSConnectionResource, APSMessage, IDSUser, MessageInst, OSConfig, PushError, aps::{APSConnection, APSInterestToken, get_message}, ids::{MessageBody, user::{IDSError, IDSLookupUser}}, register, util::{Resource, ResourceManager, base64_decode, base64_encode, bin_deserialize, bin_deserialize_sha, bin_serialize, duration_since_epoch, encode_hex, plist_to_bin, plist_to_string, ungzip}};
 
@@ -821,11 +822,11 @@ impl IdentityResource {
     }
 
     pub async fn receive_message(&self, msg: APSMessage, topics: &[&'static str]) -> Result<Option<IDSRecvMessage>, PushError> {
-        let APSMessage::Notification { id: _, topic, token: _, payload, channel: _ } = msg else { return Ok(None) };
+        let APSMessage::Notification { id: _, topic, token: _, payload: envelope, channel: _ } = msg else { return Ok(None) };
         let Some(topic) = topics.iter().find(|t| sha1(t.as_bytes()) == topic) else { return Ok(None) };
-        debug!("ID got message {topic} {:?}", &payload);
+        debug!("ID got message {topic} {:?}", &envelope);
 
-        let mut payload = plist::from_value::<IDSRecvMessage>(&payload)?;
+        let mut payload = plist::from_value::<IDSRecvMessage>(&envelope)?;
 
 
         payload.topic = *topic;
@@ -856,6 +857,7 @@ impl IdentityResource {
             payload.message_unenc = Some(MessageBody::Bytes(ungzipped));
         }
 
+        wire_capture::record(topic, "inbound", &envelope, payload.message_unenc.as_ref().map(Into::into), None);
         Ok(Some(payload))
     }
 
@@ -959,6 +961,7 @@ impl IdentityResource {
                 ("gd".to_string(), Value::Boolean(true)),
             ]);
         }
+        wire_capture::record_control_send(topic, &dict);
         self.aps.send_message(topic, dict, Some(msg_id)).await?;
 
         Ok(())
@@ -1170,15 +1173,19 @@ impl InnerSendJob {
         let mut group_size = 0;
         const GROUP_MAX_SIZE: usize = 5000;
 
+        let mut captured_bodies = wire_capture::enabled_for(self.topic).then(std::collections::VecDeque::new);
         for target in &targets {
-            let encrypted = match &message.raw {
+            let body = match &message.raw {
                 Raw::Body(b) => Some(b.clone()),
                 Raw::Builder(b) => b(target),
                 Raw::None => None,
             };
-            let encrypted = if let Some(msg) = encrypted {
-                Some(self.identity.identity.encrypt_payload(&target.delivery_data, &self.identity.cache, &msg).await?)
+            let encrypted = if let Some(msg) = &body {
+                Some(self.identity.identity.encrypt_payload(&target.delivery_data, &self.identity.cache, msg).await?)
             } else { None };
+            if let Some(bodies) = &mut captured_bodies {
+                bodies.push_back(body);
+            }
             let send_delivered = if message.send_delivered { &target.participant != &message.sender } else { false };
             group_size += encrypted.as_ref().map(|i| i.0.len()).unwrap_or(0);
             group.push(target.build_bundle(send_delivered, encrypted));
@@ -1234,6 +1241,12 @@ impl InnerSendJob {
 
             debug!("Sending value {value:?}");
 
+            if let Some(bodies) = &mut captured_bodies {
+                for index in 0..complete.payloads.len() {
+                    let body = bodies.pop_front().flatten();
+                    wire_capture::record(apns_topic, "outbound", &value, body.as_deref().map(wire_capture::Body::Bytes), Some(index));
+                }
+            }
             self.conn.send_message(apns_topic, value, Some(msg_id)).await?
         }
 

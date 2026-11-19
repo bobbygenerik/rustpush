@@ -6,3 +6,4 @@ pub mod name_photo_sharing;
 pub mod posterkit;
 pub mod cloud_messages;
 pub mod hq_media;
+pub mod wire_capture;
