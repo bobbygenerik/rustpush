@@ -70,6 +70,12 @@ pub const MADRID_SERVICE: IDSService = IDSService {
         ("supports-transcript-backgrounds", Value::Boolean(true)),
         ("supports-gti", Value::Boolean(true)),
         ("supports-polls", Value::Boolean(true)),
+        // IDSFoundation _IDSRegistrationPropertySupportsHighQualityVideo (0x1e0c055c8) &
+        // _IDSRegistrationPropertySupportsHighQualityPhotoFileSizes (0x1e0c05540),
+        // checked by IMDaemonCore commonCapabilitiesSupportHighQualityVideos: (0x2346d1a18)
+        // and commonCapabilitiesSupportHighQualityPhotos: (0x2346d19a8).
+        ("supports-high-quality-video", Value::Boolean(true)),
+        ("supports-high-quality-photo-file-sizes", Value::Boolean(true)),
     ],
     flags: 17,
     capabilities_name: "Messenger"

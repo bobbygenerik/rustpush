@@ -652,6 +652,26 @@ pub struct IDSLookupUser {
     pub sender_correlation_identifier: Option<String>,
 }
 
+fn deserialize_bool_or_int<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum BoolOrInt {
+        Bool(bool),
+        Int(i64),
+        UInt(u64),
+    }
+
+    match Option::<BoolOrInt>::deserialize(deserializer)? {
+        Some(BoolOrInt::Bool(b)) => Ok(b),
+        Some(BoolOrInt::Int(i)) => Ok(i == 1),
+        Some(BoolOrInt::UInt(u)) => Ok(u == 1),
+        None => Ok(false),
+    }
+}
+
 #[derive(Deserialize, Clone, Debug, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct ParsedClientData {
@@ -661,6 +681,10 @@ pub struct ParsedClientData {
     pub ngm_public_identity: Option<CompactECKey<Public>>,
     #[serde(default)]
     pub supports_certified_delivery_v1: bool,
+    #[serde(default, deserialize_with = "deserialize_bool_or_int")]
+    pub supports_high_quality_video: bool,
+    #[serde(default, deserialize_with = "deserialize_bool_or_int")]
+    pub supports_high_quality_photo_file_sizes: bool,
 }
 
 pub fn deserialize_kt_data<'de, D>(d: D) -> Result<Option<CompactECKey<Public>>, D::Error>

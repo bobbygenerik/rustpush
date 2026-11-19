@@ -1014,6 +1014,28 @@ impl IdentityResource {
             handle,
         })
     }
+
+    pub async fn common_hq_capabilities(
+        &self,
+        targets: &[String],
+        topic: &'static str,
+        handle: &str,
+    ) -> Result<crate::imessage::hq_media::CommonHqCapabilities, PushError> {
+        if targets.is_empty() {
+            return Ok(crate::imessage::hq_media::CommonHqCapabilities::default());
+        }
+        let delivery_handles = self.targets_for_handles(topic, targets, handle).await?;
+        let mut per_participant: HashMap<String, Vec<crate::ids::user::ParsedClientData>> =
+            targets.iter().map(|t| (t.clone(), Vec::new())).collect();
+        for dh in delivery_handles {
+            if let Some(list) = per_participant.get_mut(&dh.participant) {
+                list.push(dh.delivery_data.client_data);
+            }
+        }
+        Ok(crate::imessage::hq_media::compute_common_hq_capabilities(
+            &per_participant,
+        ))
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
