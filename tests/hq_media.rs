@@ -94,6 +94,18 @@ fn parsed_client_data_decodes_bool_and_integer_hq_flags() {
     assert!(!int_two.supports_high_quality_video);
     assert!(!int_two.supports_high_quality_photo_file_sizes);
 
+    // Build 1019 regression: an unexpected value type must not fail the whole lookup.
+    let odd = sample_client_data(
+        &ident,
+        Some(Value::String("1".into())),
+        Some(Value::Data(vec![1, 2, 3])),
+    );
+    assert!(odd.supports_high_quality_video);
+    assert!(!odd.supports_high_quality_photo_file_sizes);
+    let real = sample_client_data(&ident, Some(Value::Real(1.0)), Some(Value::Real(2.5)));
+    assert!(real.supports_high_quality_video);
+    assert!(!real.supports_high_quality_photo_file_sizes);
+
     let omitted = sample_client_data(&ident, None, None);
     assert!(!omitted.supports_high_quality_video);
     assert!(!omitted.supports_high_quality_photo_file_sizes);

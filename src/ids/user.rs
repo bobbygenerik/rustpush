@@ -656,20 +656,26 @@ fn deserialize_bool_or_int<'de, D>(deserializer: D) -> Result<bool, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum BoolOrInt {
-        Bool(bool),
-        Int(i64),
-        UInt(u64),
-    }
-
-    match Option::<BoolOrInt>::deserialize(deserializer)? {
-        Some(BoolOrInt::Bool(b)) => Ok(b),
-        Some(BoolOrInt::Int(i)) => Ok(i == 1),
-        Some(BoolOrInt::UInt(u)) => Ok(u == 1),
-        None => Ok(false),
-    }
+    // Peer capability values are not always bool/int (versioned caps, reals, strings).
+    // A capability flag must never fail the whole IDS lookup: that broke every send to
+    // the chat in build 1019. Accept any plist value; unknown shapes count as "absent".
+    let v = Option::<Value>::deserialize(deserializer)?;
+    Ok(match v {
+        Some(Value::Boolean(b)) => b,
+        // Integers keep the existing `== 1` semantics (tests/hq_media.rs int_two case).
+        Some(Value::Integer(i)) => i
+            .as_signed()
+            .map(|x| x == 1)
+            .or_else(|| i.as_unsigned().map(|x| x == 1))
+            .unwrap_or(false),
+        Some(Value::Real(r)) => r == 1.0,
+        Some(Value::String(s)) => matches!(s.trim(), "1" | "true" | "TRUE" | "YES" | "yes"),
+        Some(other) => {
+            log::debug!("capability flag with unexpected plist type: {:?}", other);
+            false
+        }
+        None => false,
+    })
 }
 
 #[derive(Deserialize, Clone, Debug, Serialize)]
