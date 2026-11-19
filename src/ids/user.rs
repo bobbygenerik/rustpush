@@ -693,6 +693,8 @@ pub struct ParsedClientData {
     pub supports_async_attachments: bool,
     #[serde(default, deserialize_with = "deserialize_bool_or_int")]
     pub supports_group_photo_refresh_version: bool,
+    #[serde(default, deserialize_with = "deserialize_bool_or_int")]
+    pub supports_heif: bool,
 }
 
 pub fn deserialize_kt_data<'de, D>(d: D) -> Result<Option<CompactECKey<Public>>, D::Error>

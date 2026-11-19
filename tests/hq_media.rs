@@ -5,11 +5,13 @@ use openssl::nid::Nid;
 use openssl::rsa::Rsa;
 use plist::Value;
 use rustpush::hq_media::{
-    MMCS_HQ_PHOTO_REPORTED_SIZE_OVERRIDE, MMCS_HQ_VIDEO_REPORTED_SIZE_OVERRIDE,
-    MODERN_HIGH_QUALITY_PHOTO_SIZE_LIMIT, MODERN_HIGH_QUALITY_VIDEO_SIZE_LIMIT,
-    SMALLER_IMAGE_FILE_SIZE, STANDARD_VIDEO_CELLULAR_SIZE_LIMIT, STANDARD_VIDEO_WIFI_SIZE_LIMIT,
-    compute_common_hq_capabilities, mmcs_target_report_size_for_hq_photo,
-    mmcs_target_report_size_for_hq_video,
+    MESSAGE_SENDABLE_UTIS, MMCS_HQ_PHOTO_REPORTED_SIZE_OVERRIDE,
+    MMCS_HQ_VIDEO_REPORTED_SIZE_OVERRIDE, MODERN_HIGH_QUALITY_PHOTO_SIZE_LIMIT,
+    MODERN_HIGH_QUALITY_VIDEO_SIZE_LIMIT, SMALLER_IMAGE_FILE_SIZE,
+    STANDARD_PHOTO_CELLULAR_SIZE_LIMIT, STANDARD_PHOTO_WIFI_SIZE_LIMIT,
+    STANDARD_VIDEO_CELLULAR_SIZE_LIMIT, STANDARD_VIDEO_WIFI_SIZE_LIMIT,
+    TINY_IMAGE_QUALITY_SIZE_LIMIT, compute_common_hq_capabilities,
+    mmcs_target_report_size_for_hq_photo, mmcs_target_report_size_for_hq_video,
 };
 use rustpush::{IDSPublicIdentity, MADRID_SERVICE, ParsedClientData};
 
@@ -146,9 +148,15 @@ fn ipsw_size_limits_and_mmcs_report_size_overrides_match_24a446() {
     assert_eq!(MODERN_HIGH_QUALITY_PHOTO_SIZE_LIMIT, 0x640_0000);
     assert_eq!(STANDARD_VIDEO_WIFI_SIZE_LIMIT, 0xa0_0000);
     assert_eq!(STANDARD_VIDEO_CELLULAR_SIZE_LIMIT, 0x40_0000);
+    assert_eq!(STANDARD_PHOTO_WIFI_SIZE_LIMIT, 0xa0_0000);
+    assert_eq!(STANDARD_PHOTO_CELLULAR_SIZE_LIMIT, 0x40_0000);
     assert_eq!(SMALLER_IMAGE_FILE_SIZE, 0x7_d000);
+    assert_eq!(TINY_IMAGE_QUALITY_SIZE_LIMIT, 0x5_7800);
     assert_eq!(MMCS_HQ_VIDEO_REPORTED_SIZE_OVERRIDE, 0x13f_ffff);
     assert_eq!(MMCS_HQ_PHOTO_REPORTED_SIZE_OVERRIDE, 0x10_0000);
+    assert!(MESSAGE_SENDABLE_UTIS.contains(&"public.jpeg"));
+    assert!(MESSAGE_SENDABLE_UTIS.contains(&"public.png"));
+    assert!(!MESSAGE_SENDABLE_UTIS.contains(&"public.heic"));
 
     // IMDaemonCore mmcsTargetReportSizeForHighQualityVideoSize:commonCapabilities: (0x2346d1d4c)
     assert_eq!(
