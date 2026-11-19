@@ -80,13 +80,20 @@ pub const MADRID_SERVICE: IDSService = IDSService {
         // IDSFoundation _IDSRegistrationPropertySupportsQueueOneReadReceiptsV3 (`0x574c56`),
         // gated by Messages/enhanced_read_receipts (`identityservicesd` `0x10065815c`).
         ("supports-queue-one-read-receipts-v3", Value::Boolean(true)),
-        // IDSFoundation safe capability advertisements parity with iOS 27 (`identityservicesd`):
-        // LQM-HQ (`0x100657274`), emoji stickers (`0x100658050`), sticker editing (`0x100658094`),
-        // Animoji v2 (`0x100657e68`).
+        // IDSFoundation capability advertisements parity with iOS 27 (`identityservicesd`):
+        // LQM-HQ (`0x100657274`), sticker editing (`0x100658094`).
         ("supports-lqm-hq", Value::Boolean(true)),
+        // `supports-emoji-stickers`: despite the name, its only sender-side use is the Send Later
+        // gate. iMessage.imservice MessageDeliveryController `func_486e8` (`0x48e54..0x48e7c`):
+        // scheduleType == 1 → IDSSendMessageOptionRequireAllRegistrationPropertiesKey =
+        // {supports-emoji-stickers}, so server-held scheduled messages only reach peers advertising it.
         ("supports-emoji-stickers", Value::Boolean(true)),
         ("supports-sticker-editing", Value::Boolean(true)),
-        ("supports-animoji-v2", Value::Boolean(true)),
+        // `supports-animoji-v2` deliberately NOT advertised. iMessage.imservice `0x4b5a4..0x4b5bc`
+        // adds it to a message's required capabilities when a transfer isAnimojiV2 && !wantsAlphaRemoved
+        // (HEVC + alpha). Peers without it get Apple's compatibility copy (`func_4e1b4` `0x4ee24..0x4ee6c`,
+        // "Contains AnimojiV2. Setting RemoveAlpha transcoderUserInfo option"). Android MediaCodec cannot
+        // decode the HEVC alpha layer, so the RemoveAlpha copy is the one we can render correctly.
         // `identityservicesd` (`0x10065817c`): gates NBAS placeholder `<FILE>` + `c=108` updates.
         ("supports-async-attachments", Value::Boolean(true)),
         // `IDSFoundation` `0x197ce9f1e` & `iMessage.imservice` `0x8b144`/`0x8bfb0`: group photo refresh (`gpru`).
