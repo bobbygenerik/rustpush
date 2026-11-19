@@ -89,6 +89,8 @@ pub const MADRID_SERVICE: IDSService = IDSService {
         ("supports-animoji-v2", Value::Boolean(true)),
         // `identityservicesd` (`0x10065817c`): gates NBAS placeholder `<FILE>` + `c=108` updates.
         ("supports-async-attachments", Value::Boolean(true)),
+        // `IDSFoundation` `0x197ce9f1e` & `iMessage.imservice` `0x8b144`/`0x8bfb0`: group photo refresh (`gpru`).
+        ("supports-group-photo-refresh-version", Value::Boolean(true)),
     ],
     flags: 17,
     capabilities_name: "Messenger"
@@ -304,6 +306,7 @@ impl IMClient {
                 cv_name: None,
                 sender_guid: None,
                 after_guid: None,
+                group_photo_refresh_ns: None,
             }), Message::Typing(true, None)).ok())
         }
 
@@ -354,6 +357,7 @@ impl IMClient {
                 cv_name: None,
                 sender_guid: Some(Uuid::new_v4().to_string()),
                 after_guid: None,
+                group_photo_refresh_ns: None,
             }, &sender, Message::MessageReadOnDevice)).await;
         }
 

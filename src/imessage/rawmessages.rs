@@ -28,6 +28,8 @@ pub struct RawRenameMessage {
     pub msg_type: String,
     #[serde(rename = "gid")]
     pub sender_guid: Option<String>,
+    #[serde(rename = "gpru", default, skip_serializing_if = "Option::is_none")]
+    pub group_photo_refresh_ns: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -47,6 +49,8 @@ pub struct RawChangeMessage {
     pub msg_type: String,
     #[serde(rename = "gid")]
     pub sender_guid: Option<String>,
+    #[serde(rename = "gpru", default, skip_serializing_if = "Option::is_none")]
+    pub group_photo_refresh_ns: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -79,15 +83,20 @@ struct RawIconChangeMessage {
     participants: Vec<String>,
     #[serde(rename = "n")]
     cv_name: Option<String>,
-    gv: String
+    gv: String,
+    #[serde(rename = "gpru", default, skip_serializing_if = "Option::is_none")]
+    pub group_photo_refresh_ns: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct RawReactMessage {
+    #[serde(default)]
     pv: u64,
-    amrln: u64,
-    amrlc: u64,
-    amt: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    amrln: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    amrlc: Option<i64>,
+    amt: i64,
     #[serde(rename = "t")]
     text: String,
     #[serde(rename = "p")]
@@ -133,6 +142,12 @@ struct RawReactMessage {
     low_res_wallpaper_tag: Option<Data>,
     #[serde(rename = "nWMK")]
     wallpaper_message_tag: Option<Data>,
+    #[serde(rename = "amf", default, skip_serializing_if = "Option::is_none")]
+    associated_message_fallback_hash: Option<u64>,
+    #[serde(rename = "tgf", default, skip_serializing_if = "Option::is_none")]
+    thread_originator_fallback_hash: Option<u64>,
+    #[serde(rename = "gpru", default, skip_serializing_if = "Option::is_none")]
+    group_photo_refresh_ns: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -164,8 +179,12 @@ struct RawShareProfileMessage {
 
 #[derive(Serialize, Deserialize)]
 struct RawEditMessage {
+    #[serde(rename = "v", default, skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
     #[serde(rename = "epb")]
     new_html_body: String,
+    #[serde(rename = "ept", default, skip_serializing_if = "Option::is_none")]
+    translated_html: Option<String>,
     et: u64,
     #[serde(rename = "t")]
     new_text: Option<String>,
@@ -411,6 +430,7 @@ struct RawIMessage {
     after_guid: Option<String>, // uuid
     #[serde(rename = "gid")]
     sender_guid: Option<String>,
+    #[serde(default)]
     pv: u64,
     gv: String,
     v: String,
@@ -442,6 +462,18 @@ struct RawIMessage {
     schedule_date: Option<Date>,
     #[serde(rename = "st")]
     schedule_type: Option<u32>,
+    #[serde(rename = "tbid", default, skip_serializing_if = "Option::is_none")]
+    transcript_background_id: Option<u64>,
+    #[serde(rename = "gpru", default, skip_serializing_if = "Option::is_none")]
+    group_photo_refresh_ns: Option<u64>,
+    #[serde(rename = "tx", default, skip_serializing_if = "Option::is_none")]
+    translated_html: Option<String>,
+    #[serde(rename = "ar", default, skip_serializing_if = "Option::is_none")]
+    is_auto_reply: Option<bool>,
+    #[serde(rename = "ms", default, skip_serializing_if = "Option::is_none")]
+    is_from_external_source: Option<bool>,
+    #[serde(rename = "tgf", default, skip_serializing_if = "Option::is_none")]
+    thread_originator_fallback_hash: Option<u64>,
     #[serde(rename = "CloudKitDecryptionRecordKey")]
     cloud_kit_decryption_record_key: Option<Data>,
     #[serde(rename = "CloudKitRecordKey")]
@@ -456,6 +488,17 @@ struct RawIMessage {
     low_res_wallpaper_tag: Option<Data>,
     #[serde(rename = "nWMK")]
     wallpaper_message_tag: Option<Data>,
+}
+
+/// `iMessage.imservice` `FTCommandIDBalloonTransportCommand` (`c=196` / `0xc4`, `0x2bc28`, `0x1f82c`, `0x87af4`).
+#[derive(Serialize, Deserialize)]
+struct RawBalloonTransportMessage {
+    #[serde(rename = "bid")]
+    balloon_id: String,
+    #[serde(rename = "p", default, skip_serializing_if = "Option::is_none")]
+    balloon_part: Option<Data>,
+    #[serde(rename = "bpdi", default, skip_serializing_if = "Option::is_none")]
+    balloon_part_mmcs: Option<RawMMCSBalloon>,
 }
 
 

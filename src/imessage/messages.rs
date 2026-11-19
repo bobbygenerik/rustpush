@@ -33,6 +33,7 @@ pub struct ConversationData {
     pub cv_name: Option<String>,
     pub sender_guid: Option<String>,
     pub after_guid: Option<String>,
+    pub group_photo_refresh_ns: Option<u64>,
 }
 
 impl ConversationData {
@@ -817,6 +818,18 @@ pub struct NormalMessage {
     pub voice: bool,
     pub scheduled: Option<ScheduleMode>,
     pub embedded_profile: Option<ShareProfileMessage>,
+    pub transcript_background_id: Option<u64>,
+    pub translated_html: Option<String>,
+    pub is_auto_reply: Option<bool>,
+    pub is_from_external_source: Option<bool>,
+}
+
+#[repr(C)]
+#[derive(Clone, Serialize, Deserialize)]
+pub struct BalloonTransportMessage {
+    pub bundle_id: String,
+    pub link_meta: Option<LinkMeta>,
+    pub app: Option<ExtensionApp>,
 }
 
 #[repr(C)]
@@ -844,6 +857,10 @@ impl NormalMessage {
             voice: false,
             scheduled: None,
             embedded_profile: None,
+            transcript_background_id: None,
+            translated_html: None,
+            is_auto_reply: None,
+            is_from_external_source: None,
         }
     }
 }
@@ -1644,13 +1661,20 @@ pub enum SetTranscriptBackgroundMessage {
         key: String,
         #[serde(rename = "trabafs")]
         file_size: usize,
+    },
+    /// `iMessage.imservice` `requestTranscriptBackground:` (`0xbbb50..0xbbb90`, `traba = 3`).
+    Request {
+        #[serde(rename = "traba")]
+        aid: u32,
+        #[serde(rename = "cid")]
+        chat_id: Option<String>,
     }
 }
 
 impl SetTranscriptBackgroundMessage {
     pub fn to_mmcs(&self) -> Option<MMCSFile> {
         match self {
-            Self::Remove { .. } => None,
+            Self::Remove { .. } | Self::Request { .. } => None,
             Self::Set { object_id, url, signature, key, file_size, .. } => Some(MMCSFile { 
                 signature: base64_decode(&signature), 
                 object: object_id.to_string(), 
@@ -1732,6 +1756,7 @@ pub enum Message {
     NotifyAnyways,
     SetTranscriptBackground(SetTranscriptBackgroundMessage),
     UpdateAttachments(UpdateAttachmentsMessage),
+    BalloonTransport(BalloonTransportMessage),
 }
 
 
@@ -1791,6 +1816,7 @@ impl Message {
             Self::NotifyAnyways => 113,
             Self::SetTranscriptBackground(_) => 138,
             Self::UpdateAttachments(_) => 108,
+            Self::BalloonTransport(_) => 196,
         }
     }
 
@@ -1801,6 +1827,8 @@ impl Message {
             Message::UpdateProfile(_) => true,
             // `iMessage.imservice` `0x5537c..0x55400`: sets `WantsDeliveryStatusKey` on `c=108` in 1:1 chats.
             Message::UpdateAttachments(_) => !conversation.is_group(),
+            // `iMessage.imservice` `0x2bdb4`: `c=196` sets `WantsDeliveryStatusKey`.
+            Message::BalloonTransport(_) => true,
             _ => false
         }
     }
@@ -1964,6 +1992,9 @@ impl fmt::Display for Message {
             },
             Message::UpdateAttachments(_) => {
                 write!(f, "Updated attachments")
+            },
+            Message::BalloonTransport(_) => {
+                write!(f, "Updated balloon payload")
             }
         }
     }
@@ -2068,6 +2099,7 @@ pub fn decode_enhanced_read_receipt(value: &Value) -> Option<(Option<Conversatio
             cv_name: raw.cv_name,
             sender_guid: raw.sender_guid,
             after_guid: None,
+            group_photo_refresh_ns: None,
         })
     };
     let receipt = ReadReceiptMessage {
@@ -2166,7 +2198,7 @@ impl MessageInst {
                     id: Uuid::new_v4().to_string().to_uppercase(),
                     sent_timestamp: 0,
                     send_delivered: false,
-                    conversation: Some(ConversationData { participants: vec![], cv_name: None, sender_guid: None, after_guid: None, }),
+                    conversation: Some(ConversationData { participants: vec![], cv_name: None, sender_guid: None, after_guid: None, group_photo_refresh_ns: None }),
                     message: Message::PermanentDelete(PermanentDeleteMessage {
                         is_scheduled: true,
                         target: DeleteTarget::Messages(vec![self.id.clone()]),
@@ -2221,7 +2253,8 @@ impl MessageInst {
                     new_name: msg.new_name.clone(),
                     old_name: conversation.cv_name.clone(),
                     name: Some(msg.new_name.clone()),
-                    msg_type: "n".to_string()
+                    msg_type: "n".to_string(),
+                    group_photo_refresh_ns: conversation.group_photo_refresh_ns,
                 };
                 plist_to_bin(&raw).unwrap()
             },
@@ -2230,6 +2263,19 @@ impl MessageInst {
             }
             Message::UpdateAttachments(update) => {
                 encode_update_attachments(update)?
+            }
+            Message::BalloonTransport(bt) => {
+                let (_, balloon_part, _) = Self::encode_balloon_payload(bt.app.as_ref(), bt.link_meta.as_ref())?;
+                let (balloon_part, balloon_part_mmcs) = if let Some(balloon_part) = balloon_part {
+                    Self::put_balloon(balloon_part, apns).await?
+                } else {
+                    (None, None)
+                };
+                plist_to_bin(&RawBalloonTransportMessage {
+                    balloon_id: bt.bundle_id.clone(),
+                    balloon_part,
+                    balloon_part_mmcs,
+                })?
             }
             Message::UpdateExtension(ext) => {
                 let raw = RawUpdateExtensionMessage {
@@ -2326,7 +2372,8 @@ impl MessageInst {
                     new_name: conversation.cv_name.clone(),
                     name: conversation.cv_name.clone(),
                     msg_type: "p".to_string(),
-                    group_version: msg.group_version
+                    group_version: msg.group_version,
+                    group_photo_refresh_ns: conversation.group_photo_refresh_ns,
                 };
                 plist_to_bin(&raw).unwrap()
             },
@@ -2353,9 +2400,9 @@ impl MessageInst {
 
                 let raw = RawReactMessage {
                     text: text,
-                    amrln: if react.to_part.is_none() { u64::MAX } else { react.to_text.len() as u64 },
-                    amrlc: 0,
-                    amt: react.reaction.get_cmd(),
+                    amrln: Some(if react.to_part.is_none() { -1 } else { react.to_text.len() as i64 }),
+                    amrlc: Some(0),
+                    amt: react.reaction.get_cmd() as i64,
                     participants: conversation.participants.clone(),
                     after_guid: conversation.after_guid.clone(),
                     sender_guid: conversation.sender_guid.clone(),
@@ -2386,31 +2433,17 @@ impl MessageInst {
                     low_res_wallpaper_tag: react.embedded_profile.as_ref().and_then(|p| p.poster.as_ref().map(|p| p.low_res_wallpaper_tag.clone().into())),
                     wallpaper_update_key: react.embedded_profile.as_ref().and_then(|p| if p.poster.is_some() { Some("YES".to_string()) } else { None }),
                     update_info_included: react.embedded_profile.as_ref().and_then(|p| if p.poster.is_some() { Some(15) } else { None }),
+                    associated_message_fallback_hash: None,
+                    thread_originator_fallback_hash: None,
+                    group_photo_refresh_ns: conversation.group_photo_refresh_ns,
                 };
                 plist_to_bin(&raw).unwrap()
             },
             Message::Message (normal) => {
                 match &normal.service {
                     MessageType::IMessage => {
-                        let mut balloon_id: Option<String> = None;
-                        let mut balloon_part: Option<Vec<u8>> = None;
-                        let mut app_info: Option<Data> = None;
-                        if let Some(app_obj) = &normal.app {
-                            let (app, balloon) = app_obj.to_raw(false)?;
-                            app_info = Some(app.into());
-                            balloon_part = balloon;
-                            balloon_id = Some(app_obj.bundle_id.clone());
-                        }
-                        if let Some(link_meta) = &normal.link_meta {
-                            balloon_id = Some("com.apple.messages.URLBalloonProvider".to_string());
-                            balloon_part = Some(gzip(&BaseBalloonBody {
-                                attachments: link_meta.attachments.clone().into_iter().map(|i| i.into()).collect(),
-                                payload: plist_to_bin(&KeyedArchive::archive_item(plist::to_value(&RichLink {
-                                    rich_link_is_placeholder: true,
-                                    rich_link_metadata: link_meta.data.clone(),
-                                })?)?)?.into(),
-                            }.to_bin()?)?);
-                        }
+                        let (balloon_id, balloon_part, app_info) =
+                            Self::encode_balloon_payload(normal.app.as_ref(), normal.link_meta.as_ref())?;
                         let (balloon_part, balloon_part_mmcs) = if let Some(balloon_part) = balloon_part {
                             Self::put_balloon(balloon_part, apns).await?
                         } else {
@@ -2440,6 +2473,12 @@ impl MessageInst {
                             voice_e: if normal.voice { Some(true) } else { None },
                             schedule_date: if !scheduled { normal.scheduled.clone().map(|i| (SystemTime::UNIX_EPOCH + Duration::from_millis(i.ms)).into()) } else { None },
                             schedule_type: if normal.scheduled.is_some() && !scheduled { Some(2) } else { None },
+                            transcript_background_id: normal.transcript_background_id,
+                            group_photo_refresh_ns: conversation.group_photo_refresh_ns,
+                            translated_html: normal.translated_html.clone(),
+                            is_auto_reply: normal.is_auto_reply.filter(|b| *b),
+                            is_from_external_source: normal.is_from_external_source.filter(|b| *b),
+                            thread_originator_fallback_hash: None,
                             cloud_kit_decryption_record_key: normal.embedded_profile.as_ref().map(|p| p.cloud_kit_decryption_record_key.clone().into()),
                             cloud_kit_record_key: normal.embedded_profile.as_ref().map(|p| p.cloud_kit_record_key.clone()),
                             wallpaper_message_tag: normal.embedded_profile.as_ref().and_then(|p| p.poster.as_ref().map(|p| p.message_tag.clone().into())),
@@ -2572,7 +2611,9 @@ impl MessageInst {
             },
             Message::Edit(msg) => {
                 let raw = RawEditMessage {
+                    version: Some("1".to_string()),
                     new_html_body: msg.new_parts.to_xml(None),
+                    translated_html: None,
                     et: 1,
                     part_index: msg.edit_part,
                     message: msg.tuuid.clone(),
@@ -2598,7 +2639,8 @@ impl MessageInst {
                     msg_type: "v".to_string(),
                     participants: remove_prefix(&conversation.participants),
                     gv: "8".to_string(),
-                    cv_name: conversation.cv_name.clone()
+                    cv_name: conversation.cv_name.clone(),
+                    group_photo_refresh_ns: conversation.group_photo_refresh_ns,
                 };
 
                 warn!("sent {:?}", plist::Value::from_reader(Cursor::new(&plist_to_bin(&raw).unwrap())));
@@ -2682,9 +2724,101 @@ impl MessageInst {
         }
     }
 
+    fn encode_balloon_payload(
+        app: Option<&ExtensionApp>,
+        link_meta: Option<&LinkMeta>,
+    ) -> Result<(Option<String>, Option<Vec<u8>>, Option<Data>), PushError> {
+        let mut balloon_id: Option<String> = None;
+        let mut balloon_part: Option<Vec<u8>> = None;
+        let mut app_info: Option<Data> = None;
+        if let Some(app_obj) = app {
+            let (app_bytes, balloon) = app_obj.to_raw(false)?;
+            app_info = Some(app_bytes.into());
+            balloon_part = balloon;
+            balloon_id = Some(app_obj.bundle_id.clone());
+        }
+        if let Some(link_meta) = link_meta {
+            balloon_id = Some("com.apple.messages.URLBalloonProvider".to_string());
+            balloon_part = Some(gzip(&BaseBalloonBody {
+                attachments: link_meta.attachments.clone().into_iter().map(|i| i.into()).collect(),
+                payload: plist_to_bin(&KeyedArchive::archive_item(plist::to_value(&RichLink {
+                    rich_link_is_placeholder: true,
+                    rich_link_metadata: link_meta.data.clone(),
+                })?)?)?.into(),
+            }.to_bin()?)?);
+        }
+        Ok((balloon_id, balloon_part, app_info))
+    }
+
+    fn decode_balloon_and_link(
+        balloon_id: Option<&str>,
+        balloon_part: Option<Vec<u8>>,
+        app_info: Option<&Data>,
+    ) -> (Option<ExtensionApp>, Option<LinkMeta>) {
+        let mut app = None;
+        if let Some(app_info) = app_info {
+            app = match ExtensionApp::from_ati(app_info.as_ref(), balloon_part.as_deref()) {
+                Ok(i) => Some(i),
+                Err(e) => {
+                    warn!("Error parsing balloon {e}");
+                    None
+                }
+            };
+        }
+        if let (Some(balloon), None, Some(bid)) = (&balloon_part, &app, balloon_id) {
+            app = match Balloon::decode_raw(balloon) {
+                Ok(i) => Some(ExtensionApp {
+                    app_id: None,
+                    name: "None".to_string(),
+                    bundle_id: bid.to_string(),
+                    balloon: Some(i),
+                }),
+                Err(e) => {
+                    warn!("Error parsing balloon {e}");
+                    None
+                }
+            };
+        }
+        let mut link_meta = None;
+        if let (Some("com.apple.messages.URLBalloonProvider"), Some(balloon_part)) = (balloon_id, balloon_part) {
+            match (|| {
+                let unpacked = BaseBalloonBody::from_bin(ungzip(&balloon_part)?);
+                let payload: RichLink = plist::from_value(&KeyedArchive::expand_root(unpacked.payload.as_ref())?)?;
+                Ok::<_, PushError>((unpacked, payload))
+            })() {
+                Ok((unpacked, payload)) => {
+                    link_meta = Some(LinkMeta {
+                        data: payload.rich_link_metadata,
+                        attachments: unpacked.attachments.into_iter().map(|i| i.into()).collect(),
+                    });
+                },
+                Err(e) => {
+                    error!("Error parsing url preview! {e}");
+                }
+            }
+        }
+        (app, link_meta)
+    }
+
     #[async_recursion]
     pub async fn from_raw(value: Value, wrapper: &IDSRecvMessage, apns: &APSConnectionResource) -> Result<MessageInst, PushError> {
         debug!("xml: {:?}",value);
+        if wrapper.command == 196 {
+            if let Ok(loaded) = plist::from_value::<RawBalloonTransportMessage>(&value) {
+                let balloon_part = Self::get_balloon(loaded.balloon_part, loaded.balloon_part_mmcs, apns).await;
+                let (app, link_meta) = Self::decode_balloon_and_link(
+                    Some(loaded.balloon_id.as_str()),
+                    balloon_part,
+                    None,
+                );
+                return wrapper.to_message(None, Message::BalloonTransport(BalloonTransportMessage {
+                    bundle_id: loaded.balloon_id,
+                    link_meta,
+                    app,
+                }));
+            }
+            return Err(PushError::BadMsg);
+        }
         if let Ok(loaded) = plist::from_value::<RawSmsActivateMessage>(&value) {
             if !loaded.wc && loaded.ar {
                 return wrapper.to_message(None, Message::EnableSmsActivation(true));
@@ -2698,6 +2832,7 @@ impl MessageInst {
                     cv_name: loaded.cv_name.clone(),
                     sender_guid: loaded.sender_guid.clone(),
                     after_guid: None,
+                    group_photo_refresh_ns: None,
                 }), Message::Typing(loaded.u == Some(true), if let (Some(bid), Some(icon)) = (&loaded.bundle_id, loaded.icon) { Some(TypingApp { 
                     bundle_id: bid.clone(), 
                     icon: ungzip(icon.as_ref())?, 
@@ -2800,6 +2935,7 @@ impl MessageInst {
                 cv_name: loaded.name,
                 sender_guid: loaded.sender_guid.clone(),
                 after_guid: None,
+                group_photo_refresh_ns: loaded.group_photo_refresh_ns,
             }), Message::ChangeParticipants(ChangeParticipantMessage { new_participants: add_prefix(&loaded.target_participants), group_version: loaded.group_version }))
         }
         if let Ok(loaded) = plist::from_value::<RawIconChangeMessage>(&value) {
@@ -2808,6 +2944,7 @@ impl MessageInst {
                 cv_name: loaded.cv_name.clone(),
                 sender_guid: loaded.sender_guid.clone(),
                 after_guid: None,
+                group_photo_refresh_ns: loaded.group_photo_refresh_ns,
             }), Message::IconChange(IconChangeMessage {
                 file: loaded.new_icon.map(|icon| icon.local_user_info.into()),
                 group_version: loaded.group_version
@@ -2840,6 +2977,7 @@ impl MessageInst {
                 cv_name: loaded.old_name.clone(),
                 sender_guid: loaded.sender_guid.clone(),
                 after_guid: None,
+                group_photo_refresh_ns: loaded.group_photo_refresh_ns,
             }), Message::RenameMessage(RenameMessage { new_name: loaded.new_name.clone() }));
         }
         if let Ok(loaded) = plist::from_value::<RawReactMessage>(&value) {
@@ -2886,12 +3024,12 @@ impl MessageInst {
                         enable: loaded.amt == 2007
                     }
                 },
-                2000..=2999 => ReactMessageType::React {
-                    reaction: ReactMessage::from_idx(loaded.amt - 2000, loaded.react_emoji.clone()).ok_or(PushError::BadMsg)?,
+                amt @ 2000..=2999 => ReactMessageType::React {
+                    reaction: ReactMessage::from_idx((amt - 2000) as u64, loaded.react_emoji.clone()).ok_or(PushError::BadMsg)?,
                     enable: true
                 },
-                3000..=3999 => ReactMessageType::React {
-                    reaction: ReactMessage::from_idx(loaded.amt - 3000, loaded.react_emoji.clone()).ok_or(PushError::BadMsg)?,
+                amt @ 3000..=3999 => ReactMessageType::React {
+                    reaction: ReactMessage::from_idx((amt - 3000) as u64, loaded.react_emoji.clone()).ok_or(PushError::BadMsg)?,
                     enable: false
                 },
                 _ => return Err(PushError::BadMsg)
@@ -2901,6 +3039,7 @@ impl MessageInst {
                 cv_name: loaded.cv_name.clone(),
                 sender_guid: loaded.sender_guid.clone(),
                 after_guid: loaded.after_guid.clone(),
+                group_photo_refresh_ns: loaded.group_photo_refresh_ns,
             }), Message::React(ReactMessage {
                 to_uuid,
                 to_part,
@@ -2945,6 +3084,7 @@ impl MessageInst {
                     cv_name: None, // ha sms sux, can't believe these losers don't have an iPhone
                     sender_guid: None,
                     after_guid: None,
+                    group_photo_refresh_ns: None,
                 }),
                 Message::Message(NormalMessage {
                     parts,
@@ -2962,6 +3102,10 @@ impl MessageInst {
                     voice: false,
                     scheduled: None,
                     embedded_profile: None,
+                    transcript_background_id: None,
+                    translated_html: None,
+                    is_auto_reply: None,
+                    is_from_external_source: None,
                 })
             )?;
             msg.sent_timestamp = system_recv.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
@@ -2978,6 +3122,7 @@ impl MessageInst {
                 cv_name: None, // ha sms sux, can't believe these losers don't have an iPhone
                 sender_guid: None,
                 after_guid: loaded.message.reply_to_guid,
+                group_photo_refresh_ns: None,
             }), Message::Message(NormalMessage {
                 parts,
                 effect: None, // losers
@@ -2994,6 +3139,10 @@ impl MessageInst {
                 voice: false,
                 scheduled: None,
                 embedded_profile: None,
+                transcript_background_id: None,
+                translated_html: None,
+                is_auto_reply: None,
+                is_from_external_source: None,
             }))
         }
         if let Ok(loaded) = plist::from_value::<RawIMessage>(&value) {
@@ -3012,59 +3161,18 @@ impl MessageInst {
             });
             
             let balloon_part = Self::get_balloon(loaded.balloon_part, loaded.balloon_part_mmcs, apns).await;
-            let mut app = None;
-            if let Some(app_info) = &loaded.app_info {
-                // parsing failures for com.apple.Stickers.UserGenerated.MessagesExtension
-                app = match ExtensionApp::from_ati(app_info.as_ref(), balloon_part.as_ref().map(|i| i.as_ref())) {
-                    Ok(i) => Some(i),
-                    Err(e) => {
-                        warn!("Error parsing balloon {e}");
-                        None
-                    }
-                };
-            }
-            if let (Some(balloon), None) = (&balloon_part, &app) {
-                app = match Balloon::decode_raw(&balloon) {
-                    Ok(i) => Some(ExtensionApp {
-                        app_id: None,
-                        name: "None".to_string(),
-                        bundle_id: loaded.balloon_id.clone().unwrap(),
-                        balloon: Some(i),
-                    }),
-                    Err(e) => {
-                        warn!("Error parsing balloon {e}");
-                        None
-                    }
-                };
-            } 
-            let mut link_meta = None;
-            if let (Some("com.apple.messages.URLBalloonProvider"), Some(balloon_part)) = (loaded.balloon_id.as_deref(), balloon_part) {
-                match (|| {
-                    debug!("a");
-                    let unpacked = BaseBalloonBody::from_bin(ungzip(&balloon_part)?);
-                    debug!("b");
-                    let payload: RichLink = plist::from_value(&KeyedArchive::expand_root(unpacked.payload.as_ref())?)?;
-                    debug!("c");
-                    Ok::<_, PushError>((unpacked, payload))
-                })() {
-                    Ok((unpacked, payload)) => {
-                        debug!("d");
-                        link_meta = Some(LinkMeta {
-                            data: payload.rich_link_metadata,
-                            attachments: unpacked.attachments.into_iter().map(|i| i.into()).collect(),
-                        });
-                    },
-                    Err(e) => {
-                        error!("Error parsing url preview! {e}");
-                    }
-                }
-            }
+            let (app, link_meta) = Self::decode_balloon_and_link(
+                loaded.balloon_id.as_deref(),
+                balloon_part,
+                loaded.app_info.as_ref(),
+            );
             debug!("e");
             return wrapper.to_message(Some(ConversationData {
                 participants: loaded.participants.clone(),
                 cv_name: loaded.cv_name.clone(),
                 sender_guid: loaded.sender_guid.clone(),
                 after_guid: loaded.after_guid.clone(),
+                group_photo_refresh_ns: loaded.group_photo_refresh_ns,
             }), Message::Message(NormalMessage {
                 parts,
                 effect: loaded.effect.clone(),
@@ -3081,6 +3189,10 @@ impl MessageInst {
                     ScheduleMode { ms: system_time.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64, schedule: true }
                 }),
                 embedded_profile: shared_profile,
+                transcript_background_id: loaded.transcript_background_id,
+                translated_html: loaded.translated_html,
+                is_auto_reply: loaded.is_auto_reply,
+                is_from_external_source: loaded.is_from_external_source,
             }))
         }
         Err(PushError::BadMsg)
@@ -3186,5 +3298,54 @@ pub fn decode_update_attachments(
     Some(UpdateAttachmentsMessage {
         message_guid: message_guid.to_string(),
         updates,
+    })
+}
+
+const APPLE_EPOCH_UNIX_OFFSET_MS: u64 = 978_307_200_000;
+
+/// `iMessage.imservice` `-[MessageDeliveryController _appendMyTranscriptBackgroundVersionToMessageDictionary:forMessage:chat:]`
+/// (`0x49f28..0x49fa0`): interval defaults to `3` when `< 1`; sets `"tbid"` when
+/// `(num_messages_sent % interval == 2) || (num_messages_sent == 1)`.
+pub fn should_include_tbid(num_messages_sent: u64, interval: u64) -> bool {
+    let eff = if interval < 1 { 3 } else { interval };
+    num_messages_sent == 1 || (num_messages_sent % eff) == 2
+}
+
+/// `iMessage.imservice` `-[MessageGroupController _addGroupPhotoRefreshDate:context:]` (`0x8b20c`:
+/// `__im_nanosecondTimeIntervalSinceEpochTime`): nanoseconds since Apple reference epoch (`2001-01-01`).
+pub fn apple_epoch_ns_from_unix_ms(unix_ms: u64) -> u64 {
+    unix_ms.saturating_sub(APPLE_EPOCH_UNIX_OFFSET_MS).saturating_mul(1_000_000)
+}
+
+pub fn unix_ms_from_apple_epoch_ns(apple_ns: u64) -> u64 {
+    (apple_ns / 1_000_000).saturating_add(APPLE_EPOCH_UNIX_OFFSET_MS)
+}
+
+/// Encodes an inline `c=196` (`FTCommandIDBalloonTransportCommand`) plist body (`iMessage.imservice` `0x2bd94`, `0x2bdc0`).
+pub fn encode_balloon_transport_inline(
+    bundle_id: &str,
+    link_meta: Option<&LinkMeta>,
+    app: Option<&ExtensionApp>,
+) -> Result<Vec<u8>, PushError> {
+    let (_, balloon_part, _) = MessageInst::encode_balloon_payload(app, link_meta)?;
+    Ok(plist_to_bin(&RawBalloonTransportMessage {
+        balloon_id: bundle_id.to_string(),
+        balloon_part: balloon_part.map(Into::into),
+        balloon_part_mmcs: None,
+    })?)
+}
+
+/// Decodes an inline `c=196` (`FTCommandIDBalloonTransportCommand`) plist body (`iMessage.imservice` `0x1f974..0x1f9dc`).
+pub fn decode_balloon_transport_inline(value: &Value) -> Option<BalloonTransportMessage> {
+    let raw = plist::from_value::<RawBalloonTransportMessage>(value).ok()?;
+    let (app, link_meta) = MessageInst::decode_balloon_and_link(
+        Some(raw.balloon_id.as_str()),
+        raw.balloon_part.map(Into::into),
+        None,
+    );
+    Some(BalloonTransportMessage {
+        bundle_id: raw.balloon_id,
+        link_meta,
+        app,
     })
 }

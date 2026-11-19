@@ -171,7 +171,7 @@ async fn handle_record(mut record: IMessageNicknameRecord, client: &IMClient, ph
         photo.set_record(record, &mut existing).await.unwrap();
 
         client.send(&mut MessageInst::new(
-            ConversationData { participants: vec!["mailto:tag3@copper.jjtech.dev".to_string()], cv_name: None, sender_guid: None, after_guid: None }, 
+            ConversationData { participants: vec!["mailto:tag3@copper.jjtech.dev".to_string()], cv_name: None, sender_guid: None, after_guid: None, group_photo_refresh_ns: None }, 
             "mailto:tag3@copper.jjtech.dev", Message::UpdateProfile(UpdateProfileMessage { profile: Some(existing.unwrap()), share_contacts: false }))).await.unwrap();
         
         // fs::write(format!("posters/{stamp}/poster.zip"), &by.package).await.unwrap();
