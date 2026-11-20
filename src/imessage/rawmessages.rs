@@ -573,6 +573,11 @@ struct RawBalloonData {
     #[serde(rename = "URL")]
     url: NSURL,
     appid: Option<u64>,
+    /// `IMSharedUtilities` `_IMBalloonPluginRequiredCapabilitiesWithPayloadDictionary`
+    /// (`0x1a41dda90`): payload key `requiredCapabilities` holds NSData of an
+    /// NSKeyedArchiver root NSArray<NSString> (IDS registration property names).
+    #[serde(rename = "requiredCapabilities")]
+    required_capabilities: Option<BalloonRawData>,
 }
 
 impl Serialize for RawBalloonData {
@@ -604,6 +609,10 @@ impl Serialize for RawBalloonData {
 
         if let Some(session_identifier) = &self.session_identifier {
             dict.insert("sessionIdentifier".to_string(), plist::to_value(&session_identifier).map_err(serde::ser::Error::custom)?);
+        }
+
+        if let Some(required) = &self.required_capabilities {
+            dict.insert("requiredCapabilities".to_string(), plist::to_value(&required).map_err(serde::ser::Error::custom)?);
         }
 
         if let Some(live_layout_info) = &self.live_layout_info {

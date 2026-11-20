@@ -797,6 +797,17 @@ pub struct Balloon {
     pub icon: Option<Vec<u8>>,
 }
 
+/// Required capabilities an Apple extension sets on its MSMessage.
+/// `MessagesPolls` `msMessageFrom` (`0x398dc..0x3990c`) sets
+/// `[IDSRegistrationPropertySupportsPolls]` (`"supports-polls"`).
+pub fn balloon_required_capabilities(bundle_id: &str) -> Option<&'static [&'static str]> {
+    if bundle_id.ends_with("com.apple.messages.Polls") {
+        Some(&["supports-polls"])
+    } else {
+        None
+    }
+}
+
 impl Balloon {
     fn decode_raw(bp: &[u8]) -> Result<Balloon, PushError> {
         Balloon::from_raw(Balloon::unpack_raw(bp)?)
@@ -836,6 +847,15 @@ impl Balloon {
                     relative: self.url.clone()
                 },
                 appid: app.app_id.clone(),
+                required_capabilities: balloon_required_capabilities(&app.bundle_id)
+                    .map(|caps| -> Result<BalloonRawData, PushError> {
+                        let arr = NSArray {
+                            objects: caps.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
+                            class: NSArrayClass::NSArray,
+                        };
+                        Ok(BalloonRawData::new(plist_to_bin(&KeyedArchive::archive_item(plist::to_value(&arr)?)?)?, is_backup))
+                    })
+                    .transpose()?,
             },
             class: NSDictionaryClass::NSMutableDictionary
         };
@@ -3512,3 +3532,4 @@ pub fn decode_balloon_transport_inline(value: &Value) -> Option<BalloonTransport
         app,
     })
 }
+
