@@ -221,10 +221,13 @@ impl MessageParts {
                 MessagePart::Attachment(attachment) => {
                     my_part_idx += 1;
                     let filesize = attachment.get_size().to_string();
+                    // iMessage.imservice 0x441cc, appendFormat: at 0x443d8.
+                    let width = attachment.width.unwrap_or_default().to_string();
+                    let height = attachment.height.unwrap_or_default().to_string();
                     let mut element = XmlEvent::start_element("FILE")
                         .attr("name", &attachment.name)
-                        .attr("width", "0")
-                        .attr("height", "0")
+                        .attr("width", &width)
+                        .attr("height", &height)
                         .attr("datasize", &filesize)
                         .attr("mime-type", &attachment.mime)
                         .attr("uti-type", &attachment.uti_type)
@@ -394,6 +397,8 @@ impl MessageParts {
                     mime: corresponding.mime_type.clone(),
                     name: corresponding.content_location.clone().unwrap_or("file".to_string()),
                     iris: false, // imagine not having an iPhone
+                    width: None,
+                    height: None,
                 })
             };
             IndexedMessagePart {
@@ -523,7 +528,10 @@ impl MessageParts {
                                     uti_type: get_attr("uti-type", Some("public.data")),
                                     mime: get_attr("mime-type", Some("application/octet-stream")),
                                     name: get_attr("name", Some("attachment")),
-                                    iris: get_attr("iris", Some("no")) == "yes"
+                                    iris: get_attr("iris", Some("no")) == "yes",
+                                    // iMessage.imservice 0x42354 converts both strings via integerValue.
+                                    width: get_attr_opt("width").and_then(|value| value.trim().parse().ok()),
+                                    height: get_attr_opt("height").and_then(|value| value.trim().parse().ok()),
                                 }),
                                 idx: part_idx,
                                 ext: PartExtension::from_dict(all_items),
@@ -1492,7 +1500,11 @@ pub struct Attachment {
     pub uti_type: String,
     pub mime: String,
     pub name: String,
-    pub iris: bool // or live photo
+    pub iris: bool, // or live photo
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<i64>,
 }
 
 impl Attachment {
@@ -1505,7 +1517,9 @@ impl Attachment {
             uti_type: uti.to_string(),
             mime: mime.to_string(),
             name: name.to_string(),
-            iris: false
+            iris: false,
+            width: None,
+            height: None,
         })
     }
 
