@@ -955,7 +955,8 @@ pub enum Reaction {
     Emphasize,
     Question,
     Emoji(String),
-    // send not supported
+    // Sticker tapback (`amt` 2007 / 3007). Sent with the sticker `<FILE>` in
+    // the XHTML body and the sticker extension as `ati`, mirroring receive.
     Sticker {
         spec: Option<ExtensionApp>,
         body: MessageParts
@@ -1012,6 +1013,14 @@ pub enum PartExtension {
         effect_type: i64,
         #[serde(rename = "sid")]
         sticker_id: String,
+        // `iMessage.imservice` FILE reader `0x426e8..0x4282c` reads `pid`
+        // (`_IMStickerUserInfoStickerPackGUIDKey`) and `sbid`
+        // (`_IMStickerUserInfoStickerBundleIDKey`) from the FILE attributes
+        // into `stickerUserInfo` (`setStickerUserInfo:` `0x42964`).
+        #[serde(rename = "pid", default, skip_serializing_if = "Option::is_none")]
+        pack_id: Option<String>,
+        #[serde(rename = "sbid", default, skip_serializing_if = "Option::is_none")]
+        bundle_id: Option<String>,
     }
 }
 
@@ -1044,6 +1053,8 @@ impl PartExtension {
             safi: data.get("safi")?.parse().ok()?,
             effect_type: data.get("stickerEffectType")?.parse().ok()?,
             sticker_id: data.remove("sid")?,
+            pack_id: data.remove("pid"),
+            bundle_id: data.remove("sbid"),
         })
     }
 }
@@ -1140,6 +1151,7 @@ impl ReactMessageType {
 
     fn get_xml(&self) -> Option<String> {
         match self {
+            Self::React { reaction: Reaction::Sticker { body, .. }, enable: true } => Some(body.to_xml(None)),
             Self::React { reaction: _, enable: _ } => None,
             Self::Extension { spec: _, body, .. } => {
                 Some(body.to_xml(None))
@@ -2474,7 +2486,12 @@ impl MessageInst {
                 let mut balloon_name: Option<String> = None;
                 let mut balloon_part: Option<Vec<u8>> = None;
                 let mut app_info: Option<Data> = None;
-                if let ReactMessageType::Extension { spec: app_obj, body: _, .. } = &react.reaction {
+                let ext_spec = match &react.reaction {
+                    ReactMessageType::Extension { spec, .. } => Some(spec),
+                    ReactMessageType::React { reaction: Reaction::Sticker { spec: Some(spec), .. }, enable: true } => Some(spec),
+                    _ => None,
+                };
+                if let Some(app_obj) = ext_spec {
                     let (app, balloon) = app_obj.to_raw(false)?;
                     app_info = if balloon.is_none() { Some(app.into()) } else { None };
                     balloon_part = balloon;
