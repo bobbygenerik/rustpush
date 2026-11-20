@@ -224,11 +224,19 @@ impl MessageParts {
                     // iMessage.imservice 0x441cc, appendFormat: at 0x443d8.
                     let width = attachment.width.unwrap_or_default().to_string();
                     let height = attachment.height.unwrap_or_default().to_string();
+                    // 0x44328 escapes the filename before inserting it as an attribute.
+                    let name = html_escape::encode_quoted_attribute(&attachment.name)
+                        .replace("&#x27;", "&apos;");
                     let mut element = XmlEvent::start_element("FILE")
-                        .attr("name", &attachment.name)
+                        .attr("name", &name)
                         .attr("width", &width)
                         .attr("height", &height)
-                        .attr("datasize", &filesize)
+                        .attr("datasize", &filesize);
+                    // iMessage.imservice 0x44bc8 marks the companion video.
+                    if attachment.iris {
+                        element = element.attr("iris", "yes");
+                    }
+                    element = element
                         .attr("mime-type", &attachment.mime)
                         .attr("uti-type", &attachment.uti_type)
                         .attr("file-size", &filesize)
@@ -461,6 +469,8 @@ impl MessageParts {
                     let all_items: HashMap<String, String> = attributes.iter().map(|a| (a.name.to_string(), a.value.clone())).collect();
                     match name.local_name.as_str() {
                         "FILE" => {
+                            // iMessage.imservice 0x423a0 skips FILE when name is absent.
+                            let Some(filename) = get_attr_opt("name") else { continue };
                             if staging_item.is_some() {
                                 data.push(IndexedMessagePart {
                                     part: staging_item.take().unwrap().complete(std::mem::take(&mut string_buf), mem::take(&mut staging_format)), 
@@ -527,8 +537,9 @@ impl MessageParts {
                                     part: attributes.iter().find(|attr| attr.name.to_string() == "message-part").and_then(|item| item.value.parse().ok()).unwrap_or(0),
                                     uti_type: get_attr("uti-type", Some("public.data")),
                                     mime: get_attr("mime-type", Some("application/octet-stream")),
-                                    name: get_attr("name", Some("attachment")),
-                                    iris: get_attr("iris", Some("no")) == "yes",
+                                    name: filename,
+                                    // The Apple reader branches on the string length at 0x4243c.
+                                    iris: get_attr_opt("iris").is_some_and(|value| !value.is_empty()),
                                     // iMessage.imservice 0x42354 converts both strings via integerValue.
                                     width: get_attr_opt("width").and_then(|value| value.trim().parse().ok()),
                                     height: get_attr_opt("height").and_then(|value| value.trim().parse().ok()),

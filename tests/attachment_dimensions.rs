@@ -40,3 +40,41 @@ fn persisted_attachments_from_before_dimension_support_still_decode() {
     assert_eq!((restored.width, restored.height), (None, None));
     assert_eq!(restored.get_size(), 1200);
 }
+
+#[test]
+fn file_filename_escapes_xml_metacharacters_and_absent_name_is_skipped() {
+    // iMessage.imservice 0x44328 calls IMCreateEscapedAttributeValueFromString.
+    // The Apple reader at 0x423a0 skips a missing name.
+    let parts = MessageParts::parse_parts_xml(
+        r#"<html><body><FILE datasize="3"/><FILE name="A&amp;B &quot;x&quot; &lt;&apos;y&apos;&gt;.jpg" datasize="1200"/></body></html>"#,
+    );
+    assert_eq!(parts.0.len(), 1);
+    let MessagePart::Attachment(attachment) = &parts.0[0].part else {
+        panic!("expected attachment");
+    };
+    assert_eq!(attachment.name, "A&B \"x\" <'y'>.jpg");
+    assert!(parts.to_xml_string().contains(r#"name="A&amp;B &quot;x&quot; &lt;&apos;y&apos;&gt;.jpg""#));
+}
+
+#[test]
+fn file_companion_marker_uses_nonempty_receive_and_canonical_send_values() {
+    // iMessage.imservice 0x42430/0x4243c reads the iris string and tests length.
+    // The serializer at 0x44bac/0x44bc8 emits the companion value "yes".
+    let parts = MessageParts::parse_parts_xml(
+        r#"<html><body><FILE name="photo.jpg" iris="" datasize="2"/><FILE name="photo.mov" iris="1" datasize="3"/></body></html>"#,
+    );
+    let [photo, companion] = parts.0.as_slice() else {
+        panic!("expected photo and companion");
+    };
+    let MessagePart::Attachment(photo) = &photo.part else {
+        panic!("expected photo attachment");
+    };
+    let MessagePart::Attachment(companion) = &companion.part else {
+        panic!("expected companion attachment");
+    };
+    assert!(!photo.iris);
+    assert!(companion.iris);
+    let xml = parts.to_xml_string();
+    assert_eq!(xml.matches("iris=").count(), 1);
+    assert!(xml.contains(r#"datasize="3" iris="yes""#));
+}
