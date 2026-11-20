@@ -7521,8 +7521,16 @@ impl AVConfig {
                     ..Default::default()
                 },
             ]),
-            enabled_features: EnabledAVFeatures::from_str("FLS2;RVRA1;CH1;CR;CF;FA;"),
-            supported_features: EnabledAVFeatures::from_str("FLS2;RVRA1;VRAE;CH1;CR;CF;FA;POS;HTS;EOD;RR;QP;SW;"),
+            // No VRA (RVRA1/VRAE) in either direction (2026-11-20). With VRA
+            // negotiated, iOS 27 resizes the used region and AVE scales its
+            // reference frames instead of sending an IDR; MediaCodec cannot scale
+            // references, so every incoming upswitch left stale/gray blocks until
+            // the next IDR (calls 5975534D/FBB76C76: ~530 of ~1800 AUs with
+            // missing refs). `VCPCodecIntersectFeatureList` (0x22a6a5120) +
+            // `__VideoTransmitter_IsCameraVRAEnabled` (0x206015d4c, strstr
+            // "RVRA1"/"VRAE") then keep the iPhone on its non-VRA path.
+            enabled_features: EnabledAVFeatures::from_str("FLS2;CH1;CR;CF;FA;"),
+            supported_features: EnabledAVFeatures::from_str("FLS2;CH1;CR;CF;FA;POS;HTS;EOD;RR;QP;SW;"),
             h264_features: EnabledAVFeatures::from_str("FLS2;CH1;CR;FA;"),
             h264_supported: EnabledAVFeatures::from_str("FLS2;CH1;CR;FA;POS;HTS;EOD;RR;QP;SW;"),
         }

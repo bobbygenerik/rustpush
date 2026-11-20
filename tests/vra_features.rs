@@ -5,41 +5,27 @@ use rustpush::avconference::{
 };
 
 #[test]
-fn av_config_default_advertises_rvra1_in_supported_features() {
+fn av_config_default_does_not_negotiate_vra() {
     let cfg = AVConfig::new();
     let avc = cfg.avc_data();
     let media_blob: &[u8] = avc.vc_session_participant_key_media_blob.as_ref();
     assert!(!media_blob.is_empty());
-    // VcMediaNegotiationBlobV2 puts [enabled_features (2B LE), supported_features (2B LE)]
-    // in video_features (VCPCodecIntersectFeatureList 0x22a6a5120 / sub_22a71fad0).
+    // VcMediaNegotiationBlobV2 video_features = [enabled (2B LE), supported (2B LE)].
     let mut wire = cfg.enabled_features.to_bytes().to_vec();
     wire.extend_from_slice(&cfg.supported_features.to_bytes());
     assert_eq!(wire.len(), 4);
     let enabled = EnabledAVFeatures::from_bytes(&wire[0..2]);
     let supported = EnabledAVFeatures::from_bytes(&wire[2..4]);
-    assert!(
-        enabled.has_feature("RVRA1"),
-        "TX enabled_features must advertise RVRA1: {:?}",
-        enabled
-    );
-    assert!(
-        supported.has_feature("RVRA1"),
-        "RX supported_features must advertise RVRA1 so iPhone TX & get_media_config intersect RVRA1: {:?}",
-        supported
-    );
-    assert!(
-        supported.has_feature("VRAE"),
-        "RX supported_features must advertise VRAE: {:?}",
-        supported
-    );
-    // Simulate VCPCodecIntersectFeatureList: remote TX (enabled) & local RX (supported)
+    for f in ["RVRA1", "VRAE"] {
+        assert!(!enabled.has_feature(f), "TX must not enable {f}: {:?}", enabled);
+        assert!(!supported.has_feature(f), "RX must not support {f}: {:?}", supported);
+    }
+    // VCPCodecIntersectFeatureList: iPhone TX (enabled) & our RX (supported)
+    // must drop VRA so __VideoTransmitter_IsCameraVRAEnabled returns 0.
     let apple_remote_tx = EnabledAVFeatures::from_str("FLS2;RVRA1;CH1;CR;CF;FA;");
-    let negotiated_tx_from_apple = apple_remote_tx.intersect(&supported);
-    assert!(negotiated_tx_from_apple.has_feature("RVRA1"));
-
-    // Simulate get_media_config() on our own RX stream (our enabled & our supported)
-    let loopback_negotiated = enabled.intersect(&supported);
-    assert!(loopback_negotiated.has_feature("RVRA1"));
+    let negotiated = apple_remote_tx.intersect(&supported);
+    assert!(!negotiated.has_feature("RVRA1") && !negotiated.has_feature("VRAE"));
+    assert!(negotiated.has_feature("CH1") && negotiated.has_feature("FA"));
 }
 
 #[test]
