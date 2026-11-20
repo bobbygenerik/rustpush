@@ -1,4 +1,4 @@
-use rustpush::{Attachment, MessagePart, MessageParts};
+use rustpush::{Attachment, AttachmentType, MessagePart, MessageParts};
 
 #[test]
 fn file_reader_accepts_signed_decimal_dimensions_and_preserves_missing_values() {
@@ -77,4 +77,35 @@ fn file_companion_marker_uses_nonempty_receive_and_canonical_send_values() {
     let xml = parts.to_xml_string();
     assert_eq!(xml.matches("iris=").count(), 1);
     assert!(xml.contains(r#"datasize="3" iris="yes""#));
+}
+
+#[test]
+fn file_reader_resolves_inline_refs_as_plist_data_keys() {
+    let payload = plist::Dictionary::from_iter([
+        ("ia-0", plist::Value::String("wrong type".into())),
+        ("ia-2", plist::Value::Data(vec![1, 2, 3])),
+        ("ia-4", plist::Value::Data(vec![4])),
+    ]);
+    // iMessage.imservice 0x6efe8 uses the key from 0x6ef80 directly.
+    let parts = MessageParts::parse_parts(
+        r#"<html><body>
+          <FILE name="bad type" inline-attachment="ia-0"/>
+          <FILE name="second" inline-attachment="ia-2" width="44" height="55"/>
+          <FILE name="missing value" inline-attachment="ia-3"/>
+          <FILE name="fourth" inline-attachment="ia-4"/>
+        </body></html>"#,
+        Some(&payload),
+    );
+    let [second, fourth] = parts.0.as_slice() else {
+        panic!("expected both resolvable attachments");
+    };
+    let MessagePart::Attachment(second) = &second.part else {
+        panic!("expected second attachment");
+    };
+    let MessagePart::Attachment(fourth) = &fourth.part else {
+        panic!("expected fourth attachment");
+    };
+    assert!(matches!(&second.a_type, AttachmentType::Inline(bytes) if bytes == &[1, 2, 3]));
+    assert_eq!((second.width, second.height), (Some(44), Some(55)));
+    assert!(matches!(&fourth.a_type, AttachmentType::Inline(bytes) if bytes == &[4]));
 }

@@ -431,8 +431,8 @@ impl MessageParts {
         }
     }
 
-    // parse XML parts
-    fn parse_parts(xml: &str, raw: Option<&RawIMessage>) -> MessageParts {
+    /// Parse XML parts, resolving inline attachment references from the enclosing plist when supplied.
+    pub fn parse_parts(xml: &str, payload: Option<&Dictionary>) -> MessageParts {
         let mut data: Vec<IndexedMessagePart> = vec![];
         let reader: EventReader<Cursor<&str>> = EventReader::new(Cursor::new(xml));
         let mut string_buf = String::new();
@@ -481,13 +481,18 @@ impl MessageParts {
                                 text_meta = None;
                             }
                             let a_type = if let Some(inline) = attributes.iter().find(|attr| attr.name.to_string() == "inline-attachment") {
-                                AttachmentType::Inline(if inline.value == "ia-0" {
-                                    raw.map_or(vec![], |raw| raw.inline0.clone().unwrap().into())
-                                } else if inline.value == "ia-1" {
-                                    raw.map_or(vec![], |raw| raw.inline1.clone().unwrap().into())
-                                } else {
-                                    continue
-                                })
+                                // iMessage.imservice 0x6ef7c/0x6efe8 uses the attribute
+                                // value as the key for a Data lookup in the enclosing plist.
+                                let bytes = match payload {
+                                    Some(payload) => {
+                                        let Some(bytes) = payload.get(&inline.value).and_then(Value::as_data) else {
+                                            continue;
+                                        };
+                                        bytes.to_vec()
+                                    }
+                                    None => Vec::new(),
+                                };
+                                AttachmentType::Inline(bytes)
                             } else if let (Some(sig_hex), Some(key_hex), Some(owner), Some(url)) = (
                                 get_attr_opt("mmcs-signature-hex"),
                                 get_attr_opt("decryption-key"),
@@ -2956,7 +2961,7 @@ impl MessageInst {
             return wrapper.to_message(None, Message::Edit(EditMessage {
                 tuuid: loaded.message,
                 edit_part: loaded.part_index,
-                new_parts: MessageParts::parse_parts(&loaded.new_html_body, None),
+                new_parts: MessageParts::parse_parts(&loaded.new_html_body, value.as_dictionary()),
                 translated_html: loaded.translated_html,
             }))
         }
@@ -3030,7 +3035,7 @@ impl MessageInst {
                     let data = ExtensionApp::from_bp(balloon, balloon_id)?;
                     ReactMessageType::Extension {
                         spec: data,
-                        body: loaded.xml.as_ref().map(|xml| MessageParts::parse_parts(xml, None)).unwrap_or(MessageParts(vec![])),
+                        body: loaded.xml.as_ref().map(|xml| MessageParts::parse_parts(xml, value.as_dictionary())).unwrap_or(MessageParts(vec![])),
                         is_meta: loaded.amt == 4000,
                     }
                 },
@@ -3041,7 +3046,7 @@ impl MessageInst {
                     let data = ExtensionApp::from_ati(spec.as_ref(), None)?;
                     ReactMessageType::Extension {
                         spec: data,
-                        body: MessageParts::parse_parts(xml, None),
+                        body: MessageParts::parse_parts(xml, value.as_dictionary()),
                         is_meta: false,
                     }
                 },
@@ -3051,7 +3056,7 @@ impl MessageInst {
                     };
                     let data = loaded.type_spec.as_ref().and_then(|e| ExtensionApp::from_ati(e.as_ref(), None).ok());
                     ReactMessageType::React {
-                        reaction: Reaction::Sticker { spec: data, body:  MessageParts::parse_parts(xml, None) },
+                        reaction: Reaction::Sticker { spec: data, body: MessageParts::parse_parts(xml, value.as_dictionary()) },
                         enable: loaded.amt == 2007
                     }
                 },
@@ -3188,7 +3193,7 @@ impl MessageInst {
             let parts = loaded.live_xml.as_ref().or(loaded.xml.as_ref()).map_or_else(|| {
                 loaded.text.as_ref().map_or(MessageParts(vec![]), |text| MessageParts::from_raw(text))
             }, |xml| {
-                MessageParts::parse_parts(xml, Some(&loaded))
+                MessageParts::parse_parts(xml, value.as_dictionary())
             });
             
             let balloon_part = Self::get_balloon(loaded.balloon_part, loaded.balloon_part_mmcs, apns).await;
