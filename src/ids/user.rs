@@ -685,7 +685,7 @@ pub struct ParsedClientData {
     pub public_message_ngm_device_prekey_data_key: Option<IDSNGMPrekeyIdentity>,
     #[serde(default, deserialize_with = "deserialize_kt_data", serialize_with = "serialize_kt_data")]
     pub ngm_public_identity: Option<CompactECKey<Public>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_bool_or_int")]
     pub supports_certified_delivery_v1: bool,
     #[serde(default, deserialize_with = "deserialize_bool_or_int")]
     pub supports_high_quality_video: bool,

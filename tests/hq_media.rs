@@ -51,6 +51,30 @@ fn sample_client_data(
 }
 
 #[test]
+fn malformed_certified_delivery_capability_does_not_fail_peer_lookup() {
+    let identity = plist::to_value(&dummy_public_identity()).unwrap();
+    let key = "supports-certified-delivery-v1";
+    let cases = [
+        (None, false),
+        (Some(Value::Boolean(true)), true),
+        (Some(Value::Integer(1.into())), true),
+        (Some(Value::Integer(2.into())), false),
+        (Some(Value::Real(1.0)), true),
+        (Some(Value::String("YES".into())), true),
+        (Some(Value::Dictionary(plist::Dictionary::new())), false),
+        (Some(Value::Data(vec![1])), false),
+    ];
+    for (value, expected) in cases {
+        let mut dict = plist::Dictionary::from_iter([("public-message-identity-key", identity.clone())]);
+        if let Some(value) = value {
+            dict.insert(key.to_owned(), value);
+        }
+        let parsed: ParsedClientData = plist::from_value(&Value::Dictionary(dict)).unwrap();
+        assert_eq!(parsed.supports_certified_delivery_v1, expected);
+    }
+}
+
+#[test]
 fn madrid_service_advertises_hq_video_and_photo_capabilities() {
     let entries: HashMap<&str, &Value> = MADRID_SERVICE
         .client_data
