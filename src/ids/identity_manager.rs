@@ -1031,8 +1031,24 @@ impl IdentityResource {
         let mut per_participant: HashMap<String, Vec<crate::ids::user::ParsedClientData>> =
             targets.iter().map(|t| (t.clone(), Vec::new())).collect();
         for dh in delivery_handles {
+            let cd = &dh.delivery_data.client_data;
+            let token = &dh.delivery_data.push_token;
+            info!(
+                "hq caps {} device {}: hqv={} hqp={} async={} heif={}",
+                dh.participant,
+                token.iter().take(4).map(|b| format!("{b:02x}")).collect::<String>(),
+                cd.supports_high_quality_video,
+                cd.supports_high_quality_photo_file_sizes,
+                cd.supports_async_attachments,
+                cd.supports_heif,
+            );
             if let Some(list) = per_participant.get_mut(&dh.participant) {
                 list.push(dh.delivery_data.client_data);
+            }
+        }
+        for (participant, devices) in &per_participant {
+            if devices.is_empty() {
+                info!("hq caps {participant}: no devices returned (falls back to standard)");
             }
         }
         Ok(crate::imessage::hq_media::compute_common_hq_capabilities(
