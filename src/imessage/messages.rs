@@ -220,27 +220,47 @@ impl MessageParts {
             match &part.part {
                 MessagePart::Attachment(attachment) => {
                     my_part_idx += 1;
-                    let filesize = attachment.get_size().to_string();
+                    let size = attachment.get_size();
+                    let filesize = size.to_string();
+                    // The FILE datasize and the MMCS descriptor file-size have separate readers.
+                    let datasize = attachment.data_size.unwrap_or(size).to_string();
                     // iMessage.imservice 0x441cc, appendFormat: at 0x443d8.
                     let width = attachment.width.unwrap_or_default().to_string();
                     let height = attachment.height.unwrap_or_default().to_string();
                     // 0x44328 escapes the filename before inserting it as an attribute.
-                    let name = html_escape::encode_quoted_attribute(&attachment.name)
-                        .replace("&#x27;", "&apos;");
+                    let escape_attribute = |value: &str| {
+                        html_escape::encode_quoted_attribute(value).replace("&#x27;", "&apos;")
+                    };
+                    let name = escape_attribute(&attachment.name);
+                    let animoji = attachment.animoji.map(|value| value.to_string());
+                    let glyph_id = attachment.emoji_image_id.as_deref()
+                        .filter(|value| !value.is_empty()).map(escape_attribute);
+                    let glyph_description = attachment.emoji_image_description.as_deref()
+                        .filter(|value| !value.is_empty()).map(escape_attribute);
                     let mut element = XmlEvent::start_element("FILE")
                         .attr("name", &name)
                         .attr("width", &width)
                         .attr("height", &height)
-                        .attr("datasize", &filesize);
+                        .attr("datasize", &datasize);
                     // iMessage.imservice 0x44bc8 marks the companion video.
                     if attachment.iris {
                         element = element.attr("iris", "yes");
+                    }
+                    // iMessage.imservice 0x44438–0x44470 and 0x446b0–0x4473c.
+                    if let Some(animoji) = &animoji {
+                        element = element.attr("x-apple-anim-emoji", animoji);
                     }
                     element = element
                         .attr("mime-type", &attachment.mime)
                         .attr("uti-type", &attachment.uti_type)
                         .attr("file-size", &filesize)
                         .attr("message-part", &part_idx);
+                    if let Some(glyph_id) = &glyph_id {
+                        element = element.attr("emoji-image-id", glyph_id);
+                        if let Some(description) = &glyph_description {
+                            element = element.attr("emoji-image-description", description);
+                        }
+                    }
                     let ext = part.ext.as_ref().map(|e| e.to_dict()).unwrap_or_else( || HashMap::new());
                     for (key, val) in &ext {
                         element = element.attr(key.as_str(), val);
@@ -407,6 +427,10 @@ impl MessageParts {
                     iris: false, // imagine not having an iPhone
                     width: None,
                     height: None,
+                    data_size: None,
+                    animoji: None,
+                    emoji_image_id: None,
+                    emoji_image_description: None,
                 })
             };
             IndexedMessagePart {
@@ -471,6 +495,12 @@ impl MessageParts {
                         "FILE" => {
                             // iMessage.imservice 0x423a0 skips FILE when name is absent.
                             let Some(filename) = get_attr_opt("name") else { continue };
+                            let data_size = get_attr_opt("datasize").and_then(|value| value.trim().parse().ok());
+                            let file_size = get_attr_opt("file-size").and_then(|value| value.trim().parse().ok())
+                                .or(data_size).unwrap_or_default();
+                            let emoji_image_id = get_attr_opt("emoji-image-id").filter(|value| !value.is_empty());
+                            let emoji_image_description = emoji_image_id.as_ref()
+                                .and_then(|_| get_attr_opt("emoji-image-description")).filter(|value| !value.is_empty());
                             if staging_item.is_some() {
                                 data.push(IndexedMessagePart {
                                     part: staging_item.take().unwrap().complete(std::mem::take(&mut string_buf), mem::take(&mut staging_format)), 
@@ -501,23 +531,16 @@ impl MessageParts {
                             ) {
                                 match (decode_hex(&sig_hex), decode_hex(&key_hex)) {
                                     (Ok(sig), Ok(key)) if key.len() > 1 => {
-                                        let size = get_attr_opt("file-size")
-                                            .or_else(|| get_attr_opt("datasize"))
-                                            .and_then(|s| s.parse().ok())
-                                            .unwrap_or(0);
                                         AttachmentType::MMCS(MMCSFile {
                                             signature: sig,
                                             object: owner,
                                             url,
                                             key: key[1..].to_vec(),
-                                            size,
+                                            size: file_size,
                                         })
                                     }
                                     _ => AttachmentType::Placeholder {
-                                        size: get_attr_opt("file-size")
-                                            .or_else(|| get_attr_opt("datasize"))
-                                            .and_then(|s| s.parse().ok())
-                                            .unwrap_or(0),
+                                        size: file_size,
                                         stage: get_attr_opt("stage"),
                                         grad_colors: get_attr_opt("grad-colors"),
                                     },
@@ -526,12 +549,8 @@ impl MessageParts {
                                 // `iMessage.imservice` `0x443c8..0x44a18`: NBAS placeholder `<FILE>` carries
                                 // `datasize`, optional `stage` (`"gradient"`/`"preview"`), and `grad-colors`
                                 // before MMCS attributes arrive on `c=108`.
-                                let size = get_attr_opt("file-size")
-                                    .or_else(|| get_attr_opt("datasize"))
-                                    .and_then(|s| s.parse().ok())
-                                    .unwrap_or(0);
                                 AttachmentType::Placeholder {
-                                    size,
+                                    size: file_size,
                                     stage: get_attr_opt("stage"),
                                     grad_colors: get_attr_opt("grad-colors"),
                                 }
@@ -548,6 +567,10 @@ impl MessageParts {
                                     // iMessage.imservice 0x42354 converts both strings via integerValue.
                                     width: get_attr_opt("width").and_then(|value| value.trim().parse().ok()),
                                     height: get_attr_opt("height").and_then(|value| value.trim().parse().ok()),
+                                    data_size,
+                                    animoji: get_attr_opt("x-apple-anim-emoji").and_then(|value| value.trim().parse().ok()),
+                                    emoji_image_id,
+                                    emoji_image_description,
                                 }),
                                 idx: part_idx,
                                 ext: PartExtension::from_dict(all_items),
@@ -1521,6 +1544,14 @@ pub struct Attachment {
     pub width: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub height: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_size: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub animoji: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emoji_image_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emoji_image_description: Option<String>,
 }
 
 impl Attachment {
@@ -1536,6 +1567,10 @@ impl Attachment {
             iris: false,
             width: None,
             height: None,
+            data_size: None,
+            animoji: None,
+            emoji_image_id: None,
+            emoji_image_description: None,
         })
     }
 

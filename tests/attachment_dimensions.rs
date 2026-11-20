@@ -32,12 +32,14 @@ fn persisted_attachments_from_before_dimension_support_still_decode() {
     let MessagePart::Attachment(attachment) = &parts.0[0].part else {
         panic!("expected attachment");
     };
-    let value = plist::to_value(attachment).unwrap();
-    let fields = value.as_dictionary().unwrap();
+    let mut value = plist::to_value(attachment).unwrap();
+    let fields = value.as_dictionary_mut().unwrap();
+    fields.remove("data_size");
     assert!(fields.get("width").is_none());
     assert!(fields.get("height").is_none());
     let restored: Attachment = plist::from_value(&value).unwrap();
     assert_eq!((restored.width, restored.height), (None, None));
+    assert_eq!(restored.data_size, None);
     assert_eq!(restored.get_size(), 1200);
 }
 
@@ -108,4 +110,40 @@ fn file_reader_resolves_inline_refs_as_plist_data_keys() {
     assert!(matches!(&second.a_type, AttachmentType::Inline(bytes) if bytes == &[1, 2, 3]));
     assert_eq!((second.width, second.height), (Some(44), Some(55)));
     assert!(matches!(&fourth.a_type, AttachmentType::Inline(bytes) if bytes == &[4]));
+}
+
+#[test]
+fn file_declared_size_and_glyph_metadata_survive_the_attachment_roundtrip() {
+    // FILE reader 0x423dc/0x425ec obtains datasize for transfer creation.
+    // The download routine reads the independent MMCS file-size at 0x70984.
+    let parts = MessageParts::parse_parts_xml(
+        r#"<html><body><FILE name="emoji.heic" datasize="800" file-size="1200"
+            mmcs-url="https://example.invalid/mmcs" mmcs-owner="owner"
+            mmcs-signature-hex="aa" decryption-key="0011" x-apple-anim-emoji="1"
+            emoji-image-id="glyph-id" emoji-image-description="A &amp; B"/>
+          <FILE name="ordinary.heic" emoji-image-description="Missing identifier"/></body></html>"#,
+    );
+    let [glyph, ordinary] = parts.0.as_slice() else {
+        panic!("expected two attachments");
+    };
+    let MessagePart::Attachment(glyph) = &glyph.part else {
+        panic!("expected glyph attachment");
+    };
+    let MessagePart::Attachment(ordinary) = &ordinary.part else {
+        panic!("expected ordinary attachment");
+    };
+    assert_eq!(glyph.data_size, Some(800));
+    assert!(matches!(&glyph.a_type, AttachmentType::MMCS(file) if file.size == 1200));
+    assert_eq!(glyph.animoji, Some(1));
+    assert_eq!(glyph.emoji_image_id.as_deref(), Some("glyph-id"));
+    assert_eq!(glyph.emoji_image_description.as_deref(), Some("A & B"));
+    assert_eq!(ordinary.emoji_image_description, None);
+
+    let restored: Attachment = plist::from_value(&plist::to_value(glyph).unwrap()).unwrap();
+    assert_eq!(restored.data_size, Some(800));
+    assert_eq!(restored.emoji_image_description.as_deref(), Some("A & B"));
+    let xml = parts.to_xml_string();
+    assert!(xml.contains(r#"datasize="800" x-apple-anim-emoji="1""#));
+    assert!(xml.contains(r#"file-size="1200""#));
+    assert!(xml.contains(r#"emoji-image-id="glyph-id" emoji-image-description="A &amp; B""#));
 }
