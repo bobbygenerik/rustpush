@@ -261,3 +261,20 @@ fn ipsw_size_limits_and_mmcs_report_size_overrides_match_24a446() {
     assert_eq!(decoded.translation_language.as_deref(), Some("es"));
     assert_eq!(decoded.text, "Hola mundo");
 }
+
+#[test]
+fn lqm_hq_capability_requires_every_device() {
+    let identity = plist::to_value(&dummy_public_identity()).unwrap();
+    let dev = |lqm: Option<Value>| -> ParsedClientData {
+        let mut dict = plist::Dictionary::from_iter([("public-message-identity-key", identity.clone())]);
+        if let Some(v) = lqm {
+            dict.insert("supports-lqm-hq".to_owned(), v);
+        }
+        plist::from_value(&Value::Dictionary(dict)).unwrap()
+    };
+    let mut all = HashMap::new();
+    all.insert("tel:+1".to_string(), vec![dev(Some(Value::Boolean(true))), dev(Some(Value::Integer(1.into())))]);
+    assert!(compute_common_hq_capabilities(&all).supports_lqm_hq);
+    all.insert("tel:+2".to_string(), vec![dev(None)]);
+    assert!(!compute_common_hq_capabilities(&all).supports_lqm_hq);
+}

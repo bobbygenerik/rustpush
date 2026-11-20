@@ -1034,13 +1034,14 @@ impl IdentityResource {
             let cd = &dh.delivery_data.client_data;
             let token = &dh.delivery_data.push_token;
             info!(
-                "hq caps {} device {}: hqv={} hqp={} async={} heif={}",
+                "hq caps {} device {}: hqv={} hqp={} async={} heif={} lqmhq={}",
                 dh.participant,
                 token.iter().take(4).map(|b| format!("{b:02x}")).collect::<String>(),
                 cd.supports_high_quality_video,
                 cd.supports_high_quality_photo_file_sizes,
                 cd.supports_async_attachments,
                 cd.supports_heif,
+                cd.supports_lqm_hq,
             );
             if let Some(list) = per_participant.get_mut(&dh.participant) {
                 list.push(dh.delivery_data.client_data);

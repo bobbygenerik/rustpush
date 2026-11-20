@@ -703,6 +703,12 @@ pub struct ParsedClientData {
     pub supports_heif: bool,
     #[serde(default, deserialize_with = "deserialize_bool_or_int")]
     pub supports_xhtml_translation: bool,
+    /// `supports-lqm-hq` (`_IDSRegistrationPropertySupportsLQMHQ`): the device
+    /// accepts a low-quality photo followed by a `c=108` `HQUpdate`
+    /// (`-[MessageDeliveryController isReceiverHQTransferCapable:fromID:]`,
+    /// `iMessage.imservice` `0x54b48`).
+    #[serde(default, deserialize_with = "deserialize_bool_or_int", rename = "supports-lqm-hq")]
+    pub supports_lqm_hq: bool,
 }
 
 pub fn deserialize_kt_data<'de, D>(d: D) -> Result<Option<CompactECKey<Public>>, D::Error>
