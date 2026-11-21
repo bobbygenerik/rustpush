@@ -7451,6 +7451,25 @@ pub struct AVConfig {
     h264_supported: EnabledAVFeatures,
 }
 
+static LOCAL_SCREEN_ASPECT: std::sync::Mutex<Option<(u32, u32)>> = std::sync::Mutex::new(None);
+
+/// Records this device's screen size (any orientation) as a reduced portrait
+/// ratio for the FaceTime media blob. Call once before calls start; the
+/// value must stay fixed so the IDS and link AVC blobs match.
+pub fn set_local_screen_aspect(width: u32, height: u32) {
+    if width == 0 || height == 0 {
+        return;
+    }
+    let (w, h) = (width.min(height), width.max(height));
+    fn gcd(a: u32, b: u32) -> u32 { if b == 0 { a } else { gcd(b, a % b) } }
+    let g = gcd(w, h);
+    *LOCAL_SCREEN_ASPECT.lock().unwrap() = Some((w / g, h / g));
+}
+
+pub fn local_screen_aspect() -> Option<(u32, u32)> {
+    *LOCAL_SCREEN_ASPECT.lock().unwrap()
+}
+
 impl AVConfig {
     pub fn new() -> Self {
         Self {
@@ -7600,10 +7619,17 @@ impl AVConfig {
                         preferred_decode_format: Some(0),
                     },
                 ],
-                landscape_aspect_ratio_x: None,
-                landscape_aspect_ratio_y: None,
-                portrait_aspect_ratio_x: Some(2),
-                portrait_aspect_ratio_y: Some(3),
+                // The iPhone sender sizes its encoded visible rectangle to this
+                // aspect ([AR_TX] remoteScreenAspectRatio -> visibleAspectRatio,
+                // kVTEncodeFrameOptionKey_VisibleRectangle) and spends almost no
+                // bits outside it. iPhones advertise their own screen
+                // (portrait 320:693, landscape 693:320). A fixed 2:3 made the
+                // iPhone leave ~150 px flat/blocky strips at both ends of the
+                // long axis, which showed as bars on a 1080x2340 screen.
+                landscape_aspect_ratio_x: local_screen_aspect().map(|(_, h)| h),
+                landscape_aspect_ratio_y: local_screen_aspect().map(|(w, _)| w),
+                portrait_aspect_ratio_x: Some(local_screen_aspect().map_or(2, |(w, _)| w)),
+                portrait_aspect_ratio_y: Some(local_screen_aspect().map_or(3, |(_, h)| h)),
                 mismatched_display_aspect_ratio_x: None,
                 mismatched_display_aspect_ratio_y: None,
                 cipher_suites: Some(3),

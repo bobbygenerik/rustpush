@@ -97,3 +97,13 @@ fn enabled_av_features_unknown_type_is_ignored_cleanly() {
     // Sanity check EnabledAVFeatures trait behavior on video type
     let _ = ChannelType::H265;
 }
+
+#[test]
+fn media_blob_advertises_local_screen_aspect() {
+    rustpush::avconference::set_local_screen_aspect(1080, 2340);
+    assert_eq!(rustpush::avconference::local_screen_aspect(), Some((6, 13)));
+    rustpush::avconference::set_local_screen_aspect(2340, 1080);
+    assert_eq!(rustpush::avconference::local_screen_aspect(), Some((6, 13)));
+    rustpush::avconference::set_local_screen_aspect(1179, 2556);
+    assert_eq!(rustpush::avconference::local_screen_aspect(), Some((131, 284)));
+}
